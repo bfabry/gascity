@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -1212,9 +1213,15 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 }
 
 type graphRouteBinding struct {
-	qualifiedName string
-	sessionName   string
-	metadataOnly  bool
+	qualifiedName   string
+	sessionName     string
+	directSessionID string
+	metadataOnly    bool
+}
+
+type graphStepTarget struct {
+	value        string
+	fromAssignee bool
 }
 
 func resolveGraphStepBinding(stepID string, stepByID map[string]*formula.RecipeStep, stepAlias map[string]string, depsByStep map[string][]string, cache map[string]graphRouteBinding, resolving map[string]bool, fallback graphRouteBinding, rigContext string, store beads.Store, cityName string, cfg *config.City) (graphRouteBinding, error) {
@@ -1239,12 +1246,12 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	defer delete(resolving, stepID)
 
 	target := graphStepRouteTarget(step, routeVars)
-	if target == "" {
+	if target.value == "" {
 		switch step.Metadata["gc.kind"] {
 		case "scope-check":
-			target = strings.TrimSpace(step.Metadata["gc.control_for"])
-			if target != "" {
-				binding, err := resolveGraphStepBindingWithVars(target, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cfg)
+			controlTarget := strings.TrimSpace(step.Metadata["gc.control_for"])
+			if controlTarget != "" {
+				binding, err := resolveGraphStepBindingWithVars(controlTarget, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cfg)
 				if err != nil {
 					return graphRouteBinding{}, err
 				}
@@ -1252,9 +1259,9 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 				return binding, nil
 			}
 		case "fanout":
-			target = strings.TrimSpace(step.Metadata["gc.control_for"])
-			if target != "" {
-				binding, err := resolveGraphStepBindingWithVars(target, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cfg)
+			controlTarget := strings.TrimSpace(step.Metadata["gc.control_for"])
+			if controlTarget != "" {
+				binding, err := resolveGraphStepBindingWithVars(controlTarget, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cfg)
 				if err != nil {
 					return graphRouteBinding{}, err
 				}
@@ -1322,9 +1329,15 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	if cfg == nil {
 		return graphRouteBinding{}, fmt.Errorf("graph.v2 routing for %s requires config", stepID)
 	}
-	agentCfg, ok := resolveAgentIdentity(cfg, target, rigContext)
+	if target.fromAssignee {
+		if binding, ok := resolveGraphDirectSessionBinding(store, cfg, target.value, rigContext); ok {
+			cache[stepID] = binding
+			return binding, nil
+		}
+	}
+	agentCfg, ok := resolveAgentIdentity(cfg, target.value, rigContext)
 	if !ok {
-		return graphRouteBinding{}, fmt.Errorf("step %s: unknown graph.v2 target %q", stepID, target)
+		return graphRouteBinding{}, fmt.Errorf("step %s: unknown graph.v2 target %q", stepID, target.value)
 	}
 	binding := graphRouteBinding{qualifiedName: agentCfg.QualifiedName()}
 	if isMultiSessionCfgAgent(&agentCfg) {
@@ -1341,18 +1354,49 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	return binding, nil
 }
 
-func graphStepRouteTarget(step *formula.RecipeStep, routeVars map[string]string) string {
+func graphStepRouteTarget(step *formula.RecipeStep, routeVars map[string]string) graphStepTarget {
 	if step == nil {
-		return ""
+		return graphStepTarget{}
 	}
 	target := strings.TrimSpace(formula.Substitute(step.Assignee, routeVars))
 	if target != "" {
-		return target
+		return graphStepTarget{value: target, fromAssignee: true}
 	}
 	if step.Metadata == nil {
-		return ""
+		return graphStepTarget{}
 	}
-	return strings.TrimSpace(formula.Substitute(step.Metadata["gc.run_target"], routeVars))
+	return graphStepTarget{value: strings.TrimSpace(formula.Substitute(step.Metadata["gc.run_target"], routeVars))}
+}
+
+func resolveGraphDirectSessionBinding(store beads.Store, cfg *config.City, target, rigContext string) (graphRouteBinding, bool) {
+	target = strings.TrimSpace(target)
+	if store == nil || target == "" {
+		return graphRouteBinding{}, false
+	}
+	candidates := []string{target}
+	if cfg != nil {
+		if agentCfg, ok := resolveAgentIdentity(cfg, target, rigContext); ok {
+			qn := agentCfg.QualifiedName()
+			if qn != "" && qn != target {
+				candidates = append(candidates, qn)
+			}
+		}
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		id, err := session.ResolveSessionID(store, candidate)
+		if err != nil {
+			continue
+		}
+		if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
+			return graphRouteBinding{directSessionID: bead.ID}, true
+		}
+	}
+	return graphRouteBinding{}, false
 }
 
 func graphRouteRigContext(route string) string {

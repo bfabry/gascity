@@ -63,6 +63,11 @@ func controlDispatcherBinding(store beads.Store, cityName string, cfg *config.Ci
 }
 
 func applyGraphRouteBinding(step *formula.RecipeStep, binding graphRouteBinding) {
+	if binding.directSessionID != "" {
+		delete(step.Metadata, "gc.routed_to")
+		step.Assignee = binding.directSessionID
+		return
+	}
 	step.Metadata["gc.routed_to"] = binding.qualifiedName
 	if binding.metadataOnly {
 		step.Assignee = ""
