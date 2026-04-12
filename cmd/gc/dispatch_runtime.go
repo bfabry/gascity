@@ -97,7 +97,7 @@ func assignGraphStepRoute(step *formula.RecipeStep, executionBinding graphRouteB
 // Used by both the gc sling CLI path and the order dispatch path.
 // For the sling path, pass the pre-resolved agent. For the order path,
 // pass nil and the agent will be resolved from routedTo + config.
-func applyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string, vars map[string]string, sourceBeadID, scopeKind, scopeRef, storeRef string, store beads.Store, cityName string, cfg *config.City) error {
+func applyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string, vars map[string]string, sourceBeadID, scopeKind, scopeRef, storeRef string, store beads.Store, cityName, cityPath string, cfg *config.City) error {
 	if !isCompiledGraphWorkflow(recipe) || cfg == nil {
 		return nil
 	}
@@ -125,7 +125,7 @@ func applyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 		}
 	}
 	routeVars := graphWorkflowRouteVars(recipe, vars)
-	return decorateGraphWorkflowRecipe(recipe, routeVars, sourceBeadID, scopeKind, scopeRef, storeRef, routedTo, sessionName, store, cityName, cfg)
+	return decorateGraphWorkflowRecipe(recipe, routeVars, sourceBeadID, scopeKind, scopeRef, storeRef, routedTo, sessionName, store, cityName, cityPath, cfg)
 }
 
 var (
