@@ -363,15 +363,27 @@ func FindSessionFileByID(searchPaths []string, workDir, sessionID string) string
 	if workDir == "" || sessionID == "" {
 		return ""
 	}
+	fileName := safeSessionLogFileName(sessionID)
+	if fileName == "" {
+		return ""
+	}
 	slug := ProjectSlug(workDir)
 	for _, base := range searchPaths {
-		path := filepath.Join(base, slug, sessionID+".jsonl")
+		path := filepath.Join(base, slug, fileName)
 		info, err := os.Stat(path)
 		if err == nil && !info.IsDir() {
 			return path
 		}
 	}
 	return ""
+}
+
+func safeSessionLogFileName(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, "..") || strings.ContainsAny(sessionID, `/\`) {
+		return ""
+	}
+	return filepath.Base(sessionID) + ".jsonl"
 }
 
 // findSlugSessionFile searches slug-organized search paths for the most
