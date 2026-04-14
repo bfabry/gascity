@@ -82,12 +82,18 @@ Options-driven `ResolveAgent`, `ExpandAgents`, `ScaleParamsFor`,
 - **Backward compat**: old DoSling/DoSlingBatch preserved during
   caller migration
 
-## Remaining Migration (Steps 4-5)
+## Caller Migration Status
 
-Callers (CLI, API) still use the old DoSling/SlingOpts API.
-Migration to the intent-based API is incremental:
+**API handler**: Fully migrated. Creates `sling.New(deps)` and
+dispatches to `sl.RouteBead`/`sl.LaunchFormula`/`sl.AttachFormula`
+based on request body intent. No SlingOpts in the API.
 
-- CLI: `cmdSling` maps flags to `s.RouteBead`/`s.LaunchFormula`/etc.
-- API: `handleSling` maps request body to the right method
-- After all callers migrate: delete DoSling, DoSlingBatch, SlingOpts,
-  SlingRunner, preflight, and the dispatch functions
+**CLI**: Partially migrated. Creates `sling.New(deps)` for
+validation. Batch plain-bead routes via `sl.ExpandConvoy`. Single
+sling and formula batch still use legacy `DoSling`/`DoSlingBatch`
+because CLI tests inject custom queriers. Full migration requires
+test infrastructure changes (queriers that use deps.Store).
+
+**Legacy API preserved**: `DoSling`, `DoSlingBatch`, `SlingOpts`
+still exist. The intent methods delegate to them internally.
+Delete once CLI tests are updated to use deps.Store as querier.
