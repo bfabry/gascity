@@ -1,3 +1,6 @@
+// Package agentutil provides agent resolution and pool expansion for
+// Gas City. It lives in agentutil (not agent) to avoid an import cycle
+// with internal/config.
 package agentutil
 
 import (

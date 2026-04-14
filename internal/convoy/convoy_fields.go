@@ -1,6 +1,6 @@
-// Package ops implements shared domain operations for Gas City.
-// Both the CLI (cmd/gc) and the HTTP API (internal/api) depend on this
-// package as thin adapters. ops never imports internal/api or cmd/gc.
+// Package convoy implements convoy (work group) operations for Gas City.
+// It provides convoy creation, progress tracking, item linking, and
+// lifecycle management with event emission.
 package convoy
 
 import (

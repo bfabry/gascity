@@ -377,11 +377,13 @@ func populateSlingDepsCallbacks(deps *slingDeps) {
 
 // printSlingResult writes a SlingResult to stdout/stderr.
 func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
-	for _, w := range result.Warnings {
-		fmt.Fprintln(stderr, w) //nolint:errcheck
-	}
-	for _, m := range result.Messages {
-		fmt.Fprintln(stdout, m) //nolint:errcheck
+	for _, o := range result.Output {
+		switch o.Kind {
+		case sling.OutputMessage:
+			fmt.Fprintln(stdout, o.Text) //nolint:errcheck
+		case sling.OutputWarning:
+			fmt.Fprintln(stderr, o.Text) //nolint:errcheck
+		}
 	}
 }
 

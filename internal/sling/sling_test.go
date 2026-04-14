@@ -218,13 +218,13 @@ func TestDoSlingSuspendedAgentWarns(t *testing.T) {
 		t.Fatalf("DoSling error: %v", err)
 	}
 	found := false
-	for _, w := range result.Warnings {
+	for _, w := range result.Warnings() {
 		if strings.Contains(w, "suspended") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected suspension warning in %v", result.Warnings)
+		t.Errorf("expected suspension warning in %v", result.Warnings())
 	}
 }
 

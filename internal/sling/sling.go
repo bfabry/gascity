@@ -1,3 +1,7 @@
+// Package sling implements work routing operations for Gas City.
+// It provides DoSling and DoSlingBatch for dispatching beads to agents,
+// including formula instantiation, graph workflow decoration, and
+// convoy auto-creation.
 package sling
 
 import (
@@ -68,17 +72,33 @@ type SlingDeps struct {
 	PokeControlDispatch func(cityPath string) error
 }
 
+// OutputKind tags a result output line as a message or warning.
+type OutputKind int
+
+const (
+	// OutputMessage is user-facing info (stdout in CLI).
+	OutputMessage OutputKind = iota
+	// OutputWarning is user-facing warning (stderr in CLI).
+	OutputWarning
+)
+
+// OutputLine is a single line of output from a sling operation,
+// preserving the interleaved order of messages and warnings.
+type OutputLine struct {
+	Kind OutputKind
+	Text string
+}
+
 // SlingResult holds the structured output of a sling operation.
 // Callers (CLI, API) format this for their respective surfaces.
 type SlingResult struct {
-	BeadID     string   // the routed bead ID (or wisp root for formula)
-	Target     string   // qualified agent name
-	Method     string   // "bead", "formula", "on-formula", "default-on-formula"
-	WorkflowID string   // non-empty for graph workflow launches
-	ConvoyID   string   // non-empty if auto-convoy was created
-	Idempotent bool     // true if bead was already routed (skipped)
-	Messages   []string // user-facing info (stdout in CLI)
-	Warnings   []string // user-facing warnings (stderr in CLI)
+	BeadID     string       // the routed bead ID (or wisp root for formula)
+	Target     string       // qualified agent name
+	Method     string       // "bead", "formula", "on-formula", "default-on-formula"
+	WorkflowID string       // non-empty for graph workflow launches
+	ConvoyID   string       // non-empty if auto-convoy was created
+	Idempotent bool         // true if bead was already routed (skipped)
+	Output     []OutputLine // ordered messages and warnings (preserves interleaving)
 
 	// Batch fields (populated by DoSlingBatch).
 	Routed     int
@@ -86,6 +106,38 @@ type SlingResult struct {
 	Skipped    int
 	Total      int
 	NudgeAgent *config.Agent // non-nil if caller should nudge
+}
+
+// Messages returns all message-kind output lines.
+func (r SlingResult) Messages() []string {
+	var msgs []string
+	for _, o := range r.Output {
+		if o.Kind == OutputMessage {
+			msgs = append(msgs, o.Text)
+		}
+	}
+	return msgs
+}
+
+// Warnings returns all warning-kind output lines.
+func (r SlingResult) Warnings() []string {
+	var warns []string
+	for _, o := range r.Output {
+		if o.Kind == OutputWarning {
+			warns = append(warns, o.Text)
+		}
+	}
+	return warns
+}
+
+// msg appends a message to the result output.
+func (r *SlingResult) msg(text string) {
+	r.Output = append(r.Output, OutputLine{Kind: OutputMessage, Text: text})
+}
+
+// warn appends a warning to the result output.
+func (r *SlingResult) warn(text string) {
+	r.Output = append(r.Output, OutputLine{Kind: OutputWarning, Text: text})
 }
 
 // ScaleInfo holds pool scaling parameters for an agent.
@@ -224,7 +276,7 @@ func CheckCrossRig(beadID string, a config.Agent, cfg *config.City) string {
 	if strings.EqualFold(bp, rp) {
 		return ""
 	}
-	return fmt.Sprintf("gc sling: cross-rig routing — bead %s (prefix %q) → agent %s (rig prefix %q). Use --force to override.", beadID, bp, a.QualifiedName(), rp)
+	return fmt.Sprintf("cross-rig routing — bead %s (prefix %q) → agent %s (rig prefix %q)", beadID, bp, a.QualifiedName(), rp)
 }
 
 // BeadExistsInStore checks if a bead exists in the given store.
