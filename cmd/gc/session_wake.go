@@ -300,6 +300,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 			err := sp.SetMeta(name, "GC_DRAIN_ACK", "1")
 			ds.ackSet = true
+			ds.followUp = true
 			if trace != nil {
 				outcome := "success"
 				fields := traceRecordPayload{
@@ -358,6 +359,11 @@ func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk c
 		"state":        "asleep",
 		"last_woke_at": "", // Clear to prevent false crash detection.
 	}
+	if session.Metadata["wake_mode"] == "fresh" {
+		batch["session_key"] = ""
+		batch["started_config_hash"] = ""
+		batch["continuation_reset_pending"] = "true"
+	}
 	if err := store.SetMetadataBatch(session.ID, batch); err == nil {
 		if session.Metadata == nil {
 			session.Metadata = make(map[string]string)
@@ -399,20 +405,4 @@ func verifiedInterrupt(session beads.Bead, sp runtime.Provider) error {
 		}
 	}
 	return sp.Interrupt(name)
-}
-
-// needsConfigRestart returns true if the session's core config has drifted
-// and needs a drain-then-restart cycle.
-func needsConfigRestart(session beads.Bead, cfg *config.City, buildConfigFn func(*config.Agent) runtime.Config) bool {
-	template := normalizedSessionTemplate(session, cfg)
-	agent := findAgentByTemplate(cfg, template)
-	if agent == nil {
-		return false
-	}
-	storedHash := session.Metadata["config_hash"]
-	if storedHash == "" {
-		return false // no hash stored yet — can't detect drift
-	}
-	currentHash := runtime.CoreFingerprint(buildConfigFn(agent))
-	return storedHash != currentHash
 }

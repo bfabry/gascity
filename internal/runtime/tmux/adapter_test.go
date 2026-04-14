@@ -4,6 +4,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -156,4 +157,44 @@ func TestProvider_RecyclesDeadPaneWithoutProcessNames(t *testing.T) {
 	if !p.IsRunning(name) {
 		t.Fatal("session should be running after dead-pane recycle")
 	}
+}
+
+func TestProvider_StartCanceledCleansUpSession(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	cfg := DefaultConfig()
+	cfg.SocketName = testSocketName
+	p := NewProviderWithConfig(cfg)
+	name := "gc-test-adapter-canceled"
+	_ = p.Stop(name)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	err := p.Start(ctx, name, runtime.Config{
+		Command:           "sleep 300",
+		WorkDir:           t.TempDir(),
+		ProcessNames:      []string{"sleep"},
+		ReadyPromptPrefix: "> ",
+		ReadyDelayMs:      1,
+	})
+	if !errors.Is(err, context.Canceled) {
+		_ = p.Stop(name)
+		t.Fatalf("Start: got %v, want context canceled", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !p.IsRunning(name) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = p.Stop(name)
+	t.Fatal("session should be cleaned up after canceled start")
 }

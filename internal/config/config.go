@@ -265,7 +265,7 @@ type Rig struct {
 	DoltHost string `toml:"dolt_host,omitempty"`
 	// DoltPort overrides the city-level Dolt port for this rig's beads.
 	// When set, controller commands (scale_check, work_query) prefix their
-	// shell invocations with BEADS_DOLT_PORT=<port> so bd connects to the
+	// shell invocations with BEADS_DOLT_SERVER_PORT=<port> so bd connects to the
 	// correct server instead of the city-level default.
 	DoltPort string `toml:"dolt_port,omitempty"`
 }
@@ -352,6 +352,11 @@ type AgentOverride struct {
 	MinActiveSessions *int `toml:"min_active_sessions,omitempty"`
 	// ScaleCheck overrides the shell command whose output determines desired session count.
 	ScaleCheck *string `toml:"scale_check,omitempty"`
+	// OptionDefaults adds or overrides provider option defaults for this agent.
+	// Keys are option keys, values are choice values. Merges additively
+	// (override keys win over existing agent keys).
+	// Example: option_defaults = { model = "sonnet" }
+	OptionDefaults map[string]string `toml:"option_defaults,omitempty"`
 }
 
 // PackSource defines a remote pack repository.
@@ -977,6 +982,12 @@ type DaemonConfig struct {
 	// files (e.g., aimux session paths). The default search path
 	// (~/.claude/projects/) is always included.
 	ObservePaths []string `toml:"observe_paths,omitempty"`
+	// ProbeConcurrency bounds the number of concurrent bd subprocess probes
+	// issued by the pool scale_check and work_query paths. bd serializes on
+	// a shared dolt sql-server, so unbounded parallelism causes contention.
+	// Nil (unset) defaults to 8. Set higher for workspaces with a fast
+	// dedicated dolt server, or lower to reduce contention on slow storage.
+	ProbeConcurrency *int `toml:"probe_concurrency,omitempty" jsonschema:"default=8"`
 }
 
 // PatrolIntervalDuration returns the patrol interval as a time.Duration.
@@ -1025,6 +1036,24 @@ func (d *DaemonConfig) ShutdownTimeoutDuration() time.Duration {
 		return 5 * time.Second
 	}
 	return dur
+}
+
+// DefaultProbeConcurrency is the default bd probe concurrency limit.
+// Used by ProbeConcurrencyOrDefault and referenced by cmd/gc/pool.go
+// so the default lives in one place.
+const DefaultProbeConcurrency = 8
+
+// ProbeConcurrencyOrDefault returns the bd probe concurrency limit.
+// Nil (unset) defaults to DefaultProbeConcurrency. Values below 1 are
+// clamped to 1 to prevent deadlock on a zero-capacity semaphore.
+func (d *DaemonConfig) ProbeConcurrencyOrDefault() int {
+	if d.ProbeConcurrency == nil {
+		return DefaultProbeConcurrency
+	}
+	if *d.ProbeConcurrency < 1 {
+		return 1
+	}
+	return *d.ProbeConcurrency
 }
 
 // DriftDrainTimeoutDuration returns the drift drain timeout as a time.Duration.
@@ -1084,15 +1113,20 @@ func (c *City) FormulasDir() string {
 // explicitly override them. Declared once at the city level via
 // [agent_defaults] in city.toml.
 //
-// NOTE: This is a config-only scaffold for Phase 1. Runtime merging of
-// defaults into individual agents is wired in Phase 2 (PR 2c). Until
-// then, these values are parsed and composed but not consumed at runtime.
+// NOTE: Model and WakeMode are parsed and composed but not yet applied
+// to individual agents at runtime. DefaultSlingFormula is applied via
+// ApplyAgentDefaults.
 type AgentDefaults struct {
 	// Model is the default model name for agents (e.g., "claude-sonnet-4-6").
 	// Agents with their own model override take precedence.
 	Model string `toml:"model,omitempty"`
 	// WakeMode is the default wake mode ("resume" or "fresh").
 	WakeMode string `toml:"wake_mode,omitempty" jsonschema:"enum=resume,enum=fresh"`
+	// DefaultSlingFormula is the city-level default formula used for agents
+	// that inherit [agent_defaults]. Explicit agents only receive this value
+	// when agent_defaults.default_sling_formula is set; implicit pool agents
+	// are seeded with "mol-do-work" elsewhere when no explicit default is set.
+	DefaultSlingFormula string `toml:"default_sling_formula,omitempty"`
 	// AllowOverlay lists template fields that sessions may override at
 	// creation time (e.g., ["model", "prompt", "title"]).
 	AllowOverlay []string `toml:"allow_overlay,omitempty"`
@@ -1187,16 +1221,20 @@ type Agent struct {
 	NamepoolNames []string `toml:"-"`
 	// WorkQuery is the shell command to find available work for this agent.
 	// Used by gc hook and available in prompt templates as {{.WorkQuery}}.
-	// Default for fixed agents: "bd ready --assignee=<qualified-name>".
-	// Default for pool agents:
-	// "bd ready --metadata-field gc.routed_to=<qualified-name> --unassigned --json --limit=1 2>/dev/null".
-	// Override to integrate with external task systems.
+	// If unset, Gas City uses a three-tier default query:
+	//   1. in_progress work assigned to this session/alias (crash recovery)
+	//   2. ready work assigned to this session/alias (pre-assigned work)
+	//   3. ready unassigned work with gc.routed_to=<qualified-name>
+	// When the controller probes for demand without session context, only the
+	// routed_to tier applies. Override to integrate with external task systems.
 	WorkQuery string `toml:"work_query,omitempty"`
 	// SlingQuery is the command template to route a bead to this agent/pool.
 	// Used by gc sling to make a bead visible to the target's work_query.
 	// The placeholder {} is replaced with the bead ID at runtime.
-	// Default for fixed agents: "bd update {} --assignee=<qualified-name>".
-	// Default for pool agents: "bd update {} --add-label=pool:<qualified-name>".
+	// Default for all agents:
+	// "bd update {} --set-metadata gc.routed_to=<qualified-name>".
+	// Routing is metadata-based; sling stamps the target template and the
+	// reconciler/scale_check paths decide when sessions are created.
 	// Pool agents must set both sling_query and work_query, or neither.
 	SlingQuery string `toml:"sling_query,omitempty"`
 	// IdleTimeout is the maximum time an agent session can be inactive before
@@ -1249,7 +1287,7 @@ type Agent struct {
 	// DefaultSlingFormula is the formula name automatically applied via --on
 	// when beads are slung to this agent, unless --no-formula is set.
 	// Example: "mol-polecat-work"
-	DefaultSlingFormula string `toml:"default_sling_formula,omitempty"`
+	DefaultSlingFormula *string `toml:"default_sling_formula,omitempty"`
 	// InjectFragments lists named template fragments to append to this agent's
 	// rendered prompt. Fragments come from shared template directories across
 	// all loaded packs. Each name must match a {{ define "name" }} block.
@@ -1279,8 +1317,8 @@ type Agent struct {
 	// Runtime-only — not persisted to TOML or JSON.
 	SleepAfterIdleSource string `toml:"-" json:"-"`
 	// PoolName is the template agent's qualified name, set during pool
-	// expansion. Pool instances use this for label-based work discovery
-	// (e.g., pool:dog) rather than their instance name (e.g., pool:dog-1).
+	// expansion. Pool instances use this for gc.routed_to-based work
+	// discovery (e.g., dog) rather than their concrete instance name (e.g., dog-1).
 	PoolName string `toml:"-"`
 }
 
@@ -1365,6 +1403,15 @@ func (a *Agent) EffectiveSlingQuery() string {
 	return "bd update {} --set-metadata gc.routed_to=" + a.QualifiedName()
 }
 
+// EffectiveDefaultSlingFormula returns the default sling formula for
+// this agent, or "" if none is set.
+func (a *Agent) EffectiveDefaultSlingFormula() string {
+	if a.DefaultSlingFormula == nil {
+		return ""
+	}
+	return *a.DefaultSlingFormula
+}
+
 // DrainTimeoutDuration returns the drain timeout as a time.Duration.
 // Defaults to 5m if empty or unparseable.
 func (a *Agent) DrainTimeoutDuration() time.Duration {
@@ -1380,7 +1427,8 @@ func (a *Agent) DrainTimeoutDuration() time.Duration {
 
 // EffectiveScaleCheck returns the scale check command for this agent.
 // If ScaleCheck is set, returns it. Otherwise returns a default that
-// counts actionable work routed to this agent's template.
+// counts actionable work routed to this agent's template, including
+// formula-dispatched molecule beads (which bd ready excludes).
 func (a *Agent) EffectiveScaleCheck() string {
 	if a.ScaleCheck != "" {
 		return a.ScaleCheck
@@ -1390,7 +1438,9 @@ func (a *Agent) EffectiveScaleCheck() string {
 		` --unassigned --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
 		`active=$(bd list --metadata-field gc.routed_to=` + template +
 		` --status=in_progress --no-assignee --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
-		`echo "$(( ${ready:-0} + ${active:-0} ))" || echo 0`
+		`molecules=$(bd list --metadata-field gc.routed_to=` + template +
+		` --status=open --type=molecule --no-assignee --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
+		`echo "$(( ${ready:-0} + ${active:-0} + ${molecules:-0} ))" || echo 0`
 }
 
 // EffectiveMaxActiveSessions returns the agent's max active sessions.
@@ -1492,6 +1542,11 @@ func InjectImplicitAgents(cfg *City) {
 
 	promptTemplate := citylayout.PromptsRoot + "/pool-worker.md"
 
+	slingFormula := cfg.AgentDefaults.DefaultSlingFormula
+	if slingFormula == "" {
+		slingFormula = "mol-do-work"
+	}
+
 	// City-scoped implicit agents.
 	for _, name := range providers {
 		if existing[agentKey{"", name}] {
@@ -1501,7 +1556,7 @@ func InjectImplicitAgents(cfg *City) {
 			Name:                name,
 			Provider:            name,
 			PromptTemplate:      promptTemplate,
-			DefaultSlingFormula: "mol-do-work",
+			DefaultSlingFormula: &slingFormula,
 			Implicit:            true,
 		})
 	}
@@ -1517,12 +1572,31 @@ func InjectImplicitAgents(cfg *City) {
 				Dir:                 rig.Name,
 				Provider:            name,
 				PromptTemplate:      promptTemplate,
-				DefaultSlingFormula: "mol-do-work",
+				DefaultSlingFormula: &slingFormula,
 				Implicit:            true,
 			})
 		}
 	}
+
 	injectControlDispatcherAgents(cfg, existing)
+}
+
+// ApplyAgentDefaults applies [agent_defaults] values to all agents that
+// don't set their own override. Call after InjectImplicitAgents so
+// implicit agents are already present. Control-dispatcher agents are
+// skipped because they are infrastructure, not work agents.
+func ApplyAgentDefaults(cfg *City) {
+	formula := cfg.AgentDefaults.DefaultSlingFormula
+	if formula != "" {
+		for i := range cfg.Agents {
+			if cfg.Agents[i].Name == ControlDispatcherAgentName {
+				continue
+			}
+			if cfg.Agents[i].DefaultSlingFormula == nil {
+				cfg.Agents[i].DefaultSlingFormula = &formula
+			}
+		}
+	}
 }
 
 // injectControlDispatcherAgents adds city-scoped and rig-scoped control-dispatcher
@@ -1744,12 +1818,6 @@ func ValidateNamedSessions(cfg *City) error {
 		if agent == nil {
 			return fmt.Errorf("named_session %q: referenced template not found after pack expansion", s.QualifiedName())
 		}
-		if strings.TrimSpace(agent.Namepool) != "" || len(agent.NamepoolNames) > 0 {
-			return fmt.Errorf("named_session %q: template %q uses namepool and cannot be a canonical singleton", s.QualifiedName(), agent.QualifiedName())
-		}
-		if max := agent.ResolvedMaxActiveSessions(cfg); max == nil || *max != 1 {
-			return fmt.Errorf("named_session %q: template %q must resolve to max_active_sessions = 1", s.QualifiedName(), agent.QualifiedName())
-		}
 		identity := s.QualifiedName()
 		sessionName := NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
 		if other, ok := reservedAliases[sessionName]; ok && other != identity {
@@ -1854,10 +1922,11 @@ func validateDependsOn(agents []Agent) error {
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
 func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	seenNames := make(map[string]bool, len(rigs))
-	seenPrefixes := make(map[string]string) // prefix → rig name (for error messages)
+	seenPrefixes := make(map[string]string) // lowercase prefix → rig name (for error messages)
 
 	// HQ prefix participates in collision detection.
-	seenPrefixes[hqPrefix] = "HQ"
+	// Lowercase to match runtime lookup (findRigByPrefix is case-insensitive).
+	seenPrefixes[strings.ToLower(hqPrefix)] = "HQ"
 
 	for i, r := range rigs {
 		if r.Name == "" {
@@ -1871,7 +1940,7 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		}
 		seenNames[r.Name] = true
 
-		prefix := r.EffectivePrefix()
+		prefix := strings.ToLower(r.EffectivePrefix())
 		if other, ok := seenPrefixes[prefix]; ok {
 			return fmt.Errorf("rig %q: prefix %q collides with %s", r.Name, prefix, other)
 		}
@@ -1883,11 +1952,19 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 // DefaultCity returns a City with the given name and a single default
 // agent named "mayor". This is the config written by "gc init".
 func DefaultCity(name string) City {
-	one := 1
 	return City{
 		Workspace:     Workspace{Name: name},
-		Agents:        []Agent{{Name: "mayor", PromptTemplate: "prompts/mayor.md", MaxActiveSessions: &one}},
+		Agents:        []Agent{{Name: "mayor", PromptTemplate: "prompts/mayor.md"}},
 		NamedSessions: []NamedSession{{Template: "mayor", Mode: "always"}},
+	}
+}
+
+func defaultInstallAgentHooksForProvider(provider string) []string {
+	switch strings.TrimSpace(provider) {
+	case "opencode":
+		return []string{"opencode"}
+	default:
+		return nil
 	}
 }
 
@@ -1901,12 +1978,12 @@ func WizardCity(name, provider, startCommand string) City {
 		ws.StartCommand = startCommand
 	} else {
 		ws.Provider = provider
+		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
 	}
-	one := 1
 	return City{
 		Workspace: ws,
 		Agents: []Agent{
-			{Name: "mayor", PromptTemplate: "prompts/mayor.md", MaxActiveSessions: &one},
+			{Name: "mayor", PromptTemplate: "prompts/mayor.md"},
 		},
 		NamedSessions: []NamedSession{{Template: "mayor", Mode: "always"}},
 	}
@@ -1927,6 +2004,7 @@ func GastownCity(name, provider, startCommand string) City {
 		ws.StartCommand = startCommand
 	} else if provider != "" {
 		ws.Provider = provider
+		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
 	}
 	maxRestarts := 5
 	return City{

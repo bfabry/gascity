@@ -39,7 +39,7 @@ gc [flags]
 | [gc init](#gc-init) | Initialize a new city |
 | [gc mail](#gc-mail) | Send and receive messages between agents and humans |
 | [gc nudge](#gc-nudge) | Inspect and deliver deferred nudges |
-| [gc order](#gc-order) | Manage orders (periodic formula dispatch) |
+| [gc order](#gc-order) | Manage orders (scheduled and event-driven dispatch) |
 | [gc pack](#gc-pack) | Manage remote pack sources |
 | [gc prime](#gc-prime) | Output the behavioral prompt for an agent |
 | [gc register](#gc-register) | Register a city with the machine-wide supervisor |
@@ -56,6 +56,7 @@ gc [flags]
 | [gc stop](#gc-stop) | Stop all agent sessions in the city |
 | [gc supervisor](#gc-supervisor) | Manage the machine-wide supervisor |
 | [gc suspend](#gc-suspend) | Suspend the city (all agents effectively suspended) |
+| [gc trace](#gc-trace) | Inspect and control session reconciler tracing |
 | [gc unregister](#gc-unregister) | Remove a city from the machine-wide supervisor |
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
@@ -620,8 +621,13 @@ gc convoy target <convoy-id> <branch>
 Web dashboard for monitoring the city
 
 ```
-gc dashboard
+gc dashboard [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--api` | string |  | GC API server URL override (auto-discovered by default) |
+| `--port` | int | `8080` | HTTP port |
 
 | Subcommand | Description |
 |------------|-------------|
@@ -637,7 +643,7 @@ gc dashboard serve [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--api` | string |  | GC API server URL (e.g. standalone http://127.0.0.1:9443, supervisor http://127.0.0.1:8372) |
+| `--api` | string |  | GC API server URL override (auto-discovered by default) |
 | `--port` | int | `8080` | HTTP port |
 
 ## gc doctor
@@ -846,7 +852,7 @@ Returns immediately. Equivalent to:
   gc session kill &lt;target&gt;
 
 Self-handoff requires session context (GC_ALIAS or GC_SESSION_ID, plus
-GC_SESSION_NAME and GC_CITY). Remote handoff accepts a session alias or ID.
+GC_SESSION_NAME and city context env). Remote handoff accepts a session alias or ID.
 
 ```
 gc handoff <subject> [message] [flags]
@@ -903,6 +909,8 @@ gc init
   gc init ~/my-city
   gc init --provider codex ~/my-city
   gc init --provider codex --bootstrap-profile k8s-cell /city
+  gc init --name my-city
+  gc init --from ~/elan --name elan /city
   gc init --file examples/gastown.toml ~/bright-lights
 ```
 
@@ -911,6 +919,7 @@ gc init
 | `--bootstrap-profile` | string |  | bootstrap profile to apply for hosted/container defaults |
 | `--file` | string |  | path to a TOML file to use as city.toml |
 | `--from` | string |  | path to an example city directory to copy |
+| `--name` | string |  | workspace name (default: target directory basename) |
 | `--provider` | string |  | built-in workspace provider to use for the default mayor config |
 | `--skip-provider-readiness` | bool |  | skip provider login/readiness checks during init and continue startup |
 
@@ -1131,11 +1140,12 @@ gc nudge status [session]
 
 ## gc order
 
-Manage orders — formulas with gate conditions for periodic dispatch.
+Manage orders — scheduled or event-driven dispatch of formulas and scripts.
 
-Orders are formulas annotated with scheduling gates (interval, cron
-schedule, or shell check commands). The controller evaluates gates
-periodically and dispatches order formulas when they are due.
+Orders live in orders/NAME/order.toml files. Each order pairs a gate
+condition (cooldown, cron, condition, event, or manual) with an action
+(a formula or an exec script). The controller evaluates gates on each
+tick and dispatches work when a gate opens.
 
 ```
 gc order
@@ -1177,10 +1187,10 @@ gc order history [name] [flags]
 
 ## gc order list
 
-List all available orders with their gate type, schedule, and target pool.
+List all available orders with their gate type, schedule, and target.
 
-Scans formula layers for formulas that have order metadata
-(gate, interval, schedule, check, pool).
+Scans orders/ directories for order.toml files defining gate conditions,
+scheduling parameters, and target pools.
 
 ```
 gc order list
@@ -1191,7 +1201,7 @@ gc order list
 Execute an order manually, bypassing its gate conditions.
 
 Instantiates a wisp from the order's formula and routes it to the
-target pool (if configured). Useful for testing orders or triggering
+configured target (if any). Useful for testing orders or triggering
 them outside their normal schedule.
 Use --rig to disambiguate same-name orders in different rigs.
 
@@ -1208,7 +1218,7 @@ gc order run <name> [flags]
 Display detailed information about a named order.
 
 Shows the order name, description, formula reference, gate type,
-scheduling parameters, check command, target pool, and source file.
+scheduling parameters, check command, target, and source file.
 Use --rig to disambiguate same-name orders in different rigs.
 
 ```
@@ -1268,7 +1278,7 @@ Use it to prime any CLI coding agent with city-aware instructions:
   codex --prompt "$(gc prime worker)"
 
 Runtime hook profiles may call `gc prime --hook`.
-When agent-name is omitted, `GC_AGENT` is used automatically.
+When agent-name is omitted, `GC_ALIAS` is used (falling back to `GC_AGENT`).
 
 If agent-name matches a configured agent with a prompt_template,
 that template is output. Otherwise outputs a default worker prompt.
@@ -1350,6 +1360,7 @@ If the target directory doesn't exist, it is created. Use --include
 to apply a pack directory that defines the rig's agent configuration.
 
 Use --name to set the rig name explicitly (default: directory basename).
+Use --prefix to set the bead ID prefix explicitly (default: derived from name).
 Use --start-suspended to add the rig in a suspended state (dormant-by-default).
 The rig's agents won't spawn until explicitly resumed with "gc rig resume".
 
@@ -1362,6 +1373,7 @@ gc rig add <path> [flags]
 ```
 gc rig add /path/to/project
   gc rig add /path/to/project --name myrig
+  gc rig add /path/to/project --prefix r1
   gc rig add ./my-project --include packs/gastown
   gc rig add ./my-project --include packs/gastown --start-suspended
 ```
@@ -1370,6 +1382,7 @@ gc rig add /path/to/project
 |------|------|---------|-------------|
 | `--include` | string |  | pack directory for rig agents |
 | `--name` | string |  | rig name (default: directory basename) |
+| `--prefix` | string |  | bead ID prefix (default: derived from name) |
 | `--start-suspended` | bool |  | add rig in suspended state (dormant-by-default) |
 
 ## gc rig default
@@ -1438,7 +1451,7 @@ The reconciler will restart the agents on its next tick. This is a
 quick way to force-refresh all agents working on a particular project.
 
 ```
-gc rig restart <name>
+gc rig restart [name]
 ```
 
 ## gc rig resume
@@ -1448,7 +1461,7 @@ Resume a suspended rig by clearing suspended in city.toml.
 The reconciler will start the rig's agents on its next tick.
 
 ```
-gc rig resume <name>
+gc rig resume [name]
 ```
 
 ## gc rig status
@@ -1456,7 +1469,7 @@ gc rig resume <name>
 Show rig status and agent running state
 
 ```
-gc rig status <name>
+gc rig status [name]
 ```
 
 ## gc rig suspend
@@ -1468,7 +1481,7 @@ the reconciler skips them and gc hook returns empty. The rig's beads
 database remains accessible. Use "gc rig resume" to restore.
 
 ```
-gc rig suspend <name>
+gc rig suspend [name]
 ```
 
 ## gc runtime
@@ -1620,6 +1633,8 @@ gc session
 | [gc session peek](#gc-session-peek) | View session output without attaching |
 | [gc session prune](#gc-session-prune) | Close old suspended sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
+| [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
+| [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
 | [gc session wait](#gc-session-wait) | Register a dependency wait for a session |
 | [gc session wake](#gc-session-wake) | Wake a session (clear hold and quarantine) |
@@ -1709,6 +1724,10 @@ gc session logs mayor
 Create a new persistent conversation from an agent template defined in
 city.toml. By default, attaches the terminal after creation.
 
+When --title-hint is provided without --title, the session title is
+auto-generated from the hint text: a short version is set immediately
+and refined by the title model in the background.
+
 ```
 gc session new <template> [flags]
 ```
@@ -1719,6 +1738,7 @@ gc session new <template> [flags]
 gc session new helper
   gc session new helper --alias sky
   gc session new helper --title "debugging auth"
+  gc session new helper --title-hint "fix the login redirect loop"
   gc session new helper --no-attach
 ```
 
@@ -1727,6 +1747,7 @@ gc session new helper
 | `--alias` | string |  | human-friendly session identifier for commands and mail |
 | `--no-attach` | bool |  | create session without attaching |
 | `--title` | string |  | human-readable session title |
+| `--title-hint` | string |  | text to auto-generate a session title from |
 
 ## gc session nudge
 
@@ -1785,6 +1806,43 @@ Rename a session
 ```
 gc session rename <session-id-or-alias> <title>
 ```
+
+## gc session reset
+
+Request a fresh restart for an existing session without closing its bead.
+
+The controller stops the current runtime and starts the same session again with
+fresh provider conversation state. Session identity, alias, mail, and queued
+work remain attached to the existing session bead.
+
+Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
+
+```
+gc session reset <session-id-or-alias>
+```
+
+## gc session submit
+
+Submit a user message to a session without choosing provider transport details.
+
+The runtime decides whether to wake, inject immediately, or queue the message
+according to the selected semantic intent.
+
+```
+gc session submit <id-or-alias> <message...> [flags]
+```
+
+**Example:**
+
+```
+gc session submit mayor "status update"
+  gc session submit mayor "after this run, handle docs" --intent follow_up
+  gc session submit mayor "stop and do this instead" --intent interrupt_now
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--intent` | string | `default` | submit intent: default, follow_up, or interrupt_now |
 
 ## gc session suspend
 
@@ -2063,6 +2121,119 @@ Use "gc resume" to restore.
 ```
 gc suspend [path]
 ```
+
+## gc trace
+
+Inspect and control the session reconciler trace stream.
+
+Trace state is persisted locally under .gc/runtime/session-reconciler-trace
+and can be managed even when the controller is offline.
+
+```
+gc trace
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc trace cycle](#gc-trace-cycle) | Show a cycle by tick id |
+| [gc trace reasons](#gc-trace-reasons) | Show reason codes observed in trace records |
+| [gc trace show](#gc-trace-show) | Show trace records |
+| [gc trace start](#gc-trace-start) | Start or extend tracing for a template |
+| [gc trace status](#gc-trace-status) | Show trace arms and stream state |
+| [gc trace stop](#gc-trace-stop) | Stop tracing for a template |
+| [gc trace tail](#gc-trace-tail) | Follow trace records |
+
+## gc trace cycle
+
+Show a cycle by tick id
+
+```
+gc trace cycle [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--tick` | string |  | tick id to display |
+
+## gc trace reasons
+
+Show reason codes observed in trace records
+
+```
+gc trace reasons [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--since` | string |  | show reasons since duration ago |
+| `--template` | string |  | exact normalized template selector |
+
+## gc trace show
+
+Show trace records
+
+```
+gc trace show [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool | `true` | emit JSON array |
+| `--reason` | string |  | filter by reason code |
+| `--since` | string |  | show records since duration ago |
+| `--template` | string |  | exact normalized template selector |
+| `--tick` | string |  | filter by tick id |
+| `--trace-id` | string |  | filter by trace id |
+| `--type` | string |  | filter by record type |
+
+## gc trace start
+
+Start or extend tracing for a template
+
+```
+gc trace start [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--auto` | bool |  | mark the arm as auto-triggered |
+| `--for` | string | `15m` | trace arm duration (e.g. 15m) |
+| `--level` | string | `detail` | trace level: baseline or detail |
+| `--template` | string |  | exact normalized template selector |
+
+## gc trace status
+
+Show trace arms and stream state
+
+```
+gc trace status
+```
+
+## gc trace stop
+
+Stop tracing for a template
+
+```
+gc trace stop [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--all` | bool |  | remove both manual and auto arms |
+| `--template` | string |  | exact normalized template selector |
+
+## gc trace tail
+
+Follow trace records
+
+```
+gc trace tail [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--since` | string |  | follow from duration ago |
+| `--template` | string |  | exact normalized template selector |
 
 ## gc unregister
 

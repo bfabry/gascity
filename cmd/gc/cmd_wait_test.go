@@ -6,11 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 type waitErrorStore struct {
@@ -22,6 +25,13 @@ func (s waitErrorStore) ListByLabel(label string, limit int, _ ...beads.QueryOpt
 		return nil, errors.New("wait list failed")
 	}
 	return s.MemStore.ListByLabel(label, limit)
+}
+
+func (s waitErrorStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == waitBeadLabel {
+		return nil, errors.New("wait list failed")
+	}
+	return s.MemStore.List(query)
 }
 
 func TestPrepareWaitWakeState_MarksDepsReady(t *testing.T) {
@@ -64,7 +74,7 @@ func TestPrepareWaitWakeState_MarksDepsReady(t *testing.T) {
 		t.Fatalf("create wait bead: %v", err)
 	}
 
-	readyWaitSet, err := prepareWaitWakeState(store, time.Now().UTC())
+	readyWaitSet, err := prepareWaitWakeState(store, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("prepareWaitWakeState: %v", err)
 	}
@@ -117,7 +127,7 @@ func TestPrepareWaitWakeState_FailsMissingDependencyWait(t *testing.T) {
 		t.Fatalf("create wait bead: %v", err)
 	}
 
-	readyWaitSet, err := prepareWaitWakeState(store, time.Now().UTC())
+	readyWaitSet, err := prepareWaitWakeState(store, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("prepareWaitWakeState: %v", err)
 	}
@@ -205,7 +215,7 @@ func TestPrepareWaitWakeState_FinalizesFromNudge(t *testing.T) {
 		t.Fatalf("close nudge bead: %v", err)
 	}
 
-	readyWaitSet, err := prepareWaitWakeState(store, time.Now().UTC())
+	readyWaitSet, err := prepareWaitWakeState(store, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("prepareWaitWakeState: %v", err)
 	}
@@ -242,6 +252,195 @@ func TestDepsWaitReady_IgnoresEmptyDependencyEntries(t *testing.T) {
 	})
 	if !ready {
 		t.Fatal("depsWaitReady = false, want true with only one real closed dependency")
+	}
+}
+
+func TestDepsWaitReadyDetailed_ResolvesRigBeads(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	// Create a dep bead in the rig store (not the city store).
+	dep, err := rigStore.Create(beads.Bead{Title: "rig-task"})
+	if err != nil {
+		t.Fatalf("create dep bead in rig store: %v", err)
+	}
+	if err := rigStore.Close(dep.ID); err != nil {
+		t.Fatalf("close dep bead: %v", err)
+	}
+
+	get := multiStoreGetter(cityStore, map[string]beads.Store{"my-rig": rigStore})
+
+	ready, err := depsWaitReadyDetailed(get, beads.Bead{
+		Metadata: map[string]string{
+			"dep_ids":  dep.ID,
+			"dep_mode": "all",
+		},
+	})
+	if err != nil {
+		t.Fatalf("depsWaitReadyDetailed: %v", err)
+	}
+	if !ready {
+		t.Fatal("depsWaitReadyDetailed = false, want true for closed rig bead")
+	}
+}
+
+func TestDepsWaitReadyDetailed_RigBeadNotClosedStaysPending(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	// Create a dep bead in the rig store but do NOT close it.
+	dep, err := rigStore.Create(beads.Bead{Title: "rig-task-pending"})
+	if err != nil {
+		t.Fatalf("create dep bead in rig store: %v", err)
+	}
+
+	get := multiStoreGetter(cityStore, map[string]beads.Store{"my-rig": rigStore})
+
+	ready, err := depsWaitReadyDetailed(get, beads.Bead{
+		Metadata: map[string]string{
+			"dep_ids":  dep.ID,
+			"dep_mode": "all",
+		},
+	})
+	if err != nil {
+		t.Fatalf("depsWaitReadyDetailed: %v", err)
+	}
+	if ready {
+		t.Fatal("depsWaitReadyDetailed = true, want false for open rig bead")
+	}
+}
+
+func TestDepsWaitReadyDetailed_MissingFromAllStores(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	get := multiStoreGetter(cityStore, map[string]beads.Store{"my-rig": rigStore})
+
+	ready, err := depsWaitReadyDetailed(get, beads.Bead{
+		Metadata: map[string]string{
+			"dep_ids":  "gc-nonexistent",
+			"dep_mode": "all",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for bead missing from all stores")
+	}
+	if ready {
+		t.Fatal("depsWaitReadyDetailed = true, want false for missing bead")
+	}
+}
+
+func TestPrepareWaitWakeState_ResolvesCrossRigDeps(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	// Offset rig store sequence to avoid ID collisions with the city store.
+	rigStore := beads.NewMemStoreFrom(100, nil, nil)
+
+	// Create session bead in city store.
+	sessionBead, err := cityStore.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":       "worker",
+			"agent_name":         "worker",
+			"continuation_epoch": "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	// Create dependency bead in rig store and close it.
+	dep, err := rigStore.Create(beads.Bead{Title: "rig-work"})
+	if err != nil {
+		t.Fatalf("create dep bead in rig store: %v", err)
+	}
+	if err := rigStore.Close(dep.ID); err != nil {
+		t.Fatalf("close dep bead: %v", err)
+	}
+
+	// Create wait bead in city store referencing the rig dep.
+	_, err = cityStore.Create(beads.Bead{
+		Type:   waitBeadType,
+		Labels: []string{waitBeadLabel, "session:" + sessionBead.ID},
+		Metadata: map[string]string{
+			"session_id":       sessionBead.ID,
+			"session_name":     "worker",
+			"kind":             "deps",
+			"state":            waitStatePending,
+			"dep_ids":          dep.ID,
+			"dep_mode":         "all",
+			"registered_epoch": "1",
+			"delivery_attempt": "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create wait bead: %v", err)
+	}
+
+	rigStores := map[string]beads.Store{"my-rig": rigStore}
+	readyWaitSet, err := prepareWaitWakeState(cityStore, rigStores, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("prepareWaitWakeState: %v", err)
+	}
+	if !readyWaitSet[sessionBead.ID] {
+		t.Fatalf("readyWaitSet does not contain session %s — cross-rig dep not resolved", sessionBead.ID)
+	}
+}
+
+func TestMultiStoreGetter_CityStoreFirst(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	// Create bead in city store.
+	cityBead, err := cityStore.Create(beads.Bead{Title: "city-bead"})
+	if err != nil {
+		t.Fatalf("create city bead: %v", err)
+	}
+
+	get := multiStoreGetter(cityStore, map[string]beads.Store{"my-rig": rigStore})
+	b, err := get(cityBead.ID)
+	if err != nil {
+		t.Fatalf("multiStoreGetter: %v", err)
+	}
+	if b.Title != "city-bead" {
+		t.Fatalf("got title %q, want %q", b.Title, "city-bead")
+	}
+}
+
+// brokenStore wraps a MemStore but returns a non-ErrNotFound error on Get.
+type brokenStore struct {
+	*beads.MemStore
+}
+
+func (s brokenStore) Get(_ string) (beads.Bead, error) {
+	return beads.Bead{}, errors.New("store unavailable")
+}
+
+func TestMultiStoreGetter_PropagatesCityStoreError(t *testing.T) {
+	city := brokenStore{beads.NewMemStore()}
+	rig := beads.NewMemStore()
+
+	get := multiStoreGetter(city, map[string]beads.Store{"r": rig})
+	_, err := get("gc-1")
+	if err == nil {
+		t.Fatal("expected error from broken city store")
+	}
+	if !strings.Contains(err.Error(), "city store") {
+		t.Fatalf("error should mention city store, got: %v", err)
+	}
+}
+
+func TestMultiStoreGetter_PropagatesRigStoreError(t *testing.T) {
+	city := beads.NewMemStore()
+	rig := brokenStore{beads.NewMemStore()}
+
+	get := multiStoreGetter(city, map[string]beads.Store{"r": rig})
+	_, err := get("gc-nonexistent")
+	if err == nil {
+		t.Fatal("expected error from broken rig store")
+	}
+	if !strings.Contains(err.Error(), "rig store") {
+		t.Fatalf("error should mention rig store, got: %v", err)
 	}
 }
 
@@ -341,6 +540,9 @@ func TestRetryClosedWait_CreatesReplacement(t *testing.T) {
 	}
 	if retried.ID == wait.ID {
 		t.Fatal("retryClosedWait reused original wait ID")
+	}
+	if retried.Type != waitBeadType {
+		t.Fatalf("retried type = %q, want %q", retried.Type, waitBeadType)
 	}
 	if retried.Metadata["state"] != waitStateReady {
 		t.Fatalf("retried state = %q, want %q", retried.Metadata["state"], waitStateReady)
@@ -495,7 +697,7 @@ func TestDispatchReadyWaitNudges_EnqueuesDeterministicNudge(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	if err := dispatchReadyWaitNudges(dir, store, sp, time.Now().UTC()); err != nil {
+	if err := dispatchReadyWaitNudges(dir, store, sp, time.Now().UTC(), nil); err != nil {
 		t.Fatalf("dispatchReadyWaitNudges: %v", err)
 	}
 	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now().UTC())
@@ -527,62 +729,113 @@ func TestDispatchReadyWaitNudges_EnqueuesDeterministicNudge(t *testing.T) {
 	}
 }
 
-func TestDispatchReadyWaitNudges_StartsCodexPoller(t *testing.T) {
-	t.Setenv("GC_BEADS", "file")
-	dir := t.TempDir()
-	store, err := openCityStoreAt(dir)
-	if err != nil {
-		t.Fatalf("openCityStoreAt: %v", err)
-	}
-	sessionBead, err := store.Create(beads.Bead{
-		Type:   sessionBeadType,
-		Labels: []string{sessionBeadLabel},
-		Metadata: map[string]string{
-			"session_name":       "worker",
-			"agent_name":         "worker",
-			"continuation_epoch": "1",
-			"provider":           "codex",
+// TestDispatchReadyWaitNudges_PollerGatedOnCapability proves the wait-dispatch
+// poller gate is driven by NeedsNudgePoller capability, not provider name.
+// It covers builtins, codex-derived aliases (via provider_kind), and custom
+// city-configured providers.
+func TestDispatchReadyWaitNudges_PollerGatedOnCapability(t *testing.T) {
+	cases := []struct {
+		name          string
+		provider      string
+		providerKind  string
+		cityProviders map[string]config.ProviderSpec
+		wantCalled    bool
+	}{
+		{name: "codex builtin starts poller", provider: "codex", wantCalled: true},
+		{name: "claude builtin skips poller", provider: "claude", wantCalled: false},
+		{name: "unknown provider skips poller", provider: "custom-runtime", wantCalled: false},
+		{
+			name:         "codex-derived alias starts poller via provider_kind",
+			provider:     "my-fast-codex",
+			providerKind: "codex",
+			wantCalled:   true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("create session bead: %v", err)
-	}
-	if _, err := store.Create(beads.Bead{
-		Type:   waitBeadType,
-		Labels: []string{waitBeadLabel, "session:" + sessionBead.ID},
-		Metadata: map[string]string{
-			"session_id":       sessionBead.ID,
-			"session_name":     "worker",
-			"kind":             "deps",
-			"state":            waitStateReady,
-			"dep_ids":          "gc-1",
-			"dep_mode":         "all",
-			"registered_epoch": "1",
-			"delivery_attempt": "1",
+		{
+			name:     "custom city provider with NeedsNudgePoller starts poller",
+			provider: "amp-poll",
+			cityProviders: map[string]config.ProviderSpec{
+				"amp-poll": {NeedsNudgePoller: true},
+			},
+			wantCalled: true,
 		},
-	}); err != nil {
-		t.Fatalf("create wait bead: %v", err)
+		{
+			name:     "custom city provider without NeedsNudgePoller skips poller",
+			provider: "amp-hook",
+			cityProviders: map[string]config.ProviderSpec{
+				"amp-hook": {NeedsNudgePoller: false},
+			},
+			wantCalled: false,
+		},
+		{
+			name:         "city alias derived from codex inherits NeedsNudgePoller",
+			provider:     "my-fast-codex",
+			providerKind: "codex",
+			cityProviders: map[string]config.ProviderSpec{
+				"my-fast-codex": {Command: "codex"},
+			},
+			wantCalled: true,
+		},
 	}
-	sp := runtime.NewFake()
-	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	called := false
-	prev := startNudgePoller
-	startNudgePoller = func(cityPath, agentName, sessionName string) error {
-		called = true
-		if cityPath != dir || agentName != "worker" || sessionName != "worker" {
-			t.Fatalf("unexpected poller args city=%q agent=%q session=%q", cityPath, agentName, sessionName)
-		}
-		return nil
-	}
-	t.Cleanup(func() { startNudgePoller = prev })
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GC_BEADS", "file")
+			dir := t.TempDir()
+			store, err := openCityStoreAt(dir)
+			if err != nil {
+				t.Fatalf("openCityStoreAt: %v", err)
+			}
+			meta := map[string]string{
+				"session_name":       "worker",
+				"agent_name":         "worker",
+				"continuation_epoch": "1",
+				"provider":           tc.provider,
+			}
+			if tc.providerKind != "" {
+				meta["provider_kind"] = tc.providerKind
+			}
+			sessionBead, err := store.Create(beads.Bead{
+				Type:     sessionBeadType,
+				Labels:   []string{sessionBeadLabel},
+				Metadata: meta,
+			})
+			if err != nil {
+				t.Fatalf("create session bead: %v", err)
+			}
+			if _, err := store.Create(beads.Bead{
+				Type:   waitBeadType,
+				Labels: []string{waitBeadLabel, "session:" + sessionBead.ID},
+				Metadata: map[string]string{
+					"session_id":       sessionBead.ID,
+					"session_name":     "worker",
+					"kind":             "deps",
+					"state":            waitStateReady,
+					"dep_ids":          "gc-1",
+					"dep_mode":         "all",
+					"registered_epoch": "1",
+					"delivery_attempt": "1",
+				},
+			}); err != nil {
+				t.Fatalf("create wait bead: %v", err)
+			}
+			sp := runtime.NewFake()
+			if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			called := false
+			prev := startNudgePoller
+			startNudgePoller = func(_, _, _ string) error {
+				called = true
+				return nil
+			}
+			t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := dispatchReadyWaitNudges(dir, store, sp, time.Now().UTC()); err != nil {
-		t.Fatalf("dispatchReadyWaitNudges: %v", err)
-	}
-	if !called {
-		t.Fatal("startNudgePoller was not called")
+			if err := dispatchReadyWaitNudges(dir, store, sp, time.Now().UTC(), tc.cityProviders); err != nil {
+				t.Fatalf("dispatchReadyWaitNudges: %v", err)
+			}
+			if called != tc.wantCalled {
+				t.Fatalf("startNudgePoller called = %v, want %v", called, tc.wantCalled)
+			}
+		})
 	}
 }
 
@@ -661,6 +914,32 @@ func TestCancelWaitsForSession(t *testing.T) {
 	}
 	if updated.Status != "closed" {
 		t.Fatalf("wait status = %q, want closed", updated.Status)
+	}
+}
+
+func TestLoadSessionWaitBeads_IncludesLegacyWaitType(t *testing.T) {
+	store := beads.NewMemStore()
+	sessionID := "gc-session"
+	if _, err := store.Create(beads.Bead{
+		Type:   sessionpkg.LegacyWaitBeadType,
+		Labels: []string{waitBeadLabel, "session:" + sessionID},
+		Metadata: map[string]string{
+			"session_id": sessionID,
+			"state":      waitStatePending,
+		},
+	}); err != nil {
+		t.Fatalf("create legacy wait bead: %v", err)
+	}
+
+	waits, err := loadSessionWaitBeads(store, sessionID)
+	if err != nil {
+		t.Fatalf("loadSessionWaitBeads: %v", err)
+	}
+	if len(waits) != 1 {
+		t.Fatalf("loadSessionWaitBeads returned %d waits, want 1", len(waits))
+	}
+	if waits[0].Type != sessionpkg.LegacyWaitBeadType {
+		t.Fatalf("wait type = %q, want legacy %q", waits[0].Type, sessionpkg.LegacyWaitBeadType)
 	}
 }
 

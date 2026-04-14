@@ -19,6 +19,12 @@
 
 set -e
 
+# K8s pods use GC_K8S_DOLT_* to point at the in-cluster Dolt service.
+# Inherit into standard vars when they're not already set so is_remote(),
+# allocate_port(), and connect_host() work without K8s-specific logic.
+: "${GC_DOLT_HOST:=$GC_K8S_DOLT_HOST}"
+: "${GC_DOLT_PORT:=$GC_K8S_DOLT_PORT}"
+
 # --- Configuration ---
 
 # DOLT_PORT is set after derived paths are resolved (see allocate_port below).
@@ -189,6 +195,30 @@ ensure_database_registered() {
 
     echo "warning: database $db not visible after 5 catalog probes" >&2
     return 1
+}
+
+database_exists() {
+    local db="$1"
+    [ -n "$db" ] || return 1
+
+    if ! valid_sql_name "$db"; then
+        return 1
+    fi
+
+    server_sql "USE \`$db\`" >/dev/null 2>&1
+}
+
+read_existing_dolt_database() {
+    local meta_file="$1"
+    [ -f "$meta_file" ] || return 0
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.dolt_database // empty' "$meta_file" 2>/dev/null || true
+        return 0
+    fi
+
+    grep -o '"dolt_database"[[:space:]]*:[[:space:]]*"[^"]*"' "$meta_file" 2>/dev/null | \
+        sed 's/.*"dolt_database"[[:space:]]*:[[:space:]]*"//;s/"//' || true
 }
 
 # --- Robustness Helpers ---
@@ -560,6 +590,8 @@ clean_stale_sockets() {
 ensure_metadata() {
     local meta_file="$1"
     local prefix="$2"
+    local dolt_database="$3"
+    local explicit_db="${4:-false}"
 
     [ -f "$meta_file" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
@@ -572,19 +604,49 @@ ensure_metadata() {
     beads_dir=$(dirname "$meta_file")
     write_port_file "$beads_dir"
 
+    if [ -z "$dolt_database" ]; then
+        dolt_database="$prefix"
+    fi
+
+    local existing_db existing_state target_db
+    existing_db=$(read_existing_dolt_database "$meta_file")
+    target_db="$dolt_database"
+    if [ -n "$existing_db" ] && [ "$existing_db" != "$dolt_database" ]; then
+        if [ "$explicit_db" = "true" ] || ! valid_sql_name "$existing_db"; then
+            echo "warning: metadata.json dolt_database was '$existing_db', correcting to '$dolt_database' (identity mismatch repair)" >&2
+            existing_state="repair"
+        else
+            target_db="$existing_db"
+            existing_state="preserve"
+        fi
+    fi
+
     # Patch missing/wrong fields (preserving other fields).
     # Removes deprecated dolt_server_port and unused dolt_port fields
     # to prevent beads v0.60.0+ deprecation warnings.
-    # NOTE: dolt_database uses //= to preserve existing value — the prefix
-    # and database name may differ (e.g., prefix "gc" but database "gascity").
+    # When an explicit canonical database name is available, repair metadata
+    # identity drift instead of silently preserving it.
     local tmp_file
     tmp_file=$(mktemp)
     if jq --arg mode "server" \
           --arg host "$host" \
           --arg user "$DOLT_USER" \
           --arg pass "$DOLT_PASSWORD" \
-          --arg prefix "$prefix" \
-          'del(.dolt_server_port, .dolt_port) | .database = "dolt" | .backend = "dolt" | .dolt_mode = $mode | .dolt_database //= $prefix | .dolt_host = $host | .dolt_user = $user | if $pass != "" then .dolt_password = $pass else . end' \
+          --arg target_db "$target_db" \
+          --arg existing_state "$existing_state" \
+          'del(.dolt_server_port, .dolt_port) |
+           .database = "dolt" |
+           .backend = "dolt" |
+           .dolt_mode = $mode |
+           .dolt_database = (
+             if .dolt_database == null or .dolt_database == "" then $target_db
+             elif $existing_state == "repair" then $target_db
+             else .dolt_database
+             end
+           ) |
+           .dolt_host = $host |
+           .dolt_user = $user |
+           if $pass != "" then .dolt_password = $pass else . end' \
           "$meta_file" > "$tmp_file" 2>/dev/null; then
         mv "$tmp_file" "$meta_file"
     else
@@ -807,11 +869,13 @@ run_bd_pinned() {
         cd "$dir" || exit 1
         export BEADS_DIR="$beads_dir"
         export GC_DOLT_HOST="$host"
-        export BEADS_DOLT_HOST="$host"
+        export BEADS_DOLT_SERVER_HOST="$host"
         export GC_DOLT_PORT="$DOLT_PORT"
-        export BEADS_DOLT_PORT="$DOLT_PORT"
+        export BEADS_DOLT_SERVER_PORT="$DOLT_PORT"
         export GC_DOLT_USER="$DOLT_USER"
         export GC_DOLT_PASSWORD="$DOLT_PASSWORD"
+        export BEADS_DOLT_SERVER_USER="$DOLT_USER"
+        export BEADS_DOLT_PASSWORD="$DOLT_PASSWORD"
         bd "$@"
     )
 }
@@ -837,18 +901,26 @@ verify_root_store() {
 }
 
 # op_init initializes beads in a directory.
-# Args: <dir> <prefix>
+# Args: <dir> <prefix> [dolt_database]
 op_init() {
     local dir="$1"
     local prefix="$2"
+    local dolt_database="${3:-}"
+    local explicit_db="false"
 
     if [ -z "$dir" ] || [ -z "$prefix" ]; then
-        die "usage: gc-beads-bd init <dir> <prefix>"
+        die "usage: gc-beads-bd init <dir> <prefix> [dolt_database]"
     fi
 
     # Validate prefix before SQL interpolation (upstream 38f7b380).
     if ! valid_sql_name "$prefix"; then
         die "invalid beads prefix: $prefix (must be alphanumeric, hyphens, underscores)"
+    fi
+    if [ -n "$dolt_database" ] && ! valid_sql_name "$dolt_database"; then
+        die "invalid dolt database name: $dolt_database (must be alphanumeric, hyphens, underscores)"
+    fi
+    if [ -n "$dolt_database" ]; then
+        explicit_db="true"
     fi
 
     # Filter BEADS_DIR from inherited environment to prevent bd from
@@ -857,17 +929,27 @@ op_init() {
     unset BEADS_DIR
     export BEADS_DIR="$beads_dir"
 
+    if [ -z "$dolt_database" ]; then
+        local existing_db
+        existing_db=$(read_existing_dolt_database "$dir/.beads/metadata.json")
+        if [ -n "$existing_db" ] && valid_sql_name "$existing_db"; then
+            dolt_database="$existing_db"
+        else
+            dolt_database="$prefix"
+        fi
+    fi
+
     # Custom bead types for bd (extracted from beads core in v0.46.0).
     # GC_BEADS_CUSTOM_TYPES overrides the default SDK set.
-    local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session}"
+    local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec}"
 
     # If already initialized on disk, ensure the database is also registered
     # with the running server. This covers the case where bd init created the
     # directory but the server was restarted (or the database was quarantined).
     # Also repair any missing/wrong metadata fields.
     if [ -f "$dir/.beads/metadata.json" ]; then
-        if ensure_database_registered "$prefix"; then
-            ensure_metadata "$dir/.beads/metadata.json" "$prefix"
+        if ensure_database_registered "$dolt_database"; then
+            ensure_metadata "$dir/.beads/metadata.json" "$prefix" "$dolt_database" "$explicit_db"
             # Ensure issue_prefix is set (may be missing if bd init was run
             # manually or metadata was created without full initialization).
             run_bd_pinned "$dir" config set issue_prefix "$prefix" 2>/dev/null || true
@@ -878,7 +960,7 @@ op_init() {
             exit 0
         fi
         # Database registration failed — fall through to full init.
-        echo "warning: database '$prefix' not registered; re-initializing" >&2
+        echo "warning: database '$dolt_database' not registered; re-initializing" >&2
     fi
 
     local host
@@ -888,18 +970,12 @@ op_init() {
     # IF NOT EXISTS both creates the on-disk directory and registers it in
     # the server's catalog. This is the upstream gastown pattern — when the
     # server is running, always go through SQL rather than dolt init on disk.
-    ensure_database_registered "$prefix" || true
+    ensure_database_registered "$dolt_database" || true
 
     # Run bd init in server mode.
     (cd "$dir" && bd init --quiet --server -p "$prefix" --skip-hooks --skip-agents \
         --server-host "$host" --server-port "$DOLT_PORT" \
         "$dir") || die "bd init failed for $dir"
-
-    # Set issue_prefix.
-    run_bd_pinned "$dir" config set issue_prefix "$prefix" 2>/dev/null || true
-
-    # Configure custom bead types (required since beads v0.46.0).
-    run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
 
     # Drop orphan database created by bd init (upstream gt-sv1h).
     # bd init --prefix creates beads_<prefix> on the Dolt server, but we
@@ -908,6 +984,16 @@ op_init() {
     if [ "$orphan_db" != "$prefix" ]; then
         server_sql "DROP DATABASE IF EXISTS \`$orphan_db\`" >/dev/null 2>&1 || true
     fi
+
+    # Patch metadata.json with SQL connection info and required fields before
+    # running any bd subcommands that depend on the correct server-side DB.
+    ensure_metadata "$dir/.beads/metadata.json" "$prefix" "$dolt_database" "$explicit_db"
+
+    # Set issue_prefix.
+    run_bd_pinned "$dir" config set issue_prefix "$prefix" 2>/dev/null || true
+
+    # Configure custom bead types (required since beads v0.46.0).
+    run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
 
     # Ensure config.yaml exists with correct prefix settings. Fallback
     # in case bd init didn't create it (matches upstream EnsureConfigYAML).
@@ -918,8 +1004,6 @@ op_init() {
     # Without fingerprint, the bd daemon may fail to start silently.
     run_bd_pinned "$dir" migrate --update-repo-id 2>/dev/null || true
 
-    # Patch metadata.json with SQL connection info and required fields.
-    ensure_metadata "$dir/.beads/metadata.json" "$prefix"
     write_port_file "$beads_dir"
 
     verify_root_store "$beads_dir" || die "bd init verification failed for $dir"

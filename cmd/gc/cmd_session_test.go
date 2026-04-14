@@ -1,14 +1,53 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 )
+
+type attachmentAwareProvider struct {
+	*runtime.Fake
+	sleepCapability runtime.SessionSleepCapability
+	pending         *runtime.PendingInteraction
+	pendingErr      error
+	responded       runtime.InteractionResponse
+	respondErr      error
+}
+
+func (p *attachmentAwareProvider) SleepCapability(string) runtime.SessionSleepCapability {
+	return p.sleepCapability
+}
+
+func (p *attachmentAwareProvider) Pending(string) (*runtime.PendingInteraction, error) {
+	if p.pendingErr != nil {
+		return nil, p.pendingErr
+	}
+	if p.pending == nil {
+		return nil, nil
+	}
+	pendingCopy := *p.pending
+	return &pendingCopy, nil
+}
+
+func (p *attachmentAwareProvider) Respond(_ string, response runtime.InteractionResponse) error {
+	if p.respondErr != nil {
+		return p.respondErr
+	}
+	p.responded = response
+	return nil
+}
 
 func TestFormatDuration(t *testing.T) {
 	tests := []struct {
@@ -154,65 +193,561 @@ func TestShouldAttachNewSession(t *testing.T) {
 	}
 }
 
-func TestResolvedSessionCommandIncludesDefaultsAndSettings(t *testing.T) {
-	cityPath := t.TempDir()
-	settingsDir := filepath.Join(cityPath, ".gc")
-	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
-		t.Fatalf("mkdir settings dir: %v", err)
-	}
-	settingsPath := filepath.Join(settingsDir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o644); err != nil {
-		t.Fatalf("write settings: %v", err)
-	}
+func TestBuildAttachmentCache_OnlyCachesKnownActiveSessions(t *testing.T) {
+	cache := buildAttachmentCache([]session.Info{
+		{SessionName: "active-attached", State: session.StateActive, Attached: true},
+		{SessionName: "active-detached", State: session.StateActive, Attached: false},
+		{SessionName: "sleeping", State: session.StateAsleep, Attached: false},
+		{SessionName: "suspended", State: session.StateSuspended, Attached: false},
+		{State: session.StateActive, Attached: true},
+	})
 
-	claude := config.BuiltinProviders()["claude"]
-	resolved := &config.ResolvedProvider{
-		Name:              "claude",
-		Command:           claude.Command,
-		OptionsSchema:     claude.OptionsSchema,
-		EffectiveDefaults: config.ComputeEffectiveDefaults(claude.OptionsSchema, claude.OptionDefaults, nil),
+	if len(cache) != 2 {
+		t.Fatalf("cache entries = %d, want 2", len(cache))
 	}
-
-	got, err := resolvedSessionCommand(cityPath, resolved, nil)
-	if err != nil {
-		t.Fatalf("resolvedSessionCommand: %v", err)
+	if got, ok := cache["active-attached"]; !ok || !got {
+		t.Fatalf("cache[active-attached] = (%v, %v), want (true, true)", got, ok)
 	}
-	if !strings.Contains(got, "--dangerously-skip-permissions") {
-		t.Fatalf("command %q should include unrestricted default permissions", got)
+	if got, ok := cache["active-detached"]; !ok || got {
+		t.Fatalf("cache[active-detached] = (%v, %v), want (false, true)", got, ok)
 	}
-	if !strings.Contains(got, "--effort max") {
-		t.Fatalf("command %q should include effort=max default", got)
+	if _, ok := cache["sleeping"]; ok {
+		t.Fatal("sleeping session should not be cached")
 	}
-	wantSettings := `--settings "` + settingsPath + `"`
-	if !strings.Contains(got, wantSettings) {
-		t.Fatalf("command %q should include %s", got, wantSettings)
+	if _, ok := cache["suspended"]; ok {
+		t.Fatal("suspended session should not be cached")
 	}
 }
 
-func TestResolvedSessionCommandAppliesOverridesOverDefaults(t *testing.T) {
-	cityPath := t.TempDir()
-	claude := config.BuiltinProviders()["claude"]
-	resolved := &config.ResolvedProvider{
-		Name:              "claude",
-		Command:           claude.Command,
-		OptionsSchema:     claude.OptionsSchema,
-		EffectiveDefaults: config.ComputeEffectiveDefaults(claude.OptionsSchema, claude.OptionDefaults, nil),
+func TestSessionListTargetPrefersAlias(t *testing.T) {
+	info := session.Info{
+		Alias:       "hal",
+		SessionName: "s-gc-123",
+		Title:       "debug auth flow",
 	}
 
-	got, err := resolvedSessionCommand(cityPath, resolved, map[string]string{
-		"permission_mode": "plan",
-		"effort":          "low",
-	})
+	if got := sessionListTarget(info); got != "hal" {
+		t.Fatalf("sessionListTarget(alias) = %q, want %q", got, "hal")
+	}
+	if got := sessionListTitle(info); got != "debug auth flow" {
+		t.Fatalf("sessionListTitle(title) = %q, want %q", got, "debug auth flow")
+	}
+}
+
+func TestSessionListTargetFallsBackToSessionName(t *testing.T) {
+	info := session.Info{
+		SessionName: "s-gc-123",
+	}
+
+	if got := sessionListTarget(info); got != "s-gc-123" {
+		t.Fatalf("sessionListTarget(session_name) = %q, want %q", got, "s-gc-123")
+	}
+	if got := sessionListTitle(info); got != "-" {
+		t.Fatalf("sessionListTitle(empty) = %q, want %q", got, "-")
+	}
+}
+
+func TestSessionListTitleTruncatesLongHumanTitle(t *testing.T) {
+	info := session.Info{Title: "this is a very long session title that should be truncated"}
+
+	got := sessionListTitle(info)
+	if got != "this is a very long session..." {
+		t.Fatalf("sessionListTitle(truncate) = %q, want %q", got, "this is a very long session...")
+	}
+}
+
+func TestBuildResumeCommandUsesResolvedProviderCommand(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "mayor", Provider: "wrapped"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"wrapped": {
+				DisplayName:       "Wrapped Gemini",
+				Command:           "aimux",
+				Args:              []string{"run", "gemini", "--", "--approval-mode", "yolo"},
+				PathCheck:         "true", // use /usr/bin/true so LookPath succeeds in CI
+				ReadyPromptPrefix: "> ",
+				Env: map[string]string{
+					"GC_HOME": "/tmp/gc-accept-home",
+				},
+			},
+		},
+	}
+
+	info := session.Info{
+		Template: "mayor",
+		Command:  "gemini --approval-mode yolo",
+		Provider: "wrapped",
+		WorkDir:  "/tmp/workdir",
+	}
+
+	cmd, hints := buildResumeCommand(cfg, info, "")
+	if got, want := cmd, "aimux run gemini -- --approval-mode yolo"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+	if got, want := hints.WorkDir, "/tmp/workdir"; got != want {
+		t.Fatalf("hints.WorkDir = %q, want %q", got, want)
+	}
+	if got, want := hints.ReadyPromptPrefix, "> "; got != want {
+		t.Fatalf("hints.ReadyPromptPrefix = %q, want %q", got, want)
+	}
+	if got, want := hints.Env["GC_HOME"], "/tmp/gc-accept-home"; got != want {
+		t.Fatalf("hints.Env[GC_HOME] = %q, want %q", got, want)
+	}
+}
+
+func TestSessionReason_FallsThroughToProviderForSleepingAttachment(t *testing.T) {
+	sp := runtime.NewFake()
+	_ = sp.Start(context.Background(), "sleeping-worker", runtime.Config{})
+	sp.SetAttached("sleeping-worker", true)
+
+	cfg := &config.City{}
+	bead := beads.Bead{
+		ID:     "gc-1",
+		Status: "open",
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "sleeping-worker",
+			"state":        "asleep",
+			"sleep_reason": "idle-timeout",
+		},
+	}
+	info := session.Info{
+		ID:          "gc-1",
+		Template:    "worker",
+		State:       session.StateAsleep,
+		SessionName: "sleeping-worker",
+		Attached:    false,
+	}
+
+	reason := sessionReason(
+		info,
+		map[string]beads.Bead{bead.ID: bead},
+		cfg,
+		&attachmentCachingProvider{
+			Provider: sp,
+			cache:    buildAttachmentCache([]session.Info{info}),
+		},
+		nil,
+		nil,
+	)
+	if reason != string(WakeAttached) {
+		t.Fatalf("sessionReason = %q, want %q", reason, WakeAttached)
+	}
+}
+
+func TestAttachmentCachingProvider_DelegatesSleepCapability(t *testing.T) {
+	provider := &attachmentAwareProvider{
+		Fake:            runtime.NewFake(),
+		sleepCapability: runtime.SessionSleepCapabilityTimedOnly,
+	}
+	wrapped := &attachmentCachingProvider{Provider: provider, cache: map[string]bool{}}
+
+	if got := resolveSleepCapability(wrapped, "worker"); got != runtime.SessionSleepCapabilityTimedOnly {
+		t.Fatalf("resolveSleepCapability = %q, want %q", got, runtime.SessionSleepCapabilityTimedOnly)
+	}
+}
+
+func TestAttachmentCachingProvider_DelegatesPendingInteraction(t *testing.T) {
+	provider := &attachmentAwareProvider{
+		Fake: runtime.NewFake(),
+		pending: &runtime.PendingInteraction{
+			RequestID: "req-1",
+			Kind:      "approval",
+		},
+	}
+	wrapped := &attachmentCachingProvider{Provider: provider, cache: map[string]bool{}}
+
+	if !pendingInteractionReady(wrapped, "worker") {
+		t.Fatal("pendingInteractionReady should delegate to wrapped provider")
+	}
+
+	response := runtime.InteractionResponse{RequestID: "req-1", Action: "approve"}
+	if err := wrapped.Respond("worker", response); err != nil {
+		t.Fatalf("Respond error = %v", err)
+	}
+	if provider.responded.RequestID != response.RequestID || provider.responded.Action != response.Action {
+		t.Fatalf("responded = %+v, want request_id=%q action=%q", provider.responded, response.RequestID, response.Action)
+	}
+}
+
+func TestAttachmentCachingProvider_RejectsUnsupportedInteraction(t *testing.T) {
+	wrapped := &attachmentCachingProvider{cache: map[string]bool{}}
+
+	if _, err := wrapped.Pending("worker"); !errors.Is(err, runtime.ErrInteractionUnsupported) {
+		t.Fatalf("Pending error = %v, want ErrInteractionUnsupported", err)
+	}
+	if err := wrapped.Respond("worker", runtime.InteractionResponse{Action: "approve"}); !errors.Is(err, runtime.ErrInteractionUnsupported) {
+		t.Fatalf("Respond error = %v, want ErrInteractionUnsupported", err)
+	}
+}
+
+func TestSessionNewAliasOwner_UsesConfiguredNamedIdentity(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "mayor"},
+			{Name: "worker", MaxActiveSessions: intPtr(3)},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	if got := sessionNewAliasOwner(cfg, &cfg.Agents[0]); got != "mayor" {
+		t.Fatalf("sessionNewAliasOwner(mayor) = %q, want mayor", got)
+	}
+	if got := sessionNewAliasOwner(cfg, &cfg.Agents[1]); got != "" {
+		t.Fatalf("sessionNewAliasOwner(worker) = %q, want empty", got)
+	}
+}
+
+func TestCmdSessionNew_AllowsReservedNamedAliasWithController(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := shortSocketTempDir(t, "gc-session-new-")
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.gc): %v", err)
+	}
+
+	sockPath := filepath.Join(cityDir, ".gc", "controller.sock")
+	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
-		t.Fatalf("resolvedSessionCommand: %v", err)
+		t.Fatalf("Listen(%q): %v", sockPath, err)
 	}
-	if strings.Contains(got, "--dangerously-skip-permissions") {
-		t.Fatalf("command %q should not keep unrestricted default when overridden", got)
+	defer lis.Close() //nolint:errcheck
+
+	commands := make(chan string, 3)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(commands)
+		for i := 0; i < 3; i++ {
+			conn, err := lis.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			buf := make([]byte, 64)
+			n, err := conn.Read(buf)
+			if err != nil {
+				conn.Close() //nolint:errcheck
+				errCh <- err
+				return
+			}
+			cmd := string(buf[:n])
+			commands <- cmd
+			reply := "ok\n"
+			if cmd == "ping\n" {
+				reply = "123\n"
+			}
+			if _, err := conn.Write([]byte(reply)); err != nil {
+				conn.Close() //nolint:errcheck
+				errCh <- err
+				return
+			}
+			conn.Close() //nolint:errcheck
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionNew([]string{"mayor"}, "mayor", "", "", true, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionNew(controller) = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(got, "--permission-mode plan") {
-		t.Fatalf("command %q should include plan permission override", got)
+
+	gotCommands := make([]string, 0, 3)
+	deadline := time.After(2 * time.Second)
+	for len(gotCommands) < 3 {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("controller socket: %v", err)
+			}
+		case cmd, ok := <-commands:
+			if !ok {
+				if len(gotCommands) != 3 {
+					t.Fatalf("controller commands = %v, want ping plus 2 pokes", gotCommands)
+				}
+				break
+			}
+			gotCommands = append(gotCommands, cmd)
+		case <-deadline:
+			t.Fatalf("timed out waiting for controller pokes, got %v", gotCommands)
+		}
 	}
-	if !strings.Contains(got, "--effort low") {
-		t.Fatalf("command %q should include effort=low override", got)
+	wantCommands := []string{"ping\n", "poke\n", "poke\n"}
+	for i, want := range wantCommands {
+		if gotCommands[i] != want {
+			t.Fatalf("controller command %d = %q, want %q", i, gotCommands[i], want)
+		}
+	}
+
+	b := onlySessionBead(t, cityDir)
+	if got := b.Metadata["alias"]; got != "mayor" {
+		t.Fatalf("alias = %q, want mayor", got)
+	}
+	if got := b.Metadata["state"]; got != "creating" {
+		t.Fatalf("state = %q, want creating", got)
+	}
+}
+
+func TestCmdSessionNew_AllowsReservedNamedAliasWithoutController(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionNew([]string{"mayor"}, "mayor", "", "", true, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionNew(fallback) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	b := onlySessionBead(t, cityDir)
+	if got := b.Metadata["alias"]; got != "mayor" {
+		t.Fatalf("alias = %q, want mayor", got)
+	}
+	if got := b.Metadata["session_name"]; got == "" {
+		t.Fatal("session_name should be populated on fallback create")
+	}
+}
+
+func TestCmdSessionNew_IgnoresUnmanagedSupervisorSocket(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("GC_HOME", shortSocketTempDir(t, "gc-home-"))
+	t.Setenv("XDG_RUNTIME_DIR", shortSocketTempDir(t, "gc-run-"))
+
+	cityDir := shortSocketTempDir(t, "gc-session-city-")
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	if err := os.MkdirAll(filepath.Dir(supervisorSocketPath()), 0o755); err != nil {
+		t.Fatalf("MkdirAll(supervisor socket dir): %v", err)
+	}
+	lis, err := net.Listen("unix", supervisorSocketPath())
+	if err != nil {
+		t.Fatalf("Listen(%q): %v", supervisorSocketPath(), err)
+	}
+	defer lis.Close() //nolint:errcheck
+
+	commandCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := lis.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		buf := make([]byte, 64)
+		n, err := conn.Read(buf)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		commandCh <- string(buf[:n])
+	}()
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionNew([]string{"mayor"}, "mayor", "", "", true, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionNew(unmanaged supervisor) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	select {
+	case cmd := <-commandCh:
+		t.Fatalf("unexpected supervisor command %q for unmanaged city", cmd)
+	case err := <-errCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("supervisor socket accept/read: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	b := onlySessionBead(t, cityDir)
+	if got := b.Metadata["session_name"]; got == "" {
+		t.Fatal("session_name should be populated on direct fallback create")
+	}
+	if got := b.Metadata["state"]; got == "creating" {
+		t.Fatalf("state = %q, want direct-start state (not creating)", got)
+	}
+}
+
+func writeNamedSessionCityTOML(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.gc): %v", err)
+	}
+	data := []byte(`[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[agent]]
+name = "mayor"
+provider = "codex"
+start_command = "echo"
+
+[[named_session]]
+template = "mayor"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+}
+
+func onlySessionBead(t *testing.T, cityDir string) beads.Bead {
+	t.Helper()
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel(session): %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("session beads = %d, want 1", len(all))
+	}
+	return all[0]
+}
+
+// --- Auto-title tests for issue #500 ---
+
+func TestCmdSessionNew_AutoTitleFromMessage(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	// Force provider resolution to fail so auto-title falls back to
+	// truncation deterministically — prevents flaky auto-detection from PATH.
+	t.Setenv("PATH", "")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionNew([]string{"mayor"}, "mayor", "", "fix the login redirect loop", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSessionNew = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	b := onlySessionBead(t, cityDir)
+	// With no provider available, MaybeGenerateTitleAsync truncates the
+	// message as the immediate title.
+	if b.Title == "mayor" {
+		t.Fatalf("title should be auto-generated from message, got template name %q", b.Title)
+	}
+	if !strings.Contains(b.Title, "fix the login redirect loop") {
+		t.Fatalf("title = %q, want to contain message text", b.Title)
+	}
+}
+
+func TestCmdSessionNew_ExplicitTitlePreserved(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionNew([]string{"mayor"}, "mayor", "my explicit title", "some message", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSessionNew = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	b := onlySessionBead(t, cityDir)
+	// Explicit title should be preserved; auto-title should NOT overwrite it.
+	if b.Title != "my explicit title" {
+		t.Fatalf("title = %q, want %q", b.Title, "my explicit title")
+	}
+}
+
+func TestCmdSessionNew_NoMessageKeepsTemplateName(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionNew([]string{"mayor"}, "mayor", "", "", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSessionNew = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	b := onlySessionBead(t, cityDir)
+	// No message → no auto-title → keeps default (template name or similar).
+	if b.Title == "" {
+		t.Fatal("title should not be empty")
+	}
+}
+
+func TestMaybeAutoTitle_NilProviderFallsBackToTruncation(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Title: "template-name"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	maybeAutoTitle(store, b.ID, "", "fix the login redirect loop", nil, "", &stderr)
+
+	// MaybeGenerateTitleAsync sets the truncated title synchronously before
+	// starting the goroutine, and generateTitle(provider=nil) falls back to
+	// the same truncation. Assert immediately — no polling needed.
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Title == "template-name" {
+		t.Fatalf("title unchanged; want auto-generated from message")
+	}
+	if !strings.Contains(got.Title, "fix the login redirect loop") {
+		t.Fatalf("title = %q, want to contain message text", got.Title)
+	}
+}
+
+func TestMaybeAutoTitle_ExplicitTitleSkipsGeneration(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Title: "original"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	maybeAutoTitle(store, b.ID, "explicit", "some message", nil, "", &stderr)
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Title != "original" {
+		t.Fatalf("title = %q, want unchanged %q", got.Title, "original")
+	}
+}
+
+func TestMaybeAutoTitle_EmptyMessageSkipsGeneration(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Title: "original"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	maybeAutoTitle(store, b.ID, "", "", nil, "", &stderr)
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Title != "original" {
+		t.Fatalf("title = %q, want unchanged %q", got.Title, "original")
 	}
 }

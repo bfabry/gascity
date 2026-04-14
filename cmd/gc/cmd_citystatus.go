@@ -19,6 +19,7 @@ type StatusJSON struct {
 	CityPath   string            `json:"city_path"`
 	Controller ControllerJSON    `json:"controller"`
 	Suspended  bool              `json:"suspended"`
+	Halted     bool              `json:"halted"`
 	Agents     []StatusAgentJSON `json:"agents"`
 	Rigs       []StatusRigJSON   `json:"rigs"`
 	Summary    StatusSummaryJSON `json:"summary"`
@@ -85,18 +86,7 @@ all agents with running status, rigs, and a summary count.`,
 
 // cmdCityStatus is the CLI entry point for the city status overview.
 func cmdCityStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int {
-	var cityPath string
-	var err error
-	if len(args) > 0 {
-		cityPath, err = filepath.Abs(args[0])
-		if err != nil {
-			fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
-			return 1
-		}
-		cityPath, err = findCity(cityPath)
-	} else {
-		cityPath, err = resolveCity()
-	}
+	cityPath, err := resolveCommandCity(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -143,6 +133,13 @@ func doCityStatus(
 		fmt.Fprintf(stdout, "  Suspended:  yes\n") //nolint:errcheck // best-effort stdout
 	} else {
 		fmt.Fprintf(stdout, "  Suspended:  no\n") //nolint:errcheck // best-effort stdout
+	}
+
+	// Halt status (supervisor tick soft circuit breaker).
+	if isCityHalted(cityPath) {
+		fmt.Fprintf(stdout, "  Halted:     yes (%s)\n", haltFilePath(cityPath)) //nolint:errcheck // best-effort stdout
+	} else {
+		fmt.Fprintf(stdout, "  Halted:     no\n") //nolint:errcheck // best-effort stdout
 	}
 
 	// Build set of suspended rig names.
@@ -213,7 +210,7 @@ func doCityStatus(
 
 	// Chat sessions count (best-effort — skip if store unavailable).
 	if store, err := openCityStoreAt(cityPath); err == nil {
-		mgr := newSessionManagerWithConfig(store, sp, cfg)
+		mgr := newSessionManagerWithConfig(cityPath, store, sp, cfg)
 		if sessions, err := mgr.List("", ""); err == nil && len(sessions) > 0 {
 			var active, suspended int
 			for _, s := range sessions {
@@ -321,7 +318,7 @@ func doCityStatusJSON(
 
 	// Chat sessions count (best-effort).
 	if store, err := openCityStoreAt(cityPath); err == nil {
-		mgr := newSessionManagerWithConfig(store, sp, cfg)
+		mgr := newSessionManagerWithConfig(cityPath, store, sp, cfg)
 		if sessions, err := mgr.List("", ""); err == nil {
 			for _, s := range sessions {
 				switch s.State {
@@ -339,6 +336,7 @@ func doCityStatusJSON(
 		CityPath:   cityPath,
 		Controller: ctrl,
 		Suspended:  citySuspended(cfg),
+		Halted:     isCityHalted(cityPath),
 		Agents:     agents,
 		Rigs:       rigs,
 		Summary:    summary,

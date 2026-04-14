@@ -621,13 +621,8 @@ func TestOrphanSessionsCheck_Fix(t *testing.T) {
 
 func TestBeadsStoreCheck_OK(t *testing.T) {
 	dir := t.TempDir()
-	// Create a file store.
-	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(dir, "beads.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Create a bead so List returns something.
-	if _, err := store.Create(beads.Bead{Title: "test"}); err != nil {
+	// Create a file store so Ping can verify accessibility.
+	if _, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(dir, "beads.json")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -648,6 +643,40 @@ func TestBeadsStoreCheck_OpenError(t *testing.T) {
 	if r.Status != StatusError {
 		t.Errorf("status = %d, want Error", r.Status)
 	}
+}
+
+func TestBeadsStoreCheck_UsesPing(t *testing.T) {
+	// The check should call Ping() to verify accessibility without loading data.
+	pinged := false
+	spy := &spyPingStore{
+		pingFunc: func() error {
+			pinged = true
+			return nil
+		},
+	}
+	c := NewBeadsStoreCheck(t.TempDir(), func(_ string) (beads.Store, error) {
+		return spy, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	}
+	if !pinged {
+		t.Error("Ping was not called")
+	}
+}
+
+// spyPingStore is a minimal Store that records Ping calls.
+type spyPingStore struct {
+	beads.MemStore
+	pingFunc func() error
+}
+
+func (s *spyPingStore) Ping() error {
+	if s.pingFunc != nil {
+		return s.pingFunc()
+	}
+	return nil
 }
 
 // --- DoltServerCheck ---
@@ -779,6 +808,26 @@ func TestRigBeadsCheck_Error(t *testing.T) {
 	r := c.Run(&CheckContext{})
 	if r.Status != StatusError {
 		t.Errorf("status = %d, want Error", r.Status)
+	}
+}
+
+func TestRigBeadsCheck_UsesPing(t *testing.T) {
+	pinged := false
+	spy := &spyPingStore{
+		pingFunc: func() error {
+			pinged = true
+			return nil
+		},
+	}
+	c := NewRigBeadsCheck(config.Rig{Name: "myrig", Path: t.TempDir()}, func(_ string) (beads.Store, error) {
+		return spy, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	}
+	if !pinged {
+		t.Error("Ping was not called")
 	}
 }
 

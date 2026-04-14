@@ -318,6 +318,103 @@ func TestSetMetadata_deduplicatesViaConformance(t *testing.T) {
 	}
 }
 
+// TestCreate_metadataWithSpecialCharsRoundTrips validates the exec.Store
+// protocol contract: metadata values containing quotes and commas must
+// round-trip correctly. This exercises conformance.sh (the reference
+// provider), not gc-beads-k8s directly. The gc-beads-k8s fix was verified
+// via K8s homelab deployment (see PR #367).
+func TestCreate_metadataWithSpecialCharsRoundTrips(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	scriptPath, err := filepath.Abs(filepath.Join("testdata", "conformance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStore(scriptPath)
+	s.SetEnv(map[string]string{"BEADS_DIR": t.TempDir()})
+
+	created, err := s.Create(beads.Bead{
+		Title:  "agent-session",
+		Type:   "session",
+		Labels: []string{"gc:session"},
+		Metadata: map[string]string{
+			"command":      `claude --settings "/city/.gc/settings.json"`,
+			"csv_tricky":   `value,with,commas`,
+			"session_name": "gascity-mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["command"] != `claude --settings "/city/.gc/settings.json"` {
+		t.Errorf("Metadata[command] = %q, want value with quotes", got.Metadata["command"])
+	}
+	if got.Metadata["csv_tricky"] != "value,with,commas" {
+		t.Errorf("Metadata[csv_tricky] = %q, want value with commas", got.Metadata["csv_tricky"])
+	}
+	if got.Metadata["session_name"] != "gascity-mayor" {
+		t.Errorf("Metadata[session_name] = %q, want %q", got.Metadata["session_name"], "gascity-mayor")
+	}
+	for _, l := range got.Labels {
+		if strings.HasPrefix(l, "meta:") {
+			t.Errorf("meta: label leaked into Labels: %s", l)
+		}
+	}
+}
+
+// TestCreate_numericLookingMetadataStaysString validates the exec.Store
+// protocol contract: numeric-looking metadata values must round-trip as
+// strings. This exercises conformance.sh (the reference provider), not
+// gc-beads-k8s directly.
+func TestCreate_numericLookingMetadataStaysString(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	scriptPath, err := filepath.Abs(filepath.Join("testdata", "conformance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStore(scriptPath)
+	s.SetEnv(map[string]string{"BEADS_DIR": t.TempDir()})
+
+	created, err := s.Create(beads.Bead{
+		Title: "quarantined-session",
+		Type:  "session",
+		Metadata: map[string]string{
+			"wake_attempts":     "0",
+			"quarantined_until": "",
+			"churn_count":       "42",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Values that look numeric must round-trip as strings. bd's JSON column
+	// can store 0 as a number; the script's jq must coerce with tostring.
+	if got.Metadata["wake_attempts"] != "0" {
+		t.Errorf("Metadata[wake_attempts] = %q, want %q", got.Metadata["wake_attempts"], "0")
+	}
+	if got.Metadata["quarantined_until"] != "" {
+		t.Errorf("Metadata[quarantined_until] = %q, want empty string", got.Metadata["quarantined_until"])
+	}
+	if got.Metadata["churn_count"] != "42" {
+		t.Errorf("Metadata[churn_count] = %q, want %q", got.Metadata["churn_count"], "42")
+	}
+}
+
 func TestCreate_defaultsTypeToTask(t *testing.T) {
 	dir := t.TempDir()
 	outFile := filepath.Join(dir, "stdin.json")
@@ -490,14 +587,28 @@ func TestList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("List returned %d beads, want 2", len(got))
+	if len(got) != 1 {
+		t.Fatalf("List returned %d beads, want 1 open bead", len(got))
 	}
 	if got[0].Title != "alpha" {
 		t.Errorf("got[0].Title = %q, want %q", got[0].Title, "alpha")
 	}
-	if got[1].Title != "beta" {
-		t.Errorf("got[1].Title = %q, want %q", got[1].Title, "beta")
+}
+
+func TestList_statusFilter(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, allOpsScript())
+	s := NewStore(script)
+
+	got, err := s.ListOpen("closed")
+	if err != nil {
+		t.Fatalf("List(closed): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List(closed) returned %d beads, want 1 closed bead", len(got))
+	}
+	if got[0].Title != "beta" {
+		t.Errorf("got[0].Title = %q, want %q", got[0].Title, "beta")
 	}
 }
 
@@ -593,6 +704,68 @@ esac
 	}
 	if string(data) != "mr" {
 		t.Errorf("metadata value = %q, want %q", string(data), "mr")
+	}
+}
+
+func TestGet_numericMetadataValuesCoercedToStrings(t *testing.T) {
+	dir := t.TempDir()
+
+	// Script returns metadata with non-string values — this is what bd does
+	// in production. The Go domain model is map[string]string, so the parser
+	// must coerce non-string JSON values to their string representation.
+	script := writeScript(t, dir, `
+case "$1" in
+  get)
+    echo '{"id":"EX-1","title":"test","status":"open","type":"task","created_at":"2026-01-01T00:00:00Z","metadata":{"retries":3,"score":1.5,"flag":true,"name":"ok"}}'
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	got, err := s.Get("EX-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["retries"] != "3" {
+		t.Errorf("Metadata[retries] = %q, want %q", got.Metadata["retries"], "3")
+	}
+	if got.Metadata["score"] != "1.5" {
+		t.Errorf("Metadata[score] = %q, want %q", got.Metadata["score"], "1.5")
+	}
+	if got.Metadata["flag"] != "true" {
+		t.Errorf("Metadata[flag] = %q, want %q", got.Metadata["flag"], "true")
+	}
+	if got.Metadata["name"] != "ok" {
+		t.Errorf("Metadata[name] = %q, want %q", got.Metadata["name"], "ok")
+	}
+}
+
+func TestList_numericMetadataValuesCoercedToStrings(t *testing.T) {
+	dir := t.TempDir()
+
+	script := writeScript(t, dir, `
+case "$1" in
+  list)
+    echo '[{"id":"EX-1","title":"test","status":"open","type":"task","created_at":"2026-01-01T00:00:00Z","metadata":{"retries":3,"name":"ok"}}]'
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListOpen returned %d beads, want 1", len(got))
+	}
+	if got[0].Metadata["retries"] != "3" {
+		t.Errorf("Metadata[retries] = %q, want %q", got[0].Metadata["retries"], "3")
+	}
+	if got[0].Metadata["name"] != "ok" {
+		t.Errorf("Metadata[name] = %q, want %q", got[0].Metadata["name"], "ok")
 	}
 }
 

@@ -43,6 +43,19 @@ type formulaSummaryResponse struct {
 	RecentRuns  []formulaRecentRunResponse `json:"recent_runs"`
 }
 
+type formulaRunsResponse struct {
+	Formula       string                     `json:"formula"`
+	RunCount      int                        `json:"run_count"`
+	RecentRuns    []formulaRecentRunResponse `json:"recent_runs"`
+	Partial       bool                       `json:"partial"`
+	PartialErrors []string                   `json:"partial_errors,omitempty"`
+}
+
+const (
+	defaultFormulaRunsLimit = 3
+	maxFormulaRunsLimit     = 20
+)
+
 type formulaPreviewNodeResponse struct {
 	ID       string `json:"id"`
 	Title    string `json:"title"`
@@ -83,13 +96,7 @@ func (s *Server) handleFormulaList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runs, err := buildWorkflowRunProjections(s.state, scopeKind, scopeRef)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "formula run projection failed")
-		return
-	}
-
-	items, err := buildFormulaCatalog(paths, filterFormulaCatalogRuns(scopeKind, scopeRef, runs.Items))
+	items, err := buildFormulaCatalog(paths)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "formula catalog failed")
 		return
@@ -97,13 +104,95 @@ func (s *Server) handleFormulaList(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{
 		"items":   items,
-		"partial": runs.Partial,
+		"partial": false,
 	}
-	if len(runs.PartialErrors) > 0 {
-		resp["partial_errors"] = runs.PartialErrors
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleFormulaRuns(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "invalid", "formula name is required")
+		return
+	}
+
+	q := r.URL.Query()
+	scopeKind, scopeRef, scopeErr := parseWorkflowRequestScope(q.Get("scope_kind"), q.Get("scope_ref"))
+	if scopeErr != "" {
+		writeError(w, http.StatusBadRequest, "invalid", scopeErr)
+		return
+	}
+	if _, status, code, msg := s.formulaSearchPaths(scopeKind, scopeRef); status != http.StatusOK {
+		writeError(w, status, code, msg)
+		return
+	}
+	limit := defaultFormulaRunsLimit
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "invalid", "limit must be a non-negative integer")
+			return
+		}
+		limit = normalizeFormulaRunsLimit(parsed)
+	}
+
+	resp, err := buildFormulaRuns(s.state, name, scopeKind, scopeRef, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "formula runs failed")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleFormulaFeed(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	scopeKind, scopeRef, scopeErr := parseWorkflowRequestScope(q.Get("scope_kind"), q.Get("scope_ref"))
+	if scopeErr != "" {
+		writeError(w, http.StatusBadRequest, "invalid", scopeErr)
+		return
+	}
+	if _, status, code, msg := s.formulaSearchPaths(scopeKind, scopeRef); status != http.StatusOK {
+		writeError(w, status, code, msg)
+		return
+	}
+
+	limit := parseOrdersFeedLimit(q.Get("limit"))
+	index := s.latestIndex()
+	cacheKey := responseCacheKey("formula-feed", r)
+	if body, ok := s.cachedResponse(cacheKey, index); ok {
+		writeCachedJSON(w, r, index, body)
+		return
+	}
+
+	projections, err := buildWorkflowRunProjectionsRootOnly(s.state, scopeKind, scopeRef)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "formula feed failed")
+		return
+	}
+
+	items := make([]monitorFeedItemResponse, 0, len(projections.Items))
+	for _, run := range projections.Items {
+		items = append(items, workflowRunProjectionFeedItem(run))
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+
+	resp := map[string]any{
+		"items":   items,
+		"partial": projections.Partial,
+	}
+	if len(projections.PartialErrors) > 0 {
+		resp["partial_errors"] = projections.PartialErrors
+	}
+
+	body, err := s.storeResponse(cacheKey, index, resp)
+	if err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	writeCachedJSON(w, r, index, body)
 }
 
 func (s *Server) handleFormulaDetail(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +255,7 @@ func (s *Server) formulaSearchPaths(scopeKind, scopeRef string) ([]string, int, 
 	}
 }
 
-func buildFormulaCatalog(paths []string, runs []workflowRunProjection) ([]formulaSummaryResponse, error) {
+func buildFormulaCatalog(paths []string) ([]formulaSummaryResponse, error) {
 	if len(paths) == 0 {
 		return []formulaSummaryResponse{}, nil
 	}
@@ -181,31 +270,16 @@ func buildFormulaCatalog(paths []string, runs []workflowRunProjection) ([]formul
 			}
 			return nil, err
 		}
-		recentRuns := formulaRecentRunsFor(resolved.Formula, runs, 3)
 		items = append(items, formulaSummaryResponse{
 			Name:        resolved.Formula,
 			Description: resolved.Description,
 			Version:     formulaVersionString(resolved),
 			VarDefs:     formulaVarDefs(resolved.Vars),
-			RunCount:    formulaRunCountFor(resolved.Formula, runs),
-			RecentRuns:  recentRuns,
+			RunCount:    0,
+			RecentRuns:  []formulaRecentRunResponse{},
 		})
 	}
 	return items, nil
-}
-
-func filterFormulaCatalogRuns(scopeKind, scopeRef string, runs []workflowRunProjection) []workflowRunProjection {
-	if scopeKind != "city" {
-		return runs
-	}
-
-	filtered := make([]workflowRunProjection, 0, len(runs))
-	for _, run := range runs {
-		if run.ScopeKind == scopeKind && run.ScopeRef == scopeRef {
-			filtered = append(filtered, run)
-		}
-	}
-	return filtered
 }
 
 func formulaRunCountFor(name string, runs []workflowRunProjection) int {
@@ -223,7 +297,11 @@ func formulaRecentRunsFor(name string, runs []workflowRunProjection, limit int) 
 		return []formulaRecentRunResponse{}
 	}
 
-	matching := make([]workflowRunProjection, 0, limit)
+	capHint := limit
+	if len(runs) < capHint {
+		capHint = len(runs)
+	}
+	matching := make([]workflowRunProjection, 0, capHint)
 	for _, run := range runs {
 		if run.FormulaName != name {
 			continue
@@ -253,6 +331,46 @@ func formulaRecentRunsFor(name string, runs []workflowRunProjection, limit int) 
 		})
 	}
 	return items
+}
+
+func normalizeFormulaRunsLimit(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > maxFormulaRunsLimit {
+		return maxFormulaRunsLimit
+	}
+	return limit
+}
+
+func buildFormulaRuns(state State, formulaName, requestedScopeKind, requestedScopeRef string, limit int) (*formulaRunsResponse, error) {
+	// Use the full projection path (with per-root child lookups) so that
+	// status and UpdatedAt reflect closed children.  The /feed endpoint
+	// intentionally uses the cheaper root-only path for monitor views.
+	// Pass formulaName to skip child lookups for non-matching roots.
+	projectionResult, err := buildWorkflowRunProjections(state, requestedScopeKind, requestedScopeRef, formulaName)
+	if err != nil {
+		return nil, fmt.Errorf("listing workflow runs for %s:%s: %w", requestedScopeKind, requestedScopeRef, err)
+	}
+
+	projections := make([]workflowRunProjection, 0, len(projectionResult.Items))
+	for _, projection := range projectionResult.Items {
+		if projection.FormulaName != formulaName {
+			continue
+		}
+		if projection.ScopeKind != requestedScopeKind || projection.ScopeRef != requestedScopeRef {
+			continue
+		}
+		projections = append(projections, projection)
+	}
+
+	return &formulaRunsResponse{
+		Formula:       formulaName,
+		RunCount:      formulaRunCountFor(formulaName, projections),
+		RecentRuns:    formulaRecentRunsFor(formulaName, projections, limit),
+		Partial:       projectionResult.Partial,
+		PartialErrors: projectionResult.PartialErrors,
+	}, nil
 }
 
 func buildFormulaDetail(ctx context.Context, name string, paths []string, _ string, vars map[string]string) (*formulaDetailResponse, error) {
@@ -459,7 +577,7 @@ func includeFormulaPreviewStep(step formula.RecipeStep, rootID string) bool {
 		return false
 	}
 	switch strings.TrimSpace(step.Metadata["gc.kind"]) {
-	case "scope-check", "workflow-finalize":
+	case "scope-check", "workflow-finalize", "spec":
 		return false
 	default:
 		return true

@@ -202,7 +202,7 @@ func (s *bindingService) ListBySession(ctx context.Context, sessionID string) ([
 	if sessionID == "" {
 		return nil, nil
 	}
-	items, err := s.store.ListByLabel(bindingSessionLabel(sessionID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: bindingSessionLabel(sessionID)})
 	if err != nil {
 		return nil, fmt.Errorf("list bindings by session label: %w", err)
 	}
@@ -304,7 +304,7 @@ func (s *bindingService) Unbind(ctx context.Context, caller Caller, input Unbind
 			seeds = append(seeds, record)
 		}
 	} else {
-		items, err := s.store.ListByLabel(bindingSessionLabel(sessionID), 0)
+		items, err := s.store.List(beads.ListQuery{Label: bindingSessionLabel(sessionID)})
 		if err != nil {
 			return nil, fmt.Errorf("list bindings by session label: %w", err)
 		}
@@ -398,7 +398,10 @@ func (s *bindingService) Unbind(ctx context.Context, caller Caller, input Unbind
 }
 
 func (s *bindingService) listBindingsForConversation(ref ConversationRef) ([]SessionBindingRecord, error) {
-	items, err := s.store.ListByLabel(bindingConversationLabel(ref), 0)
+	items, err := s.store.List(beads.ListQuery{
+		Label:         bindingConversationLabel(ref),
+		IncludeClosed: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list bindings by conversation label: %w", err)
 	}
@@ -538,7 +541,10 @@ func resolveActiveBindingLocked(ctx context.Context, store beads.Store, delivery
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	items, err := store.ListByLabel(bindingConversationLabel(ref), 0)
+	items, err := store.List(beads.ListQuery{
+		Label:         bindingConversationLabel(ref),
+		IncludeClosed: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list bindings by conversation label: %w", err)
 	}

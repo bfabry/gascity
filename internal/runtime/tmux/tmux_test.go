@@ -31,6 +31,54 @@ func testTmux() *Tmux {
 	return NewTmuxWithConfig(cfg)
 }
 
+func ensureTestSocketSession(t *testing.T, tm *Tmux) {
+	t.Helper()
+
+	session := fmt.Sprintf("binding-test-%d", time.Now().UnixNano())
+	if _, err := tm.run("new-session", "-d", "-s", session, "sleep 60"); err != nil {
+		t.Fatalf("new-session on test socket: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = tm.run("kill-session", "-t", session)
+	})
+}
+
+func buildEchoBinary(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	bin := dir + "/" + name
+	src := dir + "/" + name + ".go"
+	if err := os.WriteFile(src, []byte(`package main
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+func main() {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == 27 {
+			fmt.Print("^[")
+			continue
+		}
+		_, _ = os.Stdout.Write([]byte{b})
+	}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", src, err)
+	}
+	build := exec.Command("go", "build", "-o", bin, src)
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build %s: %v\n%s", name, err, string(out))
+	}
+	return bin
+}
+
 func TestListSessionsNoServer(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
@@ -515,6 +563,35 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 		t.Logf("Pane command: %q, IsRuntimeRunning: %v", paneCmd, got)
 		// Note: This may or may not detect depending on how tmux runs the command.
 		// On some systems, tmux runs the command directly; on others via a shell.
+	}
+}
+
+func TestIsRuntimeRunningMatchesProviderNameInWrapperArgs(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-runtime-wrapper-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeBun := buildEchoBinary(t, dir, "bun")
+	fakeGemini := dir + "/gemini"
+	if err := os.WriteFile(fakeGemini, []byte("placeholder"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", fakeGemini, err)
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeBun+" "+fakeGemini); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if !tm.IsRuntimeRunning(sessionName, []string{"gemini", "node"}) {
+		pid, _ := tm.GetPanePID(sessionName)
+		cmd, _ := tm.GetPaneCommand(sessionName)
+		t.Fatalf("IsRuntimeRunning() = false, want true (pane cmd: %q pid: %q)", cmd, pid)
 	}
 }
 
@@ -1836,6 +1913,194 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	}
 }
 
+func TestNudgeSessionSkipsEscapeForCodex(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-codex-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "cat -v", map[string]string{
+		"GC_PROVIDER": "codex",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for codex nudge:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForCodexWithoutProviderEnv(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-codex-fallback-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeCodex := dir + "/codex"
+	src := dir + "/main.go"
+	if err := os.WriteFile(src, []byte(`package main
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+func main() {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == 27 {
+			fmt.Print("^[")
+			continue
+		}
+		_, _ = os.Stdout.Write([]byte{b})
+	}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", src, err)
+	}
+	build := exec.Command("go", "build", "-o", fakeCodex, src)
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build fake codex: %v\n%s", err, string(out))
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeCodex); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for codex nudge without provider env:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForClaude(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-claude-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "cat -v", map[string]string{
+		"GC_PROVIDER": "claude",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for claude nudge:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForGeminiWithoutProviderEnv(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-gemini-fallback-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeBun := buildEchoBinary(t, dir, "bun")
+	fakeGemini := dir + "/gemini"
+	if err := os.WriteFile(fakeGemini, []byte("placeholder"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", fakeGemini, err)
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeBun+" "+fakeGemini); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for gemini nudge without provider env:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSendsEscapeForUnknownProvider(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-default-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "cat -v"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll did not contain Escape for default nudge:\n%s", out)
+	}
+}
+
 // TestMatchesPromptPrefix verifies that prompt matching handles non-breaking
 // spaces (NBSP, U+00A0) correctly. Claude Code uses NBSP after its > prompt
 // character, but the default ReadyPromptPrefix uses a regular space.
@@ -1931,6 +2196,8 @@ func TestPaneContainsBusyIndicator(t *testing.T) {
 		{"idle prompt", []string{"❯ ", ""}, false},
 		{"busy status bar", []string{"❯ ", "  esc to interrupt  "}, true},
 		{"busy mid-line", []string{"some output", "Press esc to interrupt generation"}, true},
+		{"gemini auth spinner", []string{"Waiting for authentication... (Press Esc or Ctrl+C to cancel)"}, true},
+		{"gemini shell tool panel", []string{"│ ?  Shell sleep 12 [current working directory /tmp/city] (Sleep … │"}, true},
 		{"no indicator", []string{"some output", "building..."}, false},
 	}
 	for _, tt := range tests {
@@ -1950,6 +2217,15 @@ func TestDefaultReadyPromptPrefix(t *testing.T) {
 	}
 	if !strings.Contains(DefaultReadyPromptPrefix, "❯") {
 		t.Errorf("DefaultReadyPromptPrefix = %q, want to contain ❯", DefaultReadyPromptPrefix)
+	}
+}
+
+func TestIdlePromptPrefix(t *testing.T) {
+	if got := idlePromptPrefix("> "); got != "> " {
+		t.Fatalf("idlePromptPrefix(> ) = %q, want %q", got, "> ")
+	}
+	if got := idlePromptPrefix(""); got != DefaultReadyPromptPrefix {
+		t.Fatalf("idlePromptPrefix(\"\") = %q, want %q", got, DefaultReadyPromptPrefix)
 	}
 }
 
@@ -1989,6 +2265,47 @@ func TestGetSessionActivity(t *testing.T) {
 	// Just verify it's a valid Unix timestamp (after year 2000)
 	if activity.Year() < 2000 {
 		t.Errorf("GetSessionActivity returned suspicious time: %v", activity)
+	}
+}
+
+func TestGetSessionActivity_AdvancesOnDetachedOutput(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-activity-advance-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	before, err := tm.GetSessionActivity(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity before send: %v", err)
+	}
+
+	// tmux activity timestamps are second-granularity. Cross a second boundary so
+	// detached output should produce a strictly newer timestamp.
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := tm.SendKeys(sessionName, "echo GC_ACTIVITY_ADVANCE_MARKER"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	after, err := tm.GetSessionActivity(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity after send: %v", err)
+	}
+
+	if !after.After(before) {
+		output, _ := tm.CapturePane(sessionName, 50)
+		t.Fatalf("GetSessionActivity did not advance after detached output: before=%v after=%v output=%q", before, after, output)
 	}
 }
 
@@ -2145,6 +2462,7 @@ func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a GT-style if-shell binding (contains both "if-shell" and "gt ")
 	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
@@ -2170,6 +2488,7 @@ func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a user binding that doesn't contain "gt "
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2195,6 +2514,7 @@ func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// A plain user binding should NOT be detected as GT
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2224,6 +2544,7 @@ func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a custom user binding on F11
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "custom-user-cmd")

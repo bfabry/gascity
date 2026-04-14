@@ -177,10 +177,23 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 		return nil
 	}
 	it := newIdleTracker()
+	var registeredAny bool
 	for _, a := range cfg.Agents {
 		timeout := a.IdleTimeoutDuration()
 		if timeout <= 0 {
 			continue
+		}
+		named := config.FindNamedSession(cfg, a.QualifiedName())
+		if named != nil {
+			// Configured named sessions own the canonical runtime session for
+			// singletons. mode="always" must never be subject to idle timeout.
+			if named.ModeOrDefault() != "always" {
+				it.setTimeout(config.NamedSessionRuntimeName(cityName, cfg.Workspace, a.QualifiedName()), timeout)
+				registeredAny = true
+			}
+			if !isMultiSessionCfgAgent(&a) {
+				continue
+			}
 		}
 		sp0 := scaleParamsFor(&a)
 		if isMultiSessionCfgAgent(&a) {
@@ -188,11 +201,16 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, st, sp) {
 				sn := startupSessionName(cityName, qualifiedInstance, st)
 				it.setTimeout(sn, timeout)
+				registeredAny = true
 			}
 			continue
 		}
 		sn := startupSessionName(cityName, a.QualifiedName(), st)
 		it.setTimeout(sn, timeout)
+		registeredAny = true
+	}
+	if !registeredAny {
+		return nil
 	}
 	return it
 }
@@ -293,7 +311,7 @@ func resolveStartDir(args []string) (string, error) {
 }
 
 func requireBootstrappedCity(dir string) (string, error) {
-	cityPath, err := findCity(dir)
+	ctx, err := resolveContextFromPath(dir)
 	if err != nil {
 		absDir, absErr := filepath.Abs(dir)
 		if absErr == nil {
@@ -301,6 +319,7 @@ func requireBootstrappedCity(dir string) (string, error) {
 		}
 		return "", fmt.Errorf("%w; run \"gc init\" first", err)
 	}
+	cityPath := ctx.CityPath
 	if !citylayout.HasRuntimeRoot(cityPath) {
 		return "", fmt.Errorf("city runtime not bootstrapped at %s; run \"gc init %s\" first", cityPath, cityPath)
 	}
@@ -567,7 +586,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	// Enforce restrictive permissions on .gc/ and its subdirectories.
 	enforceGCPermissions(cityPath, stderr)
 
-	runPoolOnBoot(cfg, cityPath, shellScaleCheck, stderr)
+	runPoolOnBoot(cfg, cityPath, shellRunHook, stderr)
 
 	var oneShotStore beads.Store
 	if store, err := openCityStoreAt(cityPath); err == nil {
@@ -604,6 +623,10 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	dt := newDrainTracker()
 	poolDesired := PoolDesiredCounts(ComputePoolDesiredStates(
 		cfg, nil, sessionBeads.Open(), dsResult.ScaleCheckCounts))
+	if poolDesired == nil {
+		poolDesired = make(map[string]int)
+	}
+	mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
 	reconcileSessionBeadsAtPath(
 		sigCtx, cityPath, open, ds, cfgNames, cfg, sp, oneShotStore,
 		nil, nil, nil, dt, poolDesired,
@@ -722,7 +745,10 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string) []r
 	} {
 		abs := filepath.Join(workDir, rel)
 		if _, err := os.Stat(abs); err == nil {
-			copyFiles = append(copyFiles, runtime.CopyEntry{Src: abs, RelDst: path.Join(relWorkDir, rel)})
+			copyFiles = append(copyFiles, runtime.CopyEntry{
+				Src: abs, RelDst: path.Join(relWorkDir, rel),
+				Probed: true, ContentHash: runtime.HashPathContent(abs),
+			})
 		}
 	}
 	// Stage Claude skills directory (if materialized).
@@ -730,6 +756,7 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string) []r
 	if info, err := os.Stat(skillsDir); err == nil && info.IsDir() {
 		copyFiles = append(copyFiles, runtime.CopyEntry{
 			Src: skillsDir, RelDst: path.Join(relWorkDir, ".claude", "skills"),
+			Probed: true, ContentHash: runtime.HashPathContent(skillsDir),
 		})
 	}
 	// cityDir-based hooks: claude (.gc/settings.json).
@@ -745,7 +772,10 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string) []r
 			}
 		}
 		if !alreadyStaged {
-			copyFiles = append(copyFiles, runtime.CopyEntry{Src: settingsAbs, RelDst: settingsRel})
+			copyFiles = append(copyFiles, runtime.CopyEntry{
+				Src: settingsAbs, RelDst: settingsRel,
+				Probed: true, ContentHash: runtime.HashPathContent(settingsAbs),
+			})
 		}
 	}
 	return copyFiles
@@ -834,17 +864,52 @@ func agentCommandDir(cityPath string, a *config.Agent, rigs []config.Rig) string
 
 // passthroughEnv returns environment variables from the parent process that
 // agent sessions should inherit. Agents need PATH to find tools (including gc),
-// GC_BEADS/GC_DOLT so they use the same bead store as the parent, and
-// GC_DOLT_HOST/PORT/USER/PASSWORD so agents can connect to remote Dolt servers.
+// GC_BEADS/GC_DOLT so they use the same bead store as the parent,
+// GC_DOLT_HOST/PORT/USER/PASSWORD so agents can connect to remote Dolt servers,
+// and Claude auth/home context so managed sessions can launch reliably under
+// shell and supervisor-driven flows.
 func passthroughEnv() map[string]string {
 	m := make(map[string]string)
-	// Pass through PATH and all GC_* environment variables so provider
-	// configs (Docker, K8s, beads, dolt, etc.) propagate to agents.
+	// Pass through PATH so managed sessions can find tools, and preserve the
+	// minimum user/home context Claude Code needs to resolve stored credentials.
 	if v := os.Getenv("PATH"); v != "" {
 		m["PATH"] = v
 	}
+	if v := os.Getenv("HOME"); v != "" {
+		m["HOME"] = v
+	}
+	// USER/LOGNAME are required on macOS for Keychain access — without them
+	// providers like Claude Code cannot read stored OAuth credentials.
+	// CLAUDE_CONFIG_DIR and CLAUDE_CODE_OAUTH_TOKEN let managed Claude
+	// sessions find stored credentials and token-based auth.
+	for _, key := range []string{"USER", "LOGNAME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"} {
+		if v := os.Getenv(key); v != "" {
+			m[key] = v
+		}
+	}
+	// XDG directories are needed for providers to locate config files
+	// (e.g. ~/.config/opencode/opencode.jsonc). When not set, compute
+	// defaults from HOME so spawned sessions always find user config.
+	if v := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); v != "" {
+		m["XDG_CONFIG_HOME"] = v
+	} else if home := os.Getenv("HOME"); home != "" {
+		m["XDG_CONFIG_HOME"] = filepath.Join(home, ".config")
+	}
+	if v := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); v != "" {
+		m["XDG_STATE_HOME"] = v
+	} else if home := os.Getenv("HOME"); home != "" {
+		m["XDG_STATE_HOME"] = filepath.Join(home, ".local", "state")
+	}
+	// Pass through all GC_* and ANTHROPIC_* vars. Agent credentials are
+	// included in the global baseline because the SDK cannot know which
+	// agent uses which provider (zero hardcoded roles); the trust boundary
+	// is the managed session itself.
 	for _, entry := range os.Environ() {
-		if key, val, ok := strings.Cut(entry, "="); ok && strings.HasPrefix(key, "GC_") && val != "" {
+		key, val, ok := strings.Cut(entry, "=")
+		if !ok || val == "" {
+			continue
+		}
+		if strings.HasPrefix(key, "GC_") || strings.HasPrefix(key, "ANTHROPIC_") {
 			m[key] = val
 		}
 	}

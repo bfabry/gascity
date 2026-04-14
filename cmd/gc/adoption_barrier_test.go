@@ -15,10 +15,18 @@ import (
 type fakeAdoptionProvider struct {
 	runtime.Provider
 	running []string
+	alive   map[string]bool
 }
 
 func (f *fakeAdoptionProvider) ListRunning(_ string) ([]string, error) {
 	return f.running, nil
+}
+
+func (f *fakeAdoptionProvider) ProcessAlive(name string, _ []string) bool {
+	if f.alive == nil {
+		return true
+	}
+	return f.alive[name]
 }
 
 func TestAdoptionBarrier_NoRunning(t *testing.T) {
@@ -202,6 +210,42 @@ func TestAdoptionBarrier_DryRun(t *testing.T) {
 	beadList, _ := store.ListByLabel(sessionBeadLabel, 0)
 	if len(beadList) != 0 {
 		t.Errorf("dry run created %d beads, want 0", len(beadList))
+	}
+}
+
+func TestAdoptionBarrier_SkipsDeadSessions(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &fakeAdoptionProvider{
+		running: []string{"test-city-mayor", "test-city-worker"},
+		alive: map[string]bool{
+			"test-city-mayor":  true,
+			"test-city-worker": false,
+		},
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "mayor", MaxActiveSessions: intPtr(1)},
+			{Name: "worker"},
+		},
+	}
+	var stderr bytes.Buffer
+
+	result, passed := runAdoptionBarrier(store, sp, cfg, "test-city", clock.Real{}, &stderr, false)
+	if !passed {
+		t.Fatalf("barrier should pass, stderr: %s", stderr.String())
+	}
+	if result.Total != 1 {
+		t.Fatalf("Total = %d, want 1 live session", result.Total)
+	}
+	if result.Adopted != 1 {
+		t.Fatalf("Adopted = %d, want 1", result.Adopted)
+	}
+	beadList, _ := store.ListByLabel(sessionBeadLabel, 0)
+	if len(beadList) != 1 {
+		t.Fatalf("beads count = %d, want 1", len(beadList))
+	}
+	if beadList[0].Metadata["session_name"] != "test-city-mayor" {
+		t.Fatalf("adopted bead = %q, want live mayor", beadList[0].Metadata["session_name"])
 	}
 }
 

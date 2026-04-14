@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
@@ -28,19 +29,51 @@ import (
 	"github.com/gastownhall/gascity/internal/supervisor"
 )
 
-// sessionProviderName returns the session provider name.
-// Priority: GC_SESSION env var → city.toml [session].provider → "" (default: tmux).
-func sessionProviderName() string {
-	if v := os.Getenv("GC_SESSION"); v != "" {
-		return v
+type sessionProviderContext struct {
+	providerName    string
+	cfg             *config.City
+	sc              config.SessionConfig
+	cityName        string
+	cityPath        string
+	agents          []config.Agent
+	sessionTemplate string
+}
+
+func loadSessionProviderContext() sessionProviderContext {
+	ctx := sessionProviderContext{
+		providerName: os.Getenv("GC_SESSION"),
 	}
 	if cp, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cp); err == nil && cfg.Session.Provider != "" {
-			return cfg.Session.Provider
+		if cfg, err := loadCityConfig(cp); err == nil {
+			return sessionProviderContextForCity(cfg, cp, ctx.providerName)
 		}
 	}
-	return ""
+	return ctx
 }
+
+func sessionProviderContextForCity(cfg *config.City, cityPath, providerOverride string) sessionProviderContext {
+	ctx := sessionProviderContext{
+		providerName: providerOverride,
+		cfg:          cfg,
+		cityPath:     cityPath,
+	}
+	if cfg == nil {
+		return ctx
+	}
+	ctx.sc = cfg.Session
+	ctx.cityName = cfg.Workspace.Name
+	if ctx.cityName == "" {
+		ctx.cityName = filepath.Base(cityPath)
+	}
+	ctx.agents = cfg.Agents
+	ctx.sessionTemplate = cfg.Workspace.SessionTemplate
+	if ctx.providerName == "" {
+		ctx.providerName = cfg.Session.Provider
+	}
+	return ctx
+}
+
+var openSessionProviderStore = openCityStoreAt
 
 // tmuxConfigFromSession converts a config.SessionConfig into a
 // sessiontmux.Config with resolved durations and defaults. If the
@@ -119,25 +152,34 @@ func newSessionProviderByName(name string, sc config.SessionConfig, cityName, ci
 // "acp" but some agents have session = "acp", returns an auto.Provider that
 // routes per-session. Startup path — exits on error.
 func newSessionProvider() runtime.Provider {
-	var sc config.SessionConfig
-	var cityName string
-	var cityPath string
-	var agents []config.Agent
-	var sessionTemplate string
-	if cp, err := resolveCity(); err == nil {
-		cityPath = cp
-		if cfg, err := loadCityConfig(cp); err == nil {
-			sc = cfg.Session
-			cityName = cfg.Workspace.Name
-			if cityName == "" {
-				cityName = filepath.Base(cp)
-			}
-			agents = cfg.Agents
-			sessionTemplate = cfg.Workspace.SessionTemplate
-		}
+	ctx := loadSessionProviderContext()
+	sessionBeads := loadProviderSessionSnapshot(ctx)
+	return newSessionProviderFromContext(ctx, sessionBeads)
+}
+
+func newSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provider {
+	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
+	sessionBeads := loadProviderSessionSnapshot(ctx)
+	return newSessionProviderFromContext(ctx, sessionBeads)
+}
+
+func loadProviderSessionSnapshot(ctx sessionProviderContext) *sessionBeadSnapshot {
+	if ctx.cityPath == "" || ctx.providerName == "acp" || !hasACPAgents(ctx.agents) {
+		return nil
 	}
-	provName := sessionProviderName()
-	sp, err := newSessionProviderByName(provName, sc, cityName, cityPath)
+	store, err := openSessionProviderStore(ctx.cityPath)
+	if err != nil {
+		return nil
+	}
+	all, err := store.ListByLabel(sessionBeadLabel, 0)
+	if err != nil {
+		return nil
+	}
+	return newSessionBeadSnapshot(all)
+}
+
+func newSessionProviderFromContext(ctx sessionProviderContext, sessionBeads *sessionBeadSnapshot) runtime.Provider {
+	sp, err := newSessionProviderByName(ctx.providerName, ctx.sc, ctx.cityName, ctx.cityPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err) //nolint:errcheck // best-effort stderr
 		os.Exit(1)
@@ -146,25 +188,15 @@ func newSessionProvider() runtime.Provider {
 	// wrap in an auto provider that routes per-session.
 	// NOTE: agents comes from loadCityConfig which applies pack overrides,
 	// so the Session field from overrides is already resolved here.
-	if provName != "acp" && hasACPAgents(agents) {
-		acpSP, acpErr := newSessionProviderByName("acp", sc, cityName, cityPath)
+	if ctx.providerName != "acp" && hasACPAgents(ctx.agents) {
+		acpSP, acpErr := newSessionProviderByName("acp", ctx.sc, ctx.cityName, ctx.cityPath)
 		if acpErr != nil {
 			fmt.Fprintf(os.Stderr, "acp provider: %v\n", acpErr) //nolint:errcheck // best-effort stderr
 			os.Exit(1)
 		}
 		autoSP := sessionauto.New(sp, acpSP)
-		// Pre-register routes for known ACP agents so one-off commands
-		// (gc status, gc agent nudge, etc.) route correctly.
-		// Best-effort store for bead-derived session name lookup.
-		var store beads.Store
-		if cityPath != "" {
-			store, _ = openCityStoreAt(cityPath)
-		}
-		for _, a := range agents {
-			if a.Session == "acp" {
-				sessName := lookupSessionNameOrLegacy(store, cityName, a.QualifiedName(), sessionTemplate)
-				autoSP.RouteACP(sessName)
-			}
+		for _, sessName := range configuredACPSessionNames(sessionBeads, ctx.cityName, ctx.sessionTemplate, ctx.agents) {
+			autoSP.RouteACP(sessName)
 		}
 		return autoSP
 	}
@@ -181,6 +213,26 @@ func hasACPAgents(agents []config.Agent) bool {
 	return false
 }
 
+// configuredACPSessionNames resolves the runtime session names for ACP-backed
+// agents using a single session-bead snapshot. When the snapshot is unavailable
+// or bead lookup fails, it falls back to the legacy deterministic name.
+func configuredACPSessionNames(snapshot *sessionBeadSnapshot, cityName, sessionTemplate string, agents []config.Agent) []string {
+	names := make([]string, 0, len(agents))
+	for _, a := range agents {
+		if a.Session != "acp" {
+			continue
+		}
+		sessName := agent.SessionNameFor(cityName, a.QualifiedName(), sessionTemplate)
+		if snapshot != nil {
+			if beadName := snapshot.FindSessionNameByTemplate(a.QualifiedName()); beadName != "" {
+				sessName = beadName
+			}
+		}
+		names = append(names, sessName)
+	}
+	return names
+}
+
 // displayProviderName returns a human-readable provider name for logging.
 func displayProviderName(name string) string {
 	if name == "" {
@@ -193,8 +245,17 @@ func displayProviderName(name string) string {
 // Priority: GC_BEADS env var → city.toml [beads].provider → "bd" default.
 // This is the unmodified config value; use beadsProvider() for lifecycle
 // routing which remaps "bd" → exec:.
+//
+// If the ambient GC_BEADS points at the city-managed gc-beads-bd lifecycle
+// wrapper, we normalize it back to "bd". The wrapper exits 2 for data ops
+// (see #647), so inheriting it from a contaminated parent would reintroduce
+// the crash in nested agent sessions. Genuine user exec: overrides are
+// preserved — only the well-known lifecycle wrapper path is stripped.
 func rawBeadsProvider(cityPath string) string {
 	if v := os.Getenv("GC_BEADS"); v != "" {
+		if isLifecycleWrapperPath(v) {
+			return "bd"
+		}
 		return v
 	}
 	// Try to read provider from city.toml.
@@ -205,9 +266,25 @@ func rawBeadsProvider(cityPath string) string {
 	return "bd"
 }
 
+// isLifecycleWrapperPath reports whether v is the city-managed gc-beads-bd
+// lifecycle wrapper (i.e., `exec:<anything>/.gc/system/bin/gc-beads-bd`).
+func isLifecycleWrapperPath(v string) bool {
+	if !strings.HasPrefix(v, "exec:") {
+		return false
+	}
+	return strings.HasSuffix(v, string(filepath.Separator)+citylayout.SystemBinRoot+string(filepath.Separator)+"gc-beads-bd")
+}
+
 // beadsProvider returns the bead store provider name for lifecycle operations.
 // Maps "bd" → "exec:<cityPath>/.gc/system/bin/gc-beads-bd" so all lifecycle operations
 // route through the exec: protocol. Other providers pass through unchanged.
+//
+// This is for lifecycle operations ONLY (start/stop/health/ensure-ready/init).
+// gc-beads-bd exits 2 for data operations (get/list/create/update/close); it
+// is not a full exec-beads protocol implementation. Data-path callers — in
+// particular agent-session environments (see template_resolve.go) — must use
+// rawBeadsProvider() so they route through BdStore directly. See #647 for the
+// crash that surfaced when this invariant was violated.
 //
 // Related env vars:
 //   - GC_DOLT=skip — the gc-beads-bd script checks this and exits 2 for all

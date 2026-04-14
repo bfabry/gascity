@@ -31,11 +31,10 @@ type BeadQuerier interface {
 	Get(id string) (beads.Bead, error)
 }
 
-// BeadChildQuerier extends BeadQuerier with the ability to list children
-// of a convoy.
+// BeadChildQuerier extends BeadQuerier with the ability to query child beads.
 type BeadChildQuerier interface {
 	BeadQuerier
-	Children(parentID string, opts ...beads.QueryOpt) ([]beads.Bead, error)
+	List(query beads.ListQuery) ([]beads.Bead, error)
 }
 
 func newSlingCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -312,13 +311,13 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 			storeDir = rigPath
 		}
 	}
-	if storeDir == cityPath {
+	if samePath(storeDir, cityPath) {
 		if rd := rigDirForAgent(cfg, a); rd != "" {
 			storeDir = rd
 		}
 	}
 	storeEnv := bdRuntimeEnv(cityPath)
-	if filepath.Clean(storeDir) != filepath.Clean(cityPath) {
+	if !samePath(storeDir, cityPath) {
 		storeEnv = bdRuntimeEnvForRig(cityPath, cfg, storeDir)
 	}
 	store := beads.NewBdStore(storeDir, beads.ExecCommandRunnerWithEnv(storeEnv))
@@ -476,7 +475,7 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 	beadID := opts.BeadOrFormula
 	method := "bead"
 
-	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" && (opts.NoFormula || a.DefaultSlingFormula == "") {
+	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" && (opts.NoFormula || a.EffectiveDefaultSlingFormula() == "") {
 		fmt.Fprintln(deps.Stderr, "gc sling: --scope-kind/--scope-ref require a formula-backed workflow launch") //nolint:errcheck // best-effort
 		return 1
 	}
@@ -539,21 +538,21 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 	}
 
 	// Apply default formula if target has one and no explicit formula/--no-formula.
-	if opts.OnFormula == "" && !opts.IsFormula && !opts.NoFormula && a.DefaultSlingFormula != "" {
+	if opts.OnFormula == "" && !opts.IsFormula && !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 		method = "default-on-formula"
 		if err := checkNoMoleculeChildren(querier, beadID, deps.Store, deps.Stderr); err != nil {
 			fmt.Fprintf(deps.Stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
 			return 1
 		}
-		defaultVars := buildSlingFormulaVars(a.DefaultSlingFormula, beadID, opts.Vars, a, deps)
-		result, err := instantiateSlingFormula(context.Background(), a.DefaultSlingFormula, slingFormulaSearchPaths(deps, a), molecule.Options{
+		defaultVars := buildSlingFormulaVars(a.EffectiveDefaultSlingFormula(), beadID, opts.Vars, a, deps)
+		result, err := instantiateSlingFormula(context.Background(), a.EffectiveDefaultSlingFormula(), slingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             defaultVars,
 			PriorityOverride: beadPriorityOverride(querier, beadID),
 		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
 			fmt.Fprintf(deps.Stderr, "gc sling: instantiating default formula %q on %s: %v\n", //nolint:errcheck // best-effort
-				a.DefaultSlingFormula, beadID, err)
+				a.EffectiveDefaultSlingFormula(), beadID, err)
 			return 1
 		}
 		wispRootID := result.RootID
@@ -561,7 +560,7 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 			if code := startGraphWorkflow(result, beadID, a, method, deps); code != 0 {
 				return code
 			}
-			fmt.Fprintf(deps.Stdout, "Attached workflow %s (default formula %q) to %s\n", wispRootID, a.DefaultSlingFormula, beadID) //nolint:errcheck // best-effort
+			fmt.Fprintf(deps.Stdout, "Attached workflow %s (default formula %q) to %s\n", wispRootID, a.EffectiveDefaultSlingFormula(), beadID) //nolint:errcheck // best-effort
 			return 0
 		}
 		// Record molecule_id on the work bead so agents can discover it
@@ -571,7 +570,7 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 			// Non-fatal — wisp was already attached.
 		}
 		fmt.Fprintf(deps.Stdout, "Attached wisp %s (default formula %q) to %s\n", //nolint:errcheck // best-effort
-			wispRootID, a.DefaultSlingFormula, beadID)
+			wispRootID, a.EffectiveDefaultSlingFormula(), beadID)
 	}
 
 	// Build and execute sling command.
@@ -676,8 +675,13 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int 
 		return doSling(singleOpts, deps, querier)
 	}
 
-	// Container expansion.
-	children, err := querier.Children(b.ID)
+	// Container expansion keeps closed children in the preview so the skipped
+	// section and summary counts still reflect the full container state.
+	children, err := querier.List(beads.ListQuery{
+		ParentID:      b.ID,
+		IncludeClosed: true,
+		Sort:          beads.SortCreatedAsc,
+	})
 	if err != nil {
 		fmt.Fprintf(deps.Stderr, "gc sling: listing children of %s: %v\n", b.ID, err) //nolint:errcheck // best-effort
 		return 1
@@ -710,8 +714,8 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int 
 
 	// Pre-check: if --on or default formula, verify NO open child already has an attached molecule.
 	useFormula := opts.OnFormula
-	if useFormula == "" && !opts.IsFormula && !opts.NoFormula && a.DefaultSlingFormula != "" {
-		useFormula = a.DefaultSlingFormula
+	if useFormula == "" && !opts.IsFormula && !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
+		useFormula = a.EffectiveDefaultSlingFormula()
 	}
 	if useFormula != "" {
 		if err := checkBatchNoMoleculeChildren(querier, open, deps.Store, deps.Stderr); err != nil {
@@ -731,7 +735,7 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int 
 	batchMethod := "batch"
 	if opts.OnFormula != "" {
 		batchMethod = "batch-on"
-	} else if !opts.NoFormula && a.DefaultSlingFormula != "" {
+	} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 		batchMethod = "batch-default-on"
 	}
 
@@ -769,16 +773,16 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int 
 			}
 			_ = deps.Store.SetMetadata(child.ID, "molecule_id", cookResult.RootID)             // best-effort
 			fmt.Fprintf(deps.Stdout, "  Attached wisp %s → %s\n", cookResult.RootID, child.ID) //nolint:errcheck // best-effort
-		} else if !opts.NoFormula && a.DefaultSlingFormula != "" {
+		} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 			// Apply default formula per-child.
-			childVars := buildSlingFormulaVars(a.DefaultSlingFormula, child.ID, opts.Vars, a, deps)
-			cookResult, err := molecule.Cook(context.Background(), deps.Store, a.DefaultSlingFormula, slingFormulaSearchPaths(deps, a), molecule.Options{
+			childVars := buildSlingFormulaVars(a.EffectiveDefaultSlingFormula(), child.ID, opts.Vars, a, deps)
+			cookResult, err := molecule.Cook(context.Background(), deps.Store, a.EffectiveDefaultSlingFormula(), slingFormulaSearchPaths(deps, a), molecule.Options{
 				Title:            opts.Title,
 				Vars:             childVars,
 				PriorityOverride: clonePriorityPtr(child.Priority),
 			})
 			if err != nil {
-				fmt.Fprintf(deps.Stderr, "  Failed %s: instantiating default formula %q: %v\n", child.ID, a.DefaultSlingFormula, err) //nolint:errcheck // best-effort
+				fmt.Fprintf(deps.Stderr, "  Failed %s: instantiating default formula %q: %v\n", child.ID, a.EffectiveDefaultSlingFormula(), err) //nolint:errcheck // best-effort
 				telemetry.RecordSling(context.Background(), a.QualifiedName(), targetType(&a), batchMethod, err)
 				failed++
 				continue
@@ -945,9 +949,10 @@ func slingFormulaUsesTargetBranch(formula string) bool {
 }
 
 // resolveSlingEnv returns extra env vars for the sling command.
-// For fixed (non-pool) agents, resolves the target's session name from
-// the bead store and returns it as GC_SLING_TARGET. Pool agents don't
-// need this — they use label-based dispatch.
+// For fixed single-session agents, resolves the target's session name from
+// the bead store and returns it as GC_SLING_TARGET. Default routing uses
+// gc.routed_to metadata for all agents, but custom sling_query templates may
+// still rely on the resolved concrete session target.
 func resolveSlingEnv(a config.Agent, deps slingDeps) map[string]string {
 	if isMultiSessionCfgAgent(&a) {
 		return nil
@@ -1117,7 +1122,7 @@ func decorateGraphWorkflowRecipe(recipe *formula.Recipe, routeVars map[string]st
 	if sessionName != "" {
 		defaultRoute.sessionName = sessionName
 	} else {
-		defaultRoute.label = "pool:" + routedTo
+		defaultRoute.metadataOnly = true
 	}
 	routingRigContext := graphRouteRigContext(defaultRoute.qualifiedName)
 	controlRoute, err := controlDispatcherBinding(store, cityName, cfg, routingRigContext)
@@ -1165,7 +1170,7 @@ func decorateGraphWorkflowRecipe(recipe *formula.Recipe, routeVars map[string]st
 			continue
 		}
 		switch step.Metadata["gc.kind"] {
-		case "workflow", "scope":
+		case "workflow", "scope", "spec":
 			continue
 		}
 		binding, err := resolveGraphStepBindingWithVars(step.ID, stepByID, stepAlias, depsByStep, bindingCache, resolving, routeVars, defaultRoute, routingRigContext, store, cityName, cfg)
@@ -1185,8 +1190,8 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 	if strings.TrimSpace(storeDir) == "" || strings.TrimSpace(cityPath) == "" {
 		return ""
 	}
-	storeDir = filepath.Clean(storeDir)
-	cityPath = filepath.Clean(cityPath)
+	storeDir = normalizePathForCompare(storeDir)
+	cityPath = normalizePathForCompare(cityPath)
 	if storeDir == cityPath {
 		cityName = strings.TrimSpace(cityName)
 		if cityName == "" {
@@ -1199,7 +1204,7 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 		if !filepath.IsAbs(rigPath) {
 			rigPath = filepath.Join(cityPath, rigPath)
 		}
-		if filepath.Clean(rigPath) == storeDir {
+		if samePath(rigPath, storeDir) {
 			return "rig:" + rig.Name
 		}
 	}
@@ -1209,7 +1214,7 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 type graphRouteBinding struct {
 	qualifiedName string
 	sessionName   string
-	label         string
+	metadataOnly  bool
 }
 
 func resolveGraphStepBinding(stepID string, stepByID map[string]*formula.RecipeStep, stepAlias map[string]string, depsByStep map[string][]string, cache map[string]graphRouteBinding, resolving map[string]bool, fallback graphRouteBinding, rigContext string, store beads.Store, cityName string, cfg *config.City) (graphRouteBinding, error) {
@@ -1323,7 +1328,7 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	}
 	binding := graphRouteBinding{qualifiedName: agentCfg.QualifiedName()}
 	if isMultiSessionCfgAgent(&agentCfg) {
-		binding.label = "pool:" + agentCfg.QualifiedName()
+		binding.metadataOnly = true
 		cache[stepID] = binding
 		return binding, nil
 	}
@@ -1360,15 +1365,6 @@ func graphRouteRigContext(route string) string {
 		return ""
 	}
 	return route[:idx]
-}
-
-func appendUniqueString(in []string, value string) []string {
-	for _, existing := range in {
-		if existing == value {
-			return in
-		}
-	}
-	return append(in, value)
 }
 
 func shouldPromoteWorkflowLaunchStatus(status string) bool {
@@ -1457,6 +1453,9 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 		if b.Assignee != "" {
 			warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
 		}
+		if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
+			warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
+		}
 		for _, l := range b.Labels {
 			if strings.HasPrefix(l, "pool:") {
 				warnings = append(warnings, fmt.Sprintf("warning: bead %s already has pool label %q", beadID, l))
@@ -1466,8 +1465,20 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 	}
 
 	target := a.QualifiedName()
+	if strings.TrimSpace(b.Metadata["gc.routed_to"]) == target {
+		// Only idempotent if the bead is unassigned or already assigned
+		// consistently with the target. Otherwise the bead would be
+		// invisible to the target's work_query (which requires --unassigned
+		// for pool work in tier 3).
+		if b.Assignee == "" || b.Assignee == target {
+			return beadCheckResult{Idempotent: true}
+		}
+		return beadCheckResult{
+			Warnings: []string{fmt.Sprintf("warning: bead %s routed to %q but assigned to %q", beadID, target, b.Assignee)},
+		}
+	}
 
-	// Fixed agent: check assignee match.
+	// Fixed agent: check legacy assignee routing as a compatibility fallback.
 	if !isMultiSessionCfgAgent(&a) {
 		if b.Assignee == target {
 			return beadCheckResult{Idempotent: true}
@@ -1475,6 +1486,9 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 		var warnings []string
 		if b.Assignee != "" {
 			warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
+		}
+		if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
+			warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
 		}
 		for _, l := range b.Labels {
 			if strings.HasPrefix(l, "pool:") {
@@ -1484,16 +1498,23 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 		return beadCheckResult{Warnings: warnings}
 	}
 
-	// Pool: check for matching pool label.
-	poolLabel := "pool:" + target
-	for _, l := range b.Labels {
-		if l == poolLabel {
-			return beadCheckResult{Idempotent: true}
+	// Multi-session targets: pool labels are a legacy fallback only when
+	// gc.routed_to is absent. If gc.routed_to is set (even to a different
+	// target), it is authoritative — a stale pool label must not short-circuit.
+	if strings.TrimSpace(b.Metadata["gc.routed_to"]) == "" {
+		poolLabel := "pool:" + target
+		for _, l := range b.Labels {
+			if l == poolLabel {
+				return beadCheckResult{Idempotent: true}
+			}
 		}
 	}
 	var warnings []string
 	if b.Assignee != "" {
 		warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
+	}
+	if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
+		warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
 	}
 	for _, l := range b.Labels {
 		if strings.HasPrefix(l, "pool:") {
@@ -1598,7 +1619,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 	const msg = "Work slung. Check your hook."
 	running := sp.IsRunning(target.sessionName)
 	now := time.Now()
-	if running && tryDeliverWaitIdleNudge(target, sp, msg) {
+	if running && tryDeliverWaitIdleNudge(target, sp, "sling", msg) {
 		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), nil)
 		fmt.Fprintf(stdout, "Nudged %s\n", target.agent.QualifiedName()) //nolint:errcheck // best-effort
 		return
@@ -1610,7 +1631,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 		return
 	}
 	if running {
-		maybeStartCodexNudgePoller(target)
+		maybeStartNudgePoller(target)
 	} else if err := pokeController(cityPath); err != nil {
 		fmt.Fprintf(stderr, "Session %q is asleep; poke failed: %v\n", target.agent.QualifiedName(), err) //nolint:errcheck // best-effort
 	} else {
@@ -1696,18 +1717,18 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 			w("  Would run: " + cookCmd)
 			w("  Pre-check: " + opts.BeadOrFormula + " has no existing molecule/wisp children ✓")
 			w("")
-		} else if !opts.NoFormula && a.DefaultSlingFormula != "" {
+		} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, deps.Stderr); err != nil {
 				fmt.Fprintf(deps.Stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
 				return 1
 			}
 
 			w("Default formula:")
-			w("  Formula: " + a.DefaultSlingFormula)
+			w("  Formula: " + a.EffectiveDefaultSlingFormula())
 			w("  Target " + a.QualifiedName() + " has a default_sling_formula configured.")
 			w("  A wisp will be attached automatically (use --no-formula to suppress).")
 			w("")
-			cookCmd := fmt.Sprintf("bd mol cook --formula=%s --on=%s", a.DefaultSlingFormula, opts.BeadOrFormula)
+			cookCmd := fmt.Sprintf("bd mol cook --formula=%s --on=%s", a.EffectiveDefaultSlingFormula(), opts.BeadOrFormula)
 			if opts.Title != "" {
 				cookCmd += fmt.Sprintf(" --title=%s", opts.Title)
 			}
@@ -1777,7 +1798,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps,
 				w("    " + clabel + " (open) → already routed (skip)")
 			} else {
 				suffix := " → would route"
-				if opts.OnFormula != "" || (!opts.NoFormula && a.DefaultSlingFormula != "") {
+				if opts.OnFormula != "" || (!opts.NoFormula && a.EffectiveDefaultSlingFormula() != "") {
 					suffix = " → would route + attach wisp"
 				}
 				w("    " + clabel + " (open)" + suffix)
@@ -1796,12 +1817,12 @@ func dryRunBatch(opts slingOpts, deps slingDeps,
 			w("    bd mol cook --formula=" + opts.OnFormula + " --on=" + c.ID)
 		}
 		w("")
-	} else if !opts.NoFormula && a.DefaultSlingFormula != "" {
+	} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 		w("Default formula (per open child):")
-		w("  Formula: " + a.DefaultSlingFormula)
+		w("  Formula: " + a.EffectiveDefaultSlingFormula())
 		w("  Would run:")
 		for _, c := range open {
-			w("    bd mol cook --formula=" + a.DefaultSlingFormula + " --on=" + c.ID)
+			w("    bd mol cook --formula=" + a.EffectiveDefaultSlingFormula() + " --on=" + c.ID)
 		}
 		w("")
 	}
@@ -1903,11 +1924,13 @@ func isCustomSlingQuery(a config.Agent) bool {
 }
 
 // looksLikeBeadID reports whether s matches the bead ID pattern: an
-// alphabetic-led alphanumeric prefix, a dash, and a short base36-like
-// suffix (e.g. "BL-42", "mp-1j1", "g6-53b"). Real bd prefixes can include
-// digits after the first character, so the prefix matcher must allow that.
-// Strings with spaces or multiple dashes (like "code-review" or "hello-world")
-// are treated as inline text for ad-hoc bead creation.
+// alphabetic-led alphanumeric prefix, a dash, and a short alphanumeric
+// suffix of 1-8 chars (e.g. "BL-42", "mp-1j1", "gc-56nqn",
+// "gc-r5sr6bm"). Short suffixes (1-4 chars) are accepted
+// unconditionally. Longer suffixes (5-8 chars) must contain at least
+// one digit to distinguish base36 hashes from English words like
+// "hello-world". Strings with spaces or multiple dashes (like
+// "code-review") are treated as inline text for ad-hoc bead creation.
 // beadExistsInStore returns true if the given ID resolves to a bead in the store.
 // Used as a fallback when looksLikeBeadID returns false for valid hierarchical
 // IDs (e.g., "ProjectWrenUnity-0fze.1").
@@ -1952,9 +1975,23 @@ func looksLikeBeadID(s string) bool {
 			return false
 		}
 	}
-	// Bead ID suffixes from bd are short base36 hashes (2-4 chars).
-	// Names like "code-review" or "hello-world" have longer suffixes.
-	return len(baseSuffix) <= 4
+	// Bead ID suffixes from bd are base36 hashes (3-8 chars) or
+	// sequential integers. Short suffixes (1-4 chars) are accepted
+	// unconditionally — no English words are that short after a dash.
+	// Longer suffixes (5-8 chars) must contain at least one digit to
+	// distinguish base36 hashes from English words like "world".
+	if len(baseSuffix) > 8 {
+		return false
+	}
+	if len(baseSuffix) <= 4 {
+		return true
+	}
+	for _, c := range baseSuffix {
+		if '0' <= c && c <= '9' {
+			return true
+		}
+	}
+	return false
 }
 
 // beadPrefix extracts the rig prefix from a bead ID by taking the lowercase

@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -150,6 +151,13 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 				node.AssignAfterCreate = true
 			}
 		}
+		// Same residual-var guard as Instantiate — see #618.
+		if strings.Contains(node.Title, "{{") {
+			if residual := formula.CheckResidualVars(node.Title); len(residual) > 0 {
+				return nil, false, "", fmt.Errorf("step %q: bead title contains unresolved variable(s) %s — missing or misspelled --var(s)?", step.ID, strings.Join(residual, ", "))
+			}
+		}
+
 		plan.Nodes = append(plan.Nodes, node)
 	}
 	if !rootIncluded {
@@ -176,9 +184,10 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 		}
 	}
 
-	// Connect non-root steps to the root via a "belongs-to" dependency so that
-	// bd delete --cascade from the root discovers all workflow beads through
-	// the dependency graph (not just via gc.root_bead_id metadata).
+	// Connect non-root steps to the root via a non-blocking dependency so
+	// bd delete --cascade from the root still discovers all workflow beads
+	// through the dependency graph without making the workflow root a
+	// readiness blocker for finalizers and teardown work.
 	if graphWorkflow && rootKey != "" {
 		for _, node := range plan.Nodes {
 			if node.Key == rootKey {
@@ -187,7 +196,7 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
 				FromKey: node.Key,
 				ToKey:   rootKey,
-				Type:    "belongs-to",
+				Type:    "tracks",
 			})
 		}
 	}
@@ -271,6 +280,13 @@ func buildFragmentApplyPlan(store beads.Store, recipe *formula.FragmentRecipe, o
 				Type:    dep.Type,
 			})
 		}
+		// Same residual-var guard as buildRecipeApplyPlan — see #618.
+		if strings.Contains(node.Title, "{{") {
+			if residual := formula.CheckResidualVars(node.Title); len(residual) > 0 {
+				return nil, fmt.Errorf("step %q: bead title contains unresolved variable(s) %s — missing or misspelled --var(s)?", step.ID, strings.Join(residual, ", "))
+			}
+		}
+
 		plan.Nodes = append(plan.Nodes, node)
 	}
 
@@ -286,14 +302,15 @@ func buildFragmentApplyPlan(store beads.Store, recipe *formula.FragmentRecipe, o
 		}
 	}
 
-	// Connect fragment steps to the root via belongs-to so cascade deletion
-	// from the root discovers them through the dependency graph.
+	// Connect fragment steps to the root via a non-blocking dependency so
+	// cascade deletion from the root still discovers them through the
+	// dependency graph without introducing artificial blockers.
 	if opts.RootID != "" {
 		for _, node := range plan.Nodes {
 			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
 				FromKey: node.Key,
 				ToID:    opts.RootID,
-				Type:    "belongs-to",
+				Type:    "tracks",
 			})
 		}
 	}

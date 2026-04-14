@@ -9,9 +9,15 @@
 # are pruned from the ledger automatically.
 #
 # Runs as an exec order (no LLM, no agent, no wisp).
+#
+# NOTE on `bd batch` (beads#6): this script's loops call `bd show` and
+# `gc mail send` per iteration — neither is supported by `bd batch`
+# (which only handles close/update/create/dep add/dep remove). The
+# ledger-prune loop does no `bd` calls at all, just local jq. There is
+# therefore nothing here to fold into a batch transaction.
 set -euo pipefail
 
-CITY="${GC_CITY_ROOT:-.}"
+CITY="${GC_CITY:-.}"
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance}"
 LEDGER="$PACK_STATE_DIR/spawn-storm-counts.json"
 THRESHOLD="${SPAWN_STORM_THRESHOLD:-2}"

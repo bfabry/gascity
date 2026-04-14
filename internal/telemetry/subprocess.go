@@ -10,7 +10,9 @@ import (
 // Returns "" when no GC vars are found.
 func buildGCResourceAttrs() string {
 	var attrs []string
-	if v := os.Getenv("GC_AGENT"); v != "" {
+	if v := os.Getenv("GC_ALIAS"); v != "" {
+		attrs = append(attrs, "gc.agent="+v)
+	} else if v := os.Getenv("GC_AGENT"); v != "" {
 		attrs = append(attrs, "gc.agent="+v)
 	}
 	if v := os.Getenv("GC_RIG"); v != "" {

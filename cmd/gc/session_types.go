@@ -54,6 +54,7 @@ type drainState struct {
 	reason     string // "idle", "pool-excess", "config-drift", "user"
 	generation int    // generation at drain start — fence for Stop
 	ackSet     bool   // true after GC_DRAIN_ACK has been set by the reconciler
+	followUp   bool   // true when the controller should trigger one more immediate tick
 }
 
 // idleProbeState tracks an async WaitForIdle probe for interactive idle sleep.
@@ -70,7 +71,6 @@ type drainTracker struct {
 	drains          map[string]*drainState     // session bead ID -> drain state
 	idleProbes      map[string]*idleProbeState // session bead ID -> async idle probe
 	idleProbeCursor int
-	idleProbeWG     sync.WaitGroup
 }
 
 func newDrainTracker() *drainTracker {
@@ -106,6 +106,24 @@ func (dt *drainTracker) all() map[string]*drainState {
 		cp[k] = v
 	}
 	return cp
+}
+
+func (dt *drainTracker) consumeFollowUpTick() bool {
+	if dt == nil {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	needed := false
+	for _, ds := range dt.drains {
+		if ds == nil || !ds.followUp {
+			continue
+		}
+		ds.followUp = false
+		needed = true
+	}
+	return needed
 }
 
 func (dt *drainTracker) idleProbe(beadID string) (idleProbeState, bool) {
@@ -159,27 +177,6 @@ func (dt *drainTracker) clearIdleProbe(beadID string) {
 	delete(dt.idleProbes, beadID)
 }
 
-func (dt *drainTracker) beginIdleProbe() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Add(1)
-}
-
-func (dt *drainTracker) doneIdleProbe() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Done()
-}
-
-func (dt *drainTracker) waitIdleProbes() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Wait()
-}
-
 // Reconciler tuning defaults.
 const (
 	// stabilityThreshold is how long a session must survive after wake
@@ -210,4 +207,17 @@ const (
 	// defaultMaxWakeAttempts is how many consecutive wake failures before
 	// quarantine.
 	defaultMaxWakeAttempts = 5
+
+	// churnProductivityThreshold is how long a session must run to be
+	// considered productive. Sessions that survive past stabilityThreshold
+	// but die before this threshold are "churning" — alive long enough to
+	// not count as a rapid crash, but too short to do useful work. This
+	// catches the context exhaustion death spiral where gc prime gets
+	// re-injected every ~60-90s.
+	churnProductivityThreshold = 5 * time.Minute
+
+	// defaultMaxChurnCycles is how many consecutive non-productive
+	// wake→die cycles before quarantine. Three cycles means the session
+	// failed to be productive three times in a row.
+	defaultMaxChurnCycles = 3
 )

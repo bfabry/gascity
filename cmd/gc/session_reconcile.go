@@ -1,7 +1,14 @@
 // session_reconcile.go contains pure functions for the bead-driven session
-// reconciler. All functions assume single-threaded execution within one
-// reconciler tick. Map mutations on beads.Bead.Metadata are visible to
-// callers by design (maps are reference types).
+// reconciler. Functions in this file assume single-threaded execution
+// within one reconciler tick, with one intentional exception:
+// computeWorkSet parallelizes its per-agent scale_check runner calls
+// under a bounded semaphore (see bdProbeConcurrency in pool.go) so bd
+// subprocess latency doesn't serialize the whole cycle. Any ScaleCheckRunner
+// passed to computeWorkSet must therefore be safe to invoke from multiple
+// goroutines concurrently — shellScaleCheck (the production implementation)
+// is safe because it only reads its arguments and spawns an independent
+// subprocess. Map mutations on beads.Bead.Metadata are visible to callers
+// by design (maps are reference types).
 package main
 
 import (
@@ -9,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -377,25 +385,56 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 	if cfg == nil || runner == nil {
 		return nil
 	}
+	// Collect the per-agent probe work first so the bd subprocess
+	// calls can run concurrently. Each work_query shells out to `bd`,
+	// which serializes on the shared dolt sql-server, so a sequential
+	// loop over 40+ agents takes minutes per reconcile cycle. Bound
+	// concurrency so overlapping probes don't stampede dolt.
+	type probeWork struct {
+		qn  string
+		wq  string
+		dir string
+	}
+	var probes []probeWork
 	work := make(map[string]bool)
 	seen := make(map[string]bool) // deduplicate pool instances
-	for _, a := range cfg.Agents {
+	for i := range cfg.Agents {
+		a := &cfg.Agents[i]
 		qn := a.QualifiedName()
 		if seen[qn] {
 			continue
 		}
 		seen[qn] = true
-		wq := prefixedWorkQueryForProbe(cfg, cityDir, cityName, store, sessionBeads, &a)
+		wq := prefixedWorkQueryForProbe(cfg, cityDir, cityName, store, sessionBeads, a)
 		if wq == "" {
 			continue
 		}
-		dir := agentCommandDir(cityDir, &a, cfg.Rigs)
-		out, err := runner(wq, dir)
-		if err != nil {
-			continue // command failed — treat as no work
-		}
-		if workQueryHasReadyWork(strings.TrimSpace(out)) {
-			work[qn] = true
+		probes = append(probes, probeWork{qn: qn, wq: wq, dir: agentCommandDir(cityDir, a, cfg.Rigs)})
+	}
+
+	sem := make(chan struct{}, cfg.Daemon.ProbeConcurrencyOrDefault())
+	results := make([]bool, len(probes))
+	var wg sync.WaitGroup
+	for i := range probes {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out, err := runner(probes[idx].wq, probes[idx].dir)
+			if err != nil {
+				return // command failed — treat as no work
+			}
+			if workQueryHasReadyWork(strings.TrimSpace(out)) {
+				results[idx] = true
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, p := range probes {
+		if results[i] {
+			work[p.qn] = true
 		}
 	}
 	return work
@@ -436,8 +475,9 @@ func healExpiredTimers(session *beads.Bead, store beads.Store, clk clock.Clock) 
 			batch := map[string]string{
 				"quarantined_until": "",
 				"wake_attempts":     "0",
+				"churn_count":       "0",
 			}
-			if session.Metadata["sleep_reason"] == "quarantine" {
+			if session.Metadata["sleep_reason"] == "quarantine" || session.Metadata["sleep_reason"] == "context-churn" {
 				batch["sleep_reason"] = ""
 			}
 			if err := store.SetMetadataBatch(session.ID, batch); err == nil {
@@ -550,6 +590,122 @@ func clearWakeFailures(session *beads.Bead, store beads.Store) {
 	}
 }
 
+// checkChurn detects repeated non-productive wake→die cycles (context
+// exhaustion death spirals). Unlike checkStability which catches rapid
+// crashes (< stabilityThreshold), this catches sessions that survive past
+// the stability threshold but die before being productive.
+//
+// Returns true if a churn event was recorded (caller should skip further
+// processing for this session).
+func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, store beads.Store, clk clock.Clock) bool {
+	if alive {
+		return false
+	}
+	// Subprocess sessions exit intentionally — not churn.
+	if cfg != nil && cfg.Session.Provider == "subprocess" {
+		return false
+	}
+	// Intentional drains are not churn.
+	if dt != nil && dt.get(session.ID) != nil {
+		return false
+	}
+	lastWoke := session.Metadata["last_woke_at"]
+	if lastWoke == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, lastWoke)
+	if err != nil {
+		return false
+	}
+	elapsed := clk.Now().Sub(t)
+	// Only fires for sessions in the "churn band": survived past
+	// stabilityThreshold (so checkStability didn't fire) but died
+	// before churnProductivityThreshold (so not productive).
+	if elapsed < stabilityThreshold {
+		return false
+	}
+	if elapsed >= churnProductivityThreshold {
+		// Session was productive — clear any stale churn count so it
+		// doesn't carry over and cause premature quarantine next time.
+		clearChurn(session, store)
+		return false
+	}
+
+	recordChurn(session, store, clk)
+	// Clear last_woke_at so this death is not re-counted next tick
+	// (edge-triggered, same pattern as checkStability).
+	_ = store.SetMetadata(session.ID, "last_woke_at", "")
+	session.Metadata["last_woke_at"] = ""
+	return true
+}
+
+// recordChurn increments the churn counter and clears session_key on
+// every churn event to force a fresh conversation on next wake. When
+// the counter reaches defaultMaxChurnCycles, the session is quarantined.
+func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock) {
+	count, _ := strconv.Atoi(session.Metadata["churn_count"])
+	count++
+
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+
+	// Always clear session_key on churn — context exhaustion means the
+	// conversation itself is the problem. A fresh conversation avoids
+	// re-hitting the same wall.
+	clearBatch := map[string]string{
+		"session_key":                "",
+		"continuation_reset_pending": "true",
+	}
+	if session.Metadata["session_key"] != "" {
+		_ = store.SetMetadataBatch(session.ID, clearBatch)
+		for k, v := range clearBatch {
+			session.Metadata[k] = v
+		}
+	}
+
+	if count >= defaultMaxChurnCycles {
+		qUntil := clk.Now().Add(defaultQuarantineDuration).UTC().Format(time.RFC3339)
+		batch := map[string]string{
+			"churn_count":       strconv.Itoa(count),
+			"quarantined_until": qUntil,
+			"sleep_reason":      "context-churn",
+		}
+		if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+			for k, v := range batch {
+				session.Metadata[k] = v
+			}
+		}
+		return
+	}
+
+	_ = store.SetMetadata(session.ID, "churn_count", strconv.Itoa(count))
+	session.Metadata["churn_count"] = strconv.Itoa(count)
+}
+
+// clearChurn resets the churn counter for a productive session.
+func clearChurn(session *beads.Bead, store beads.Store) {
+	if session.Metadata["churn_count"] == "" || session.Metadata["churn_count"] == "0" {
+		return
+	}
+	_ = store.SetMetadata(session.ID, "churn_count", "0")
+	session.Metadata["churn_count"] = "0"
+}
+
+// productiveLongEnough returns true if the session has been alive past
+// churnProductivityThreshold — long enough to have done useful work.
+func productiveLongEnough(session beads.Bead, clk clock.Clock) bool {
+	lastWoke := session.Metadata["last_woke_at"]
+	if lastWoke == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, lastWoke)
+	if err != nil {
+		return false
+	}
+	return clk.Now().Sub(t) >= churnProductivityThreshold
+}
+
 // stableLongEnough returns true if the session has been alive past stabilityThreshold.
 func stableLongEnough(session beads.Bead, clk clock.Clock) bool {
 	lastWoke := session.Metadata["last_woke_at"]
@@ -636,8 +792,8 @@ func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clo
 			sleepReason := session.Metadata["sleep_reason"]
 			isDraining := sleepReason == "idle" || sleepReason == "idle-timeout" ||
 				sleepReason == "no-wake-reason" || sleepReason == "config-drift" ||
-				sleepReason == "drained" || sleepReason == "user-hold" ||
-				sleepReason == "wait-hold"
+				sleepReason == "drained" ||
+				sleepReason == "user-hold" || sleepReason == "wait-hold"
 			if !isDraining && (prevState == "active" || prevState == "awake" || prevState == "creating") {
 				batch["session_key"] = ""
 				batch["started_config_hash"] = ""

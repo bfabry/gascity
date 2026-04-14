@@ -39,7 +39,7 @@ func buildAwakeInputFromReconciler(
 		a := &cfg.Agents[i]
 		agent := AwakeAgent{
 			QualifiedName:  a.QualifiedName(),
-			Suspended:      a.Suspended,
+			Suspended:      isAgentEffectivelySuspended(cfg, a),
 			SleepAfterIdle: parseSleepDuration(a.SleepAfterIdle),
 		}
 		if len(a.DependsOn) > 0 {
@@ -83,6 +83,7 @@ func buildAwakeInputFromReconciler(
 			SessionName:    name,
 			Template:       b.Metadata["template"],
 			State:          normalizeBeadState(b.Metadata["state"]),
+			SleepReason:    b.Metadata["sleep_reason"],
 			ManualSession:  b.Metadata["manual_session"] == "true",
 			PendingCreate:  b.Metadata["pending_create_claim"] == "true",
 			DependencyOnly: b.Metadata["dependency_only"] == "true",

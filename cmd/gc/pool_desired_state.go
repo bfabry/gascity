@@ -115,24 +115,25 @@ func computePoolDesiredStates(
 			if routedTo != template {
 				continue
 			}
+			if wb.Status != "in_progress" && wb.Status != "open" {
+				continue
+			}
 			assignee := strings.TrimSpace(wb.Assignee)
 			if assignee == "" {
 				continue
 			}
 			sessionBeadID := assigneeToSessionBeadID[assignee]
-			if sessionBeadID == "" {
-				continue
+			if sessionBeadID != "" {
+				allRequests = append(allRequests, SessionRequest{
+					Template:      template,
+					BeadPriority:  beadPriority(wb),
+					Tier:          "resume",
+					SessionBeadID: sessionBeadID,
+					WorkBeadID:    wb.ID,
+				})
 			}
-			if wb.Status != "in_progress" && wb.Status != "open" {
-				continue
-			}
-			allRequests = append(allRequests, SessionRequest{
-				Template:      template,
-				BeadPriority:  beadPriority(wb),
-				Tier:          "resume",
-				SessionBeadID: sessionBeadID,
-				WorkBeadID:    wb.ID,
-			})
+			// Else: assignee set but session closed/unknown — orphaned
+			// work, not our job to respawn.
 		}
 	}
 

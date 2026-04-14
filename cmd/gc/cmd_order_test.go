@@ -340,12 +340,12 @@ func TestOrderRun(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("got %d runner calls, want 1: %v", len(calls), calls)
 	}
-	// Should include both order-run label and pool label in a single bd update.
+	// Should include both order-run tracking and routed_to metadata in a single bd update.
 	if !strings.Contains(calls[0], "--add-label=order-run:digest") {
 		t.Errorf("call[0] = %q, want --add-label=order-run:digest", calls[0])
 	}
-	if !strings.Contains(calls[0], "--add-label=pool:dog") {
-		t.Errorf("call[0] = %q, want --add-label=pool:dog", calls[0])
+	if !strings.Contains(calls[0], "--set-metadata gc.routed_to=dog") {
+		t.Errorf("call[0] = %q, want --set-metadata gc.routed_to=dog", calls[0])
 	}
 }
 
@@ -375,9 +375,9 @@ func TestOrderRunNoPool(t *testing.T) {
 	if !strings.Contains(calls[0], "--add-label=order-run:cleanup") {
 		t.Errorf("call[0] = %q, want --add-label=order-run:cleanup", calls[0])
 	}
-	// Should NOT contain pool label.
-	if strings.Contains(calls[0], "--add-label=pool:") {
-		t.Errorf("call[0] = %q, should not contain pool label", calls[0])
+	// Should NOT contain routed_to metadata.
+	if strings.Contains(calls[0], "--set-metadata gc.routed_to=") {
+		t.Errorf("call[0] = %q, should not contain routed_to metadata", calls[0])
 	}
 	// Verify wisp ID appears in stdout (MemStore generates gc-N IDs).
 	if !strings.Contains(stdout.String(), "gc-1") {
@@ -722,8 +722,8 @@ func TestOrderRunRigQualifiesPool(t *testing.T) {
 	if !strings.Contains(calls[0], "--add-label=order-run:db-health:rig:demo-repo") {
 		t.Errorf("call[0] = %q, want --add-label=order-run:db-health:rig:demo-repo", calls[0])
 	}
-	// Auto-qualified pool.
-	if !strings.Contains(calls[0], "--add-label=pool:demo-repo/polecat") {
-		t.Errorf("call[0] = %q, want --add-label=pool:demo-repo/polecat", calls[0])
+	// Auto-qualified routed_to target.
+	if !strings.Contains(calls[0], "--set-metadata gc.routed_to=demo-repo/polecat") {
+		t.Errorf("call[0] = %q, want --set-metadata gc.routed_to=demo-repo/polecat", calls[0])
 	}
 }

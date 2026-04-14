@@ -77,13 +77,18 @@ func runAdoptionBarrier(
 	}
 
 	// Step 2: Load existing open session beads, indexed by session_name.
-	existing, err := store.ListByLabel(sessionBeadLabel, 0)
+	existing, err := store.List(beads.ListQuery{
+		Label: sessionBeadLabel,
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "adoption barrier: listing beads: %v\n", err) //nolint:errcheck
 		return result, false
 	}
 	bySessionName := make(map[string]bool, len(existing))
 	for _, b := range existing {
+		if !sessionpkg.IsSessionBeadOrRepairable(b) {
+			continue
+		}
 		if b.Status == "closed" {
 			continue // closed beads don't count for dedup
 		}
@@ -118,15 +123,6 @@ func runAdoptionBarrier(
 
 	// Step 3: For each running session, adopt if no open bead exists.
 	for _, sessionName := range running {
-		if bySessionName[sessionName] {
-			result.AlreadyHadBead++
-			result.Details = append(result.Details, adoptionDetail{
-				SessionName: sessionName,
-				HasBead:     true,
-			})
-			continue
-		}
-
 		// Find matching config agent.
 		// First try exact session name match, then try resolving pool
 		// instances by stripping the numeric suffix and matching the
@@ -139,6 +135,18 @@ func runAdoptionBarrier(
 				isConfigAgent = true
 				isPoolInstance = true
 			}
+		}
+		if !sp.ProcessAlive(sessionName, processHints(cfgAgent)) {
+			result.Total--
+			continue
+		}
+		if bySessionName[sessionName] {
+			result.AlreadyHadBead++
+			result.Details = append(result.Details, adoptionDetail{
+				SessionName: sessionName,
+				HasBead:     true,
+			})
+			continue
 		}
 
 		// Build bead metadata. Config/live hashes are left empty —
@@ -247,4 +255,11 @@ func parsePoolSlot(sessionName string) int {
 		return 0
 	}
 	return slot
+}
+
+func processHints(a *config.Agent) []string {
+	if a == nil {
+		return nil
+	}
+	return a.ProcessNames
 }

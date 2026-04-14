@@ -3,19 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 type failingMetadataBatchStore struct {
@@ -269,35 +275,6 @@ func (p *interruptExitProvider) Interrupt(name string) error {
 	return p.Stop(name)
 }
 
-type staleIsRunningAfterInterruptProvider struct {
-	*runtime.Fake
-	mu          sync.Mutex
-	interrupted map[string]bool
-}
-
-func newStaleIsRunningAfterInterruptProvider() *staleIsRunningAfterInterruptProvider {
-	return &staleIsRunningAfterInterruptProvider{
-		Fake:        runtime.NewFake(),
-		interrupted: make(map[string]bool),
-	}
-}
-
-func (p *staleIsRunningAfterInterruptProvider) Interrupt(name string) error {
-	p.mu.Lock()
-	p.interrupted[name] = true
-	p.mu.Unlock()
-	return p.Fake.Interrupt(name)
-}
-
-func (p *staleIsRunningAfterInterruptProvider) IsRunning(name string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.interrupted[name] {
-		return false
-	}
-	return p.Fake.IsRunning(name)
-}
-
 type dropDependencyAfterNStartsProvider struct {
 	*runtime.Fake
 	mu        sync.Mutex
@@ -520,6 +497,107 @@ func TestPrepareStartCandidate_UsesLogicalTemplateForTaskWorkDir(t *testing.T) {
 	}
 }
 
+func TestExecutePlannedStarts_FreshWakeAfterDrainRetainsStartupContext(t *testing.T) {
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)}
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "mayor"}},
+	}
+	tp := TemplateParams{
+		Command:      "claude --dangerously-skip-permissions",
+		SessionName:  "mayor",
+		TemplateName: "mayor",
+		Prompt:       "You are the mayor. Read the city state and coordinate next actions.",
+		Hints: agent.StartupHints{
+			Nudge: "Check mail and hook status, then act accordingly.",
+		},
+		ResolvedProvider: &config.ResolvedProvider{
+			Name:          "claude",
+			Command:       "claude",
+			PromptMode:    "arg",
+			ResumeFlag:    "--resume",
+			ResumeStyle:   "flag",
+			SessionIDFlag: "--session-id",
+		},
+	}
+	overrides, err := json.Marshal(map[string]string{
+		"initial_message": "Handoff context: check your mail before taking action.",
+	})
+	if err != nil {
+		t.Fatalf("Marshal(template_overrides): %v", err)
+	}
+	session, err := store.Create(beads.Bead{
+		Title:  "mayor",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":        "mayor",
+			"template":            "mayor",
+			"state":               "asleep",
+			"sleep_reason":        "drained",
+			"wake_mode":           "fresh",
+			"session_key":         "fresh-key-123",
+			"started_config_hash": "previous-start",
+			"template_overrides":  string(overrides),
+			"generation":          "1",
+			"instance_token":      "test-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+
+	woken := executePlannedStarts(
+		context.Background(),
+		[]startCandidate{{session: &session, tp: tp, order: 0}},
+		cfg,
+		map[string]TemplateParams{"mayor": tp},
+		sp,
+		store,
+		"",
+		clk,
+		events.Discard,
+		5*time.Second,
+		ioDiscard{},
+		ioDiscard{},
+	)
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1", woken)
+	}
+
+	var startCfg *runtime.Config
+	for _, call := range sp.Calls {
+		if call.Method == "Start" && call.Name == "mayor" {
+			cfgCopy := call.Config
+			startCfg = &cfgCopy
+			break
+		}
+	}
+	if startCfg == nil {
+		t.Fatalf("expected Start call for mayor, calls=%#v", sp.Calls)
+	}
+	if got := startCfg.Command; got != "claude --dangerously-skip-permissions --session-id fresh-key-123" {
+		t.Fatalf("Start command = %q, want fresh session-id launch", got)
+	}
+	if startCfg.Nudge != "Check mail and hook status, then act accordingly." {
+		t.Fatalf("Start nudge = %q, want startup nudge preserved", startCfg.Nudge)
+	}
+	if startCfg.PromptSuffix == "" {
+		t.Fatal("PromptSuffix should be present on fresh wake after drain")
+	}
+	parts := shellquote.Split(startCfg.PromptSuffix)
+	if len(parts) != 1 {
+		t.Fatalf("PromptSuffix parsed parts = %#v, want single prompt payload", parts)
+	}
+	if !strings.Contains(parts[0], "You are the mayor. Read the city state and coordinate next actions.") {
+		t.Fatalf("prompt payload missing base prompt: %q", parts[0])
+	}
+	if !strings.Contains(parts[0], "Handoff context: check your mail before taking action.") {
+		t.Fatalf("prompt payload missing initial_message on fresh wake: %q", parts[0])
+	}
+}
+
 func TestPrepareStartCandidate_GeneratesMissingSessionKeyBeforeWake(t *testing.T) {
 	store := beads.NewMemStore()
 	session, err := store.Create(beads.Bead{
@@ -635,6 +713,56 @@ func TestReconcileSessionBeads_BlockedCandidatesDoNotConsumeWakeBudget(t *testin
 	}
 }
 
+func TestPrepareStartCandidate_NoneModeInitialMessageStaysInNudge(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		ID:     "gc-1",
+		Title:  "mayor",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":       "mayor",
+			"template":           "mayor",
+			"generation":         "1",
+			"instance_token":     "tok-mayor",
+			"state":              "creating",
+			"template_overrides": `{"initial_message":"hello from the user"}`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareStartCandidate(startCandidate{
+		session: &bead,
+		tp: TemplateParams{
+			TemplateName: "mayor",
+			SessionName:  "mayor",
+			Prompt:       "startup prompt",
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:       "gemini",
+				PromptMode: "none",
+			},
+		},
+		order: 0,
+	}, &config.City{
+		Agents: []config.Agent{
+			{Name: "mayor"},
+		},
+	}, store, &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatalf("prepareStartCandidate: %v", err)
+	}
+
+	if prepared.cfg.PromptSuffix != "" {
+		t.Fatalf("prepared.cfg.PromptSuffix = %q, want empty for prompt_mode none", prepared.cfg.PromptSuffix)
+	}
+	wantNudge := "startup prompt\n\n---\n\nUser message:\nhello from the user"
+	if prepared.cfg.Nudge != wantNudge {
+		t.Fatalf("prepared.cfg.Nudge = %q, want %q", prepared.cfg.Nudge, wantNudge)
+	}
+}
+
 func TestExecutePlannedStarts_RevalidatesDependenciesBetweenWaveBatches(t *testing.T) {
 	sp := &dropDependencyAfterNStartsProvider{
 		Fake:      runtime.NewFake(),
@@ -731,8 +859,8 @@ func TestCommitStartResult_ClearsPendingCreateClaimBeforeHashBatch(t *testing.T)
 	}
 
 	ok := commitStartResult(result, store, &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}, events.Discard, 0, ioDiscard{}, ioDiscard{})
-	if !ok {
-		t.Fatal("commitStartResult returned false, want true when only hash batch fails")
+	if ok {
+		t.Fatal("commitStartResult returned true, want false when metadata batch fails (state transition lost)")
 	}
 
 	got, err := store.Get(bead.ID)
@@ -1133,31 +1261,6 @@ func TestGracefulStopAll_UsesLegacyAgentLabelForPoolSubject(t *testing.T) {
 	}
 }
 
-func TestGracefulStopAll_UsesListRunningToStopLingeringSessions(t *testing.T) {
-	sp := newStaleIsRunningAfterInterruptProvider()
-	if err := sp.Start(context.Background(), "custom-worker", runtime.Config{}); err != nil {
-		t.Fatal(err)
-	}
-
-	rec := events.NewFake()
-	var stdout, stderr bytes.Buffer
-
-	gracefulStopAll([]string{"custom-worker"}, sp, 20*time.Millisecond, rec, nil, nil, &stdout, &stderr)
-
-	var stopCalls int
-	for _, call := range sp.Calls {
-		if call.Method == "Stop" && call.Name == "custom-worker" {
-			stopCalls++
-		}
-	}
-	if stopCalls == 0 {
-		t.Fatalf("expected gracefulStopAll to force-stop lingering session, calls=%+v", sp.Calls)
-	}
-	if !strings.Contains(stdout.String(), "Stopped agent 'custom-worker'") {
-		t.Fatalf("stdout = %q, want forced stop message", stdout.String())
-	}
-}
-
 func TestStopWaveOrder_HandlesUnknownTemplateWithoutSerialFallback(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
@@ -1454,6 +1557,36 @@ func TestInterruptTargetsBounded_RespectsInterruptCap(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("interruptTargetsBounded did not finish")
+	}
+}
+
+func TestInterruptTargetsBounded_StopsPoolManagedSessions(t *testing.T) {
+	sp := runtime.NewFake()
+	// Start both sessions.
+	for _, name := range []string{"human-worker", "pool-worker"} {
+		if err := sp.Start(context.Background(), name, runtime.Config{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targets := []stopTarget{
+		{name: "human-worker", template: "worker", resolved: true, poolManaged: false},
+		{name: "pool-worker", template: "pool", resolved: true, poolManaged: true},
+	}
+	var stderr bytes.Buffer
+	sent := interruptTargetsBounded(targets, sp, &stderr)
+	if sent != 1 {
+		t.Fatalf("sent = %d, want 1 (only human-worker)", sent)
+	}
+	if !strings.Contains(stderr.String(), "stopped_pool_managed") {
+		t.Fatalf("stderr = %q, want stopped_pool_managed log entry", stderr.String())
+	}
+	// Pool-managed session should have been stopped, not interrupted.
+	if sp.IsRunning("pool-worker") {
+		t.Fatal("pool-worker should have been stopped")
+	}
+	// Human worker should still be running (only interrupted, not stopped).
+	if !sp.IsRunning("human-worker") {
+		t.Fatal("human-worker should still be running (only interrupted)")
 	}
 }
 
@@ -1763,3 +1896,179 @@ func TestExecutePreparedStartWave_NoStaleCheckWithoutSessionKey(t *testing.T) {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestPrepareStartCandidate_PreservesRuntimeConfigAndProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title: "mayor",
+		Type:  "task",
+		Metadata: map[string]string{
+			"session_name": "s-gc-test",
+			"provider":     "gemini",
+			"alias":        "mayor",
+			"state":        "creating",
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+
+	tp := TemplateParams{
+		Command: "aimux run gemini -- --approval-mode yolo",
+		Prompt:  "system prompt",
+		Env: map[string]string{
+			"BASE":    "1",
+			"GC_HOME": "/tmp/gc-home",
+		},
+		Hints: agent.StartupHints{
+			ReadyPromptPrefix:      "> ",
+			ReadyDelayMs:           17,
+			ProcessNames:           []string{"gemini", "node"},
+			EmitsPermissionWarning: true,
+			Nudge:                  "hello",
+			PreStart:               []string{"echo pre"},
+			SessionSetup:           []string{"echo setup"},
+			SessionSetupScript:     "/tmp/setup.sh",
+			SessionLive:            []string{"echo live"},
+			PackOverlayDirs:        []string{"/tmp/pack"},
+			OverlayDir:             "/tmp/overlay",
+			CopyFiles:              []runtime.CopyEntry{{Src: "/tmp/src", RelDst: "dst"}},
+		},
+		WorkDir:          t.TempDir(),
+		SessionName:      "s-gc-test",
+		Alias:            "mayor",
+		FPExtra:          map[string]string{"pool": "1"},
+		ResolvedProvider: &config.ResolvedProvider{Name: "gemini", PromptMode: "none"},
+		TemplateName:     "mayor",
+		InstanceName:     "mayor",
+	}
+
+	prepared, err := prepareStartCandidate(
+		startCandidate{
+			session: &bead,
+			tp:      tp,
+		},
+		&config.City{},
+		store,
+		clock.Real{},
+	)
+	if err != nil {
+		t.Fatalf("prepareStartCandidate: %v", err)
+	}
+
+	generation, err := strconv.Atoi(bead.Metadata["generation"])
+	if err != nil {
+		t.Fatalf("generation metadata = %q: %v", bead.Metadata["generation"], err)
+	}
+	continuationEpoch, err := strconv.Atoi(bead.Metadata["continuation_epoch"])
+	if err != nil {
+		t.Fatalf("continuation_epoch metadata = %q: %v", bead.Metadata["continuation_epoch"], err)
+	}
+
+	expected := templateParamsToConfig(tp)
+	expected.Env = mergeEnv(expected.Env, sessionpkg.RuntimeEnvWithAlias(
+		bead.ID,
+		tp.SessionName,
+		tp.Alias,
+		generation,
+		continuationEpoch,
+		bead.Metadata["instance_token"],
+	))
+	expected.Env = mergeEnv(expected.Env, map[string]string{"GC_PROVIDER": "gemini"})
+	expected = runtime.SyncWorkDirEnv(expected)
+
+	if !reflect.DeepEqual(prepared.cfg, expected) {
+		t.Fatalf("prepared cfg mismatch\n got: %#v\nwant: %#v", prepared.cfg, expected)
+	}
+	if got := prepared.cfg.Env["GC_HOME"]; got != "/tmp/gc-home" {
+		t.Fatalf("GC_HOME = %q, want %q", got, "/tmp/gc-home")
+	}
+}
+
+func TestConfirmPendingStart(t *testing.T) {
+	// commitStartResultTraced must transition freshly-spawned pool
+	// session beads from the pending states ("", creating, asleep,
+	// drained) to active. Running states ("awake", "active") are left
+	// alone to avoid wasteful metadata rewrites on every reconcile
+	// cycle; terminal and transitional states ("draining", "archived",
+	// "quarantined", "suspended") are likewise ignored so we don't
+	// resurrect a session the reconciler deliberately wound down.
+	cases := []struct {
+		name  string
+		state string
+		want  bool
+	}{
+		{"<empty>", "", true},
+		{"creating", "creating", true},
+		{"asleep", "asleep", true},
+		{"drained", "drained", true},
+		{"creating_with_whitespace", "  creating  ", true},
+		{"active", "active", false},
+		{"awake", "awake", false},
+		{"draining", "draining", false},
+		{"archived", "archived", false},
+		{"quarantined", "quarantined", false},
+		{"suspended", "suspended", false},
+		{"unknown-future-state", "unknown-future-state", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := confirmPendingStart(tc.state); got != tc.want {
+				t.Errorf("confirmPendingStart(%q) = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCommitStartResult_TransitionsCreatingToActive(t *testing.T) {
+	// Verify that commitStartResult persists state=active and
+	// state_reason=creation_complete when the session starts in
+	// "creating" state. This is the critical integration seam for
+	// the creating→active fix.
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "worker-session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-1",
+			"state":        "creating",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := startCandidate{
+		session: &session,
+		tp:      TemplateParams{TemplateName: "worker", InstanceName: "worker-1"},
+	}
+	result := startResult{
+		prepared: preparedStart{
+			candidate: candidate,
+			coreHash:  "core-abc",
+			liveHash:  "live-xyz",
+		},
+		outcome:  "success",
+		started:  time.Unix(100, 0),
+		finished: time.Unix(101, 0),
+	}
+	rec := events.NewFake()
+	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
+	if !ok {
+		t.Fatal("commitStartResult returned false for successful start")
+	}
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["state"] != "active" {
+		t.Errorf("state = %q, want %q", got.Metadata["state"], "active")
+	}
+	if got.Metadata["state_reason"] != "creation_complete" {
+		t.Errorf("state_reason = %q, want %q", got.Metadata["state_reason"], "creation_complete")
+	}
+	if got.Metadata["started_config_hash"] != "core-abc" {
+		t.Errorf("started_config_hash = %q, want %q", got.Metadata["started_config_hash"], "core-abc")
+	}
+}

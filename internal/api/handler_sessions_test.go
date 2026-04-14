@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,6 +35,26 @@ func createTestSession(t *testing.T, store beads.Store, sp *runtime.Fake, title 
 		t.Fatalf("create session: %v", err)
 	}
 	return info
+}
+
+type cancelStartProvider struct {
+	*runtime.Fake
+}
+
+func (p *cancelStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+type stateWithSessionProvider struct {
+	*fakeState
+	provider runtime.Provider
+}
+
+func (s *stateWithSessionProvider) SessionProvider() runtime.Provider {
+	return s.provider
 }
 
 func seedQueuedWaitNudge(t *testing.T, fs *fakeState, wait beads.Bead, agentName string) string {
@@ -351,7 +372,7 @@ func TestHandleSessionClose(t *testing.T) {
 			t.Fatalf("nudge %q still queued after close", nudgeID)
 		}
 	}
-	items, err := fs.cityBeadStore.ListByLabel("nudge:"+nudgeID, 0)
+	items, err := fs.cityBeadStore.ListByLabel("nudge:"+nudgeID, 0, beads.IncludeClosed)
 	if err != nil {
 		t.Fatalf("ListByLabel(nudge): %v", err)
 	}
@@ -504,7 +525,7 @@ func TestHandleSessionWake(t *testing.T) {
 			t.Fatalf("nudge %q still queued after wake", nudgeID)
 		}
 	}
-	items, err := fs.cityBeadStore.ListByLabel("nudge:"+nudgeID, 0)
+	items, err := fs.cityBeadStore.ListByLabel("nudge:"+nudgeID, 0, beads.IncludeClosed)
 	if err != nil {
 		t.Fatalf("ListByLabel(nudge): %v", err)
 	}
@@ -931,6 +952,44 @@ func TestHandleProviderSessionCreateRejectsAsync(t *testing.T) {
 	}
 }
 
+func TestHandleProviderSessionCreateWithMessageUsesProviderDefaultNudge(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	body := `{"kind":"provider","name":"test-agent","message":"hello"}`
+	req := newPostRequest("/v0/sessions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("got status %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var resp sessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ID == "" {
+		t.Fatal("response missing id")
+	}
+	if resp.SessionName == "" {
+		t.Fatal("response missing session_name")
+	}
+
+	nudgeCount := 0
+	for _, call := range fs.sp.Calls {
+		if call.Name != resp.SessionName || call.Message != "hello" {
+			continue
+		}
+		if call.Method == "Nudge" {
+			nudgeCount++
+		}
+	}
+	if nudgeCount != 1 {
+		t.Fatalf("Nudge count for %q = %d, want 1; calls=%#v", resp.SessionName, nudgeCount, fs.sp.Calls)
+	}
+}
+
 func TestHandleSessionCreatePersistsAlias(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -1256,7 +1315,7 @@ func TestHandleSessionCreatePreservesInitialMessageWithOptions(t *testing.T) {
 	}
 }
 
-func TestHandleSessionMessageResumesSuspendedSession(t *testing.T) {
+func TestHandleSessionMessageResumesSuspendedSessionUsingProviderDefaultNudge(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
 
@@ -1285,11 +1344,11 @@ func TestHandleSessionMessageResumesSuspendedSession(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("calls = %#v, want Nudge hello", fs.sp.Calls)
+		t.Fatalf("calls = %#v, want provider-default nudge hello", fs.sp.Calls)
 	}
 }
 
-func TestHandleSessionMessageMaterializesNamedSession(t *testing.T) {
+func TestHandleSessionMessageMaterializesNamedSessionUsingProviderDefaultNudge(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
 
@@ -1334,6 +1393,30 @@ func TestHandleSessionMessageMaterializesNamedSession(t *testing.T) {
 	}
 	if nudgeCount != 1 {
 		t.Fatalf("Nudge count for %q = %d, want 1; calls=%#v", sessionName, nudgeCount, fs.sp.Calls)
+	}
+}
+
+func TestResolveSessionIDMaterializingNamedWithContext_RollsBackCanceledCreate(t *testing.T) {
+	fs := newSessionFakeState(t)
+	provider := &cancelStartProvider{Fake: runtime.NewFake()}
+	srv := New(&stateWithSessionProvider{fakeState: fs, provider: provider})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := srv.resolveSessionIDMaterializingNamedWithContext(ctx, fs.cityBeadStore, "worker")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolveSessionIDMaterializingNamedWithContext: %v, want context canceled", err)
+	}
+
+	all, err := fs.cityBeadStore.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	for _, b := range all {
+		if b.Status != "closed" {
+			t.Fatalf("session bead %s status = %q, want closed after canceled create rollback", b.ID, b.Status)
+		}
 	}
 }
 
@@ -1514,6 +1597,119 @@ func TestResolveSessionIDMaterializingNamed_QualifiedAliasBasenameDoesNotStealNa
 	}
 }
 
+func TestResolveSessionIDMaterializingNamed_AdoptsCanonicalRuntimeSessionNameBead(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	spec, ok, err := srv.findNamedSessionSpecForTarget(fs.cityBeadStore, "worker")
+	if err != nil {
+		t.Fatalf("findNamedSessionSpecForTarget(worker): %v", err)
+	}
+	if !ok {
+		t.Fatal("expected named session spec for worker")
+	}
+	bead, err := fs.cityBeadStore.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": spec.SessionName,
+			"template":     spec.Identity,
+			"agent_name":   spec.Identity,
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create canonical runtime bead: %v", err)
+	}
+
+	id, err := srv.resolveSessionIDMaterializingNamed(fs.cityBeadStore, "worker")
+	if err != nil {
+		t.Fatalf("resolveSessionIDMaterializingNamed(worker): %v", err)
+	}
+	if id != bead.ID {
+		t.Fatalf("resolveSessionIDMaterializingNamed(worker) = %q, want adopted bead %q", id, bead.ID)
+	}
+}
+
+func TestResolveSessionIDMaterializingNamed_DoesNotAdoptOrdinaryPoolSessionForSameTemplate(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	ordinary, err := fs.cityBeadStore.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "s-gc-ordinary-worker",
+			"template":     "myrig/worker",
+			"agent_name":   "myrig/worker",
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create ordinary pool worker: %v", err)
+	}
+
+	id, err := srv.resolveSessionIDMaterializingNamed(fs.cityBeadStore, "worker")
+	if err != nil {
+		t.Fatalf("resolveSessionIDMaterializingNamed(worker): %v", err)
+	}
+	if id == ordinary.ID {
+		t.Fatalf("resolveSessionIDMaterializingNamed(worker) adopted ordinary pool worker %q", ordinary.ID)
+	}
+
+	named, err := fs.cityBeadStore.Get(id)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", id, err)
+	}
+	if got := named.Metadata[apiNamedSessionMetadataKey]; got != "true" {
+		t.Fatalf("configured_named_session = %q, want true", got)
+	}
+	if got := named.Metadata["alias"]; got != "myrig/worker" {
+		t.Fatalf("alias = %q, want myrig/worker", got)
+	}
+
+	preserved, err := fs.cityBeadStore.Get(ordinary.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", ordinary.ID, err)
+	}
+	if preserved.Status != "open" {
+		t.Fatalf("ordinary pool worker status = %q, want open", preserved.Status)
+	}
+	if got := preserved.Metadata[apiNamedSessionMetadataKey]; got != "" {
+		t.Fatalf("ordinary pool worker configured_named_session = %q, want empty", got)
+	}
+}
+
+func TestResolveSessionIDMaterializingNamed_RuntimeSessionNameWrongTemplateConflicts(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	spec, ok, err := srv.findNamedSessionSpecForTarget(fs.cityBeadStore, "worker")
+	if err != nil {
+		t.Fatalf("findNamedSessionSpecForTarget(worker): %v", err)
+	}
+	if !ok {
+		t.Fatal("expected named session spec for worker")
+	}
+	if _, err := fs.cityBeadStore.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": spec.SessionName,
+			"template":     "other/worker",
+			"agent_name":   "other/worker",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("create wrong-template runtime bead: %v", err)
+	}
+
+	_, err = srv.resolveSessionIDMaterializingNamed(fs.cityBeadStore, "worker")
+	if err == nil || !strings.Contains(err.Error(), "conflicts with configured named session") {
+		t.Fatalf("resolveSessionIDMaterializingNamed(worker) error = %v, want configured named session conflict", err)
+	}
+}
+
 func TestHandleSessionWakeMaterializesNamedSessionAndStartsRuntime(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -1550,6 +1746,33 @@ func TestHandleSessionWakeMaterializesNamedSessionAndStartsRuntime(t *testing.T)
 	}
 	if !fs.sp.IsRunning(sessionName) {
 		t.Fatalf("session %q should be running after POST /wake", sessionName)
+	}
+}
+
+func TestHandleSessionWakeCanceledNamedCreateRollsBack(t *testing.T) {
+	fs := newSessionFakeState(t)
+	provider := &cancelStartProvider{Fake: runtime.NewFake()}
+	srv := New(&stateWithSessionProvider{fakeState: fs, provider: provider})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rec := httptest.NewRecorder()
+	req := newPostRequest("/v0/session/worker/wake", nil).WithContext(ctx)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("wake status = %d, want %d; body: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+
+	all, err := fs.cityBeadStore.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	for _, b := range all {
+		if b.Status != "closed" {
+			t.Fatalf("session bead %s status = %q, want closed after canceled wake rollback", b.ID, b.Status)
+		}
 	}
 }
 
@@ -1703,8 +1926,8 @@ func TestHandleSessionMessageRejectsPendingInteraction(t *testing.T) {
 		t.Fatalf("message body = %s, want pending_interaction error", rec.Body.String())
 	}
 	for _, call := range fs.sp.Calls {
-		if call.Method == "Nudge" && call.Name == info.SessionName {
-			t.Fatalf("unexpected Nudge while pending interaction is active: %#v", fs.sp.Calls)
+		if (call.Method == "Nudge" || call.Method == "NudgeNow") && call.Name == info.SessionName {
+			t.Fatalf("unexpected nudge while pending interaction is active: %#v", fs.sp.Calls)
 		}
 	}
 }

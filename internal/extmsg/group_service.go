@@ -77,7 +77,7 @@ func (s *groupService) EnsureGroup(ctx context.Context, caller Caller, input Ens
 	}
 	var out ConversationGroupRecord
 	err = withLockKey(s.locks, groupRootLabel(ref), func() error {
-		items, err := s.store.ListByLabel(groupRootLabel(ref), 0)
+		items, err := s.store.List(beads.ListQuery{Label: groupRootLabel(ref)})
 		if err != nil {
 			return fmt.Errorf("list groups by root label: %w", err)
 		}
@@ -156,7 +156,10 @@ func (s *groupService) UpsertParticipant(ctx context.Context, caller Caller, inp
 	})
 	var out ConversationGroupParticipant
 	err = withLockKey(s.locks, groupParticipantsMutationLock(groupID), func() error {
-		items, err := s.store.ListByLabel(groupParticipantLabel(groupID), 0)
+		items, err := s.store.List(beads.ListQuery{
+			Label:         groupParticipantLabel(groupID),
+			IncludeClosed: true,
+		})
 		if err != nil {
 			return fmt.Errorf("list group participants: %w", err)
 		}
@@ -305,7 +308,10 @@ func (s *groupService) RemoveParticipant(ctx context.Context, caller Caller, inp
 	var sessionIDs []string
 	var found bool
 	err = withLockKey(s.locks, groupParticipantsMutationLock(groupID), func() error {
-		items, err := s.store.ListByLabel(groupParticipantLabel(groupID), 0)
+		items, err := s.store.List(beads.ListQuery{
+			Label:         groupParticipantLabel(groupID),
+			IncludeClosed: true,
+		})
 		if err != nil {
 			return fmt.Errorf("list group participants: %w", err)
 		}
@@ -480,7 +486,7 @@ func (s *groupService) FindByConversation(_ context.Context, _ Caller, ref Conve
 }
 
 func (s *groupService) findGroupByRoot(ref ConversationRef) (*ConversationGroupRecord, error) {
-	items, err := s.store.ListByLabel(groupRootLabel(ref), 0)
+	items, err := s.store.List(beads.ListQuery{Label: groupRootLabel(ref)})
 	if err != nil {
 		return nil, fmt.Errorf("list groups by root label: %w", err)
 	}
@@ -517,7 +523,7 @@ func (s *groupService) getGroupByID(groupID string) (ConversationGroupRecord, er
 }
 
 func (s *groupService) listParticipants(groupID string) ([]ConversationGroupParticipant, error) {
-	items, err := s.store.ListByLabel(groupParticipantLabel(groupID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: groupParticipantLabel(groupID)})
 	if err != nil {
 		return nil, fmt.Errorf("list group participants: %w", err)
 	}
@@ -541,7 +547,7 @@ func (s *groupService) listParticipants(groupID string) ([]ConversationGroupPart
 }
 
 func (s *groupService) activeParticipantSessionCounts(ctx context.Context, groupID string) (map[string]int, error) {
-	items, err := s.store.ListByLabel(groupParticipantLabel(groupID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: groupParticipantLabel(groupID)})
 	if err != nil {
 		return nil, fmt.Errorf("list group participants: %w", err)
 	}

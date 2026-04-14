@@ -150,7 +150,7 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 		return ControlResult{}, fmt.Errorf("%s: unsupported gc.retry_state %q", bead.ID, bead.Metadata["gc.retry_state"])
 	}
 
-	if isPoolAssigned(subject) {
+	if beadUsesMetadataPoolRoute(subject, opts.CityPath) {
 		if opts.RecycleSession == nil {
 			return ControlResult{}, fmt.Errorf("%s: pooled retry subject %s requires RecycleSession callback", bead.ID, subject.ID)
 		}
@@ -168,7 +168,7 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 	}
 
 	if bead.Metadata["gc.retry_state"] != "spawned" {
-		if err := appendRetryAttempt(store, logicalID, subject, bead, nextAttempt); err != nil {
+		if err := appendRetryAttempt(store, logicalID, subject, bead, nextAttempt, opts.CityPath); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: appending retry attempt: %w", bead.ID, err)
 		}
 		if err := store.SetMetadataBatch(bead.ID, map[string]string{
@@ -289,7 +289,7 @@ func propagateRetrySubjectMetadata(store beads.Store, logicalID string, subject 
 	return store.SetMetadataBatch(logicalID, batch)
 }
 
-func appendRetryAttempt(store beads.Store, logicalID string, prevRun, prevEval beads.Bead, nextAttempt int) error {
+func appendRetryAttempt(store beads.Store, logicalID string, prevRun, prevEval beads.Bead, nextAttempt int, cityPath string) error {
 	oldAttempt, err := strconv.Atoi(prevRun.Metadata["gc.attempt"])
 	if err != nil || oldAttempt < 1 {
 		return fmt.Errorf("%s: invalid gc.attempt %q", prevRun.ID, prevRun.Metadata["gc.attempt"])
@@ -320,7 +320,7 @@ func appendRetryAttempt(store beads.Store, logicalID string, prevRun, prevEval b
 	}
 
 	if nextRun.ID == "" {
-		nextRun, err = store.Create(retryAttemptBead(prevRun, logicalID, runRef, nextAttempt))
+		nextRun, err = store.Create(retryAttemptBead(prevRun, logicalID, runRef, nextAttempt, cityPath))
 		if err != nil {
 			return fmt.Errorf("creating retry run bead: %w", err)
 		}
@@ -341,7 +341,7 @@ func appendRetryAttempt(store beads.Store, logicalID string, prevRun, prevEval b
 	return nil
 }
 
-func retryAttemptBead(prev beads.Bead, logicalID, stepRef string, attempt int) beads.Bead {
+func retryAttemptBead(prev beads.Bead, logicalID, stepRef string, attempt int, cityPath string) beads.Bead {
 	meta := cloneMetadata(prev.Metadata)
 	clearRetryEphemera(meta)
 	meta["gc.attempt"] = strconv.Itoa(attempt)
@@ -352,11 +352,11 @@ func retryAttemptBead(prev beads.Bead, logicalID, stepRef string, attempt int) b
 		Title:       prev.Title,
 		Description: prev.Description,
 		Type:        prev.Type,
-		Assignee:    retryPreservedAssignee(prev),
+		Assignee:    retryPreservedAssignee(prev, cityPath),
 		From:        prev.From,
 		ParentID:    prev.ParentID,
 		Ref:         stepRef,
-		Labels:      append([]string{}, prev.Labels...),
+		Labels:      removeAttemptPoolLabels(prev.Labels),
 		Metadata:    meta,
 	}
 }
@@ -375,7 +375,7 @@ func retryEvalBead(prev beads.Bead, logicalID, stepRef string, attempt int) bead
 		From:        prev.From,
 		ParentID:    prev.ParentID,
 		Ref:         stepRef,
-		Labels:      append([]string{}, prev.Labels...),
+		Labels:      removeAttemptPoolLabels(prev.Labels),
 		Metadata:    meta,
 	}
 }
@@ -427,13 +427,4 @@ func rewriteRetryAttemptRef(ref string, oldAttempt, nextAttempt int) string {
 		return rewritten
 	}
 	return ref
-}
-
-func isPoolAssigned(bead beads.Bead) bool {
-	for _, label := range bead.Labels {
-		if strings.HasPrefix(label, "pool:") {
-			return true
-		}
-	}
-	return false
 }

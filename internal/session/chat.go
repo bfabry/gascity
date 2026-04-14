@@ -35,6 +35,48 @@ func stripResumeFlag(cmd, resumeFlag, sessionKey string) string {
 	return strings.TrimSpace(result)
 }
 
+func (m *Manager) clearStaleResumeMetadata(id string, b *beads.Bead) {
+	_ = m.store.SetMetadata(id, "session_key", "")
+	_ = m.store.SetMetadata(id, "started_config_hash", "")
+	_ = m.store.SetMetadata(id, "continuation_reset_pending", "true")
+	if b.Metadata == nil {
+		b.Metadata = make(map[string]string)
+	}
+	b.Metadata["session_key"] = ""
+	b.Metadata["started_config_hash"] = ""
+	b.Metadata["continuation_reset_pending"] = "true"
+}
+
+func (m *Manager) retryFreshStartAfterStaleKey(
+	ctx context.Context,
+	id string,
+	b *beads.Bead,
+	sessName,
+	resumeCommand string,
+	cfg runtime.Config,
+	unroute func(),
+) (bool, error) {
+	if b.Metadata["session_key"] == "" {
+		return false, nil
+	}
+	freshCmd := stripResumeFlag(resumeCommand, b.Metadata["resume_flag"], b.Metadata["session_key"])
+	m.clearStaleResumeMetadata(id, b)
+	if freshCmd == resumeCommand {
+		if unroute != nil {
+			unroute()
+		}
+		return false, fmt.Errorf("fresh start after stale key: resume command could not be stripped")
+	}
+	cfg.Command = freshCmd
+	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+		if unroute != nil {
+			unroute()
+		}
+		return false, fmt.Errorf("fresh start after stale key: %w", err)
+	}
+	return true, nil
+}
+
 var (
 	// ErrNotSession reports that the requested bead is not a session bead.
 	ErrNotSession = errors.New("bead is not a session")
@@ -113,9 +155,10 @@ func (m *Manager) loadSessionBead(id string, allowClosed bool) (beads.Bead, stri
 	if err != nil {
 		return beads.Bead{}, "", fmt.Errorf("getting session: %w", err)
 	}
-	if b.Type != BeadType {
+	if !IsSessionBeadOrRepairable(b) {
 		return beads.Bead{}, "", fmt.Errorf("%w: bead %s (type=%q)", ErrNotSession, id, b.Type)
 	}
+	RepairEmptyType(m.store, &b)
 	if !allowClosed && b.Status == "closed" {
 		return beads.Bead{}, "", fmt.Errorf("%w: %s", ErrSessionClosed, id)
 	}
@@ -176,13 +219,24 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 		continuationEpoch,
 		instanceToken,
 	))
+	if gcProvider := strings.TrimSpace(b.Metadata["provider_kind"]); gcProvider != "" {
+		cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
+	} else if gcProvider := strings.TrimSpace(b.Metadata["provider"]); gcProvider != "" {
+		cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
+	}
 	cfg = runtime.SyncWorkDirEnv(cfg)
 	started := false
 	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
-		// Another caller may have resumed the same session after we loaded the
-		// bead but before we reached Start. If the runtime is already up, treat
-		// the resume as converged and only persist active state below.
-		if !errors.Is(err, runtime.ErrSessionExists) || !m.sp.IsRunning(sessName) {
+		if errors.Is(err, runtime.ErrSessionDiedDuringStartup) && b.Metadata["session_key"] != "" {
+			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
+			if err != nil {
+				return err
+			}
+			started = retried
+		} else if !errors.Is(err, runtime.ErrSessionExists) || !m.sp.IsRunning(sessName) {
+			// Another caller may have resumed the same session after we loaded the
+			// bead but before we reached Start. If the runtime is already up, treat
+			// the resume as converged and only persist active state below.
 			if unroute != nil {
 				unroute()
 			}
@@ -197,19 +251,23 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 	// invalid (e.g., "No conversation found"). Clear the key and retry
 	// with a fresh start so the user isn't stuck with a dead pane.
 	if started && b.Metadata["session_key"] != "" {
-		time.Sleep(staleKeyDetectDelay)
-		if !m.sp.IsRunning(sessName) {
-			_ = m.store.SetMetadata(id, "session_key", "")
-			freshCmd := stripResumeFlag(resumeCommand, b.Metadata["resume_flag"], b.Metadata["session_key"])
-			if freshCmd != resumeCommand {
-				cfg.Command = freshCmd
-				if err := m.sp.Start(ctx, sessName, cfg); err != nil {
-					if unroute != nil {
-						unroute()
-					}
-					return fmt.Errorf("fresh start after stale key: %w", err)
-				}
+		if err := sleepWithContext(ctx, staleKeyDetectDelay); err != nil {
+			// Context canceled during stale-key sleep: the runtime session
+			// may already be running but we skip setting state="active".
+			// This is self-healing via NDI — the next ensureRunning call
+			// sees the suspended-state bead, attempts sp.Start, gets
+			// ErrSessionExists (IsRunning=true), and persists "active".
+			if unroute != nil {
+				unroute()
 			}
+			return err
+		}
+		if !m.sp.IsRunning(sessName) {
+			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
+			if err != nil {
+				return err
+			}
+			started = retried
 		}
 	}
 	if b.Metadata["transport"] == "" && (started || transportVerified) {
@@ -224,47 +282,112 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 	return nil
 }
 
-// Send resumes a suspended session if needed, then nudges the runtime with a
-// new user message.
-func (m *Manager) Send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) error {
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		time.Sleep(d)
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, immediate bool) error {
+	content := runtime.TextContent(message)
+	err := m.nudgeContent(sessName, content, immediate)
+	recordCtx := ctx
+	if recordCtx == nil || recordCtx.Err() != nil {
+		recordCtx = context.Background()
+	}
+	telemetry.RecordNudge(recordCtx, sessName, err)
+	if err != nil {
+		return fmt.Errorf("sending message to session: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) nudgeContent(sessName string, content []runtime.ContentBlock, immediate bool) error {
+	if immediate {
+		if np, ok := m.sp.(runtime.ImmediateNudgeProvider); ok {
+			return np.NudgeNow(sessName, content)
+		}
+	}
+	return m.sp.Nudge(sessName, content)
+}
+
+func (m *Manager) pendingInteractionLocked(sessName string) error {
+	if ip, ok := m.sp.(runtime.InteractionProvider); ok {
+		pending, err := ip.Pending(sessName)
+		if err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
+			return fmt.Errorf("getting pending interaction: %w", err)
+		}
+		if pending != nil {
+			return ErrPendingInteraction
+		}
+	}
+	return nil
+}
+
+func (m *Manager) sendLocked(ctx context.Context, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool) error {
+	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
+		return err
+	}
+	if err := m.pendingInteractionLocked(sessName); err != nil {
+		return err
+	}
+	return m.nudgeSession(ctx, sessName, message, immediate)
+}
+
+func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, immediate bool) error {
 	return withSessionMutationLock(id, func() error {
 		b, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
-		if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
-			return err
-		}
-		if ip, ok := m.sp.(runtime.InteractionProvider); ok {
-			pending, err := ip.Pending(sessName)
-			if err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
-				return fmt.Errorf("getting pending interaction: %w", err)
-			}
-			if pending != nil {
-				return ErrPendingInteraction
-			}
-		}
-		if err := m.sp.Nudge(sessName, runtime.TextContent(message)); err != nil {
-			telemetry.RecordNudge(context.Background(), sessName, err)
-			return fmt.Errorf("sending message to session: %w", err)
-		}
-		telemetry.RecordNudge(context.Background(), sessName, nil)
-		return nil
+		return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, immediate)
 	})
 }
 
-// StopTurn issues a soft interrupt for the currently running turn.
+// Send resumes a suspended session if needed, then nudges the runtime with a
+// new user message.
+func (m *Manager) Send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) error {
+	return m.send(ctx, id, message, resumeCommand, hints, false)
+}
+
+// SendImmediate resumes a suspended session if needed, then injects the new
+// user message without waiting for an idle boundary when the runtime supports
+// immediate nudges. Falls back to Send semantics on runtimes without the
+// optional immediate nudge capability.
+func (m *Manager) SendImmediate(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) error {
+	return m.send(ctx, id, message, resumeCommand, hints, true)
+}
+
+// StopTurn issues a provider-appropriate interrupt for the currently running
+// turn. For providers that need post-interrupt idle settlement (e.g. Claude),
+// it waits for the session to return to an idle prompt before returning.
 func (m *Manager) StopTurn(id string) error {
 	return withSessionMutationLock(id, func() error {
 		b, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
-		if State(b.Metadata["state"]) == StateSuspended || !m.sp.IsRunning(sessName) {
-			return nil
+		if err := m.stopTurnLocked(b, sessName); err != nil {
+			return err
 		}
-		if err := m.sp.Interrupt(sessName); err != nil {
-			return fmt.Errorf("interrupting session: %w", err)
+		if waitsForIdleAfterInterrupt(b) {
+			if waiter, ok := m.sp.(runtime.IdleWaitProvider); ok {
+				if err := waiter.WaitForIdle(context.Background(), sessName, 15*time.Second); err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
+					return fmt.Errorf("waiting for stopped session to become idle: %w", err)
+				}
+			}
 		}
 		return nil
 	})
@@ -343,7 +466,10 @@ func (m *Manager) TranscriptPath(id string, searchPaths []string) (string, error
 	if workDir == "" {
 		return "", nil
 	}
-	provider := strings.TrimSpace(b.Metadata["provider"])
+	provider := strings.TrimSpace(b.Metadata["provider_kind"])
+	if provider == "" {
+		provider = strings.TrimSpace(b.Metadata["provider"])
+	}
 	if len(searchPaths) == 0 {
 		searchPaths = sessionlog.DefaultSearchPaths()
 	}
@@ -353,13 +479,15 @@ func (m *Manager) TranscriptPath(id string, searchPaths []string) (string, error
 		}
 	}
 
-	all, err := m.store.ListByLabel(LabelSession, 0)
+	all, err := m.store.List(beads.ListQuery{
+		Label: LabelSession,
+	})
 	if err != nil {
 		return "", fmt.Errorf("listing sessions: %w", err)
 	}
 	matches := 0
 	for _, other := range all {
-		if other.Type != BeadType {
+		if !IsSessionBeadOrRepairable(other) {
 			continue
 		}
 		// Only count active sessions — closed historical sessions should not

@@ -114,22 +114,27 @@ func Install(fs fsys.FS, cityDir, workDir string, providers []string) error {
 func installClaude(fs fsys.FS, cityDir string) error {
 	hookDst := filepath.Join(cityDir, citylayout.ClaudeHookFile)
 	runtimeDst := filepath.Join(cityDir, ".gc", "settings.json")
+	embedded, err := readEmbedded("config/claude.json")
+	if err != nil {
+		return err
+	}
 
 	data, err := fs.ReadFile(hookDst)
 	if err != nil {
 		data, err = fs.ReadFile(runtimeDst)
 		if err != nil {
-			data, err = readEmbedded("config/claude.json")
-			if err != nil {
-				return err
-			}
+			data = embedded
+		} else if claudeFileNeedsUpgrade(data) {
+			data = embedded
 		}
+	} else if claudeFileNeedsUpgrade(data) {
+		data = embedded
 	}
 
-	if err := writeEmbeddedManaged(fs, hookDst, data, nil); err != nil {
+	if err := writeEmbeddedManaged(fs, hookDst, data, claudeFileNeedsUpgrade); err != nil {
 		return err
 	}
-	return writeEmbeddedManaged(fs, runtimeDst, data, nil)
+	return writeEmbeddedManaged(fs, runtimeDst, data, claudeFileNeedsUpgrade)
 }
 
 // installGemini writes .gemini/settings.json in the working directory.
@@ -152,7 +157,11 @@ func installCodex(fs fsys.FS, workDir string) error {
 // installOpenCode writes .opencode/plugins/gascity.js in the working directory.
 func installOpenCode(fs fsys.FS, workDir string) error {
 	dst := filepath.Join(workDir, ".opencode", "plugins", "gascity.js")
-	return writeEmbedded(fs, "config/opencode.js", dst)
+	data, err := readEmbedded("config/opencode.js")
+	if err != nil {
+		return err
+	}
+	return writeEmbeddedManaged(fs, dst, data, opencodeFileNeedsUpgrade)
 }
 
 // installCopilot writes executable Copilot hooks plus a markdown companion file.
@@ -168,7 +177,11 @@ func installCopilot(fs fsys.FS, workDir string) error {
 // installCursor writes .cursor/hooks.json in the working directory.
 func installCursor(fs fsys.FS, workDir string) error {
 	dst := filepath.Join(workDir, ".cursor", "hooks.json")
-	return writeEmbedded(fs, "config/cursor.json", dst)
+	data, err := readEmbedded("config/cursor.json")
+	if err != nil {
+		return err
+	}
+	return writeEmbeddedManaged(fs, dst, data, cursorFileNeedsUpgrade)
 }
 
 // installPi writes .pi/extensions/gc-hooks.js in the working directory.
@@ -231,4 +244,55 @@ func geminiFileNeedsUpgrade(existing []byte) bool {
 		strings.Contains(content, `gc nudge drain --inject`) ||
 		strings.Contains(content, `gc mail check --inject`) ||
 		strings.Contains(content, `gc hook --inject`)
+}
+
+func opencodeFileNeedsUpgrade(existing []byte) bool {
+	content := string(existing)
+	if strings.Contains(content, "module.exports = {") &&
+		strings.Contains(content, "gc prime --hook") &&
+		strings.Contains(content, "experimental.chat.system.transform") {
+		return true
+	}
+	if strings.Contains(content, "experimental.chat.system.transform") &&
+		strings.Contains(content, "gc prime --hook") &&
+		!strings.Contains(content, `"chat.message"`) {
+		return true
+	}
+	if strings.Contains(content, `const prime = await run(directory, "prime", "--hook");`) {
+		return true
+	}
+	if strings.Contains(content, "export default async function") &&
+		strings.Contains(content, `let cachedPrime = "";`) &&
+		strings.Contains(content, `cachedPrime === ""`) {
+		return true
+	}
+	if strings.Contains(content, "output.system[1] = prefix + \"\\n\\n\" + output.system[1]") {
+		return true
+	}
+	if strings.Contains(content, "export default async function") &&
+		strings.Contains(content, "gc prime --hook") &&
+		(!strings.Contains(content, `"session.deleted"`) ||
+			!strings.Contains(content, "gc hook --inject")) {
+		return true
+	}
+	return strings.Contains(content, "output.system.push(") &&
+		strings.Contains(content, "gc prime --hook") &&
+		strings.Contains(content, "experimental.chat.system.transform")
+}
+
+func claudeFileNeedsUpgrade(existing []byte) bool {
+	return matchesStaleManagedFile(existing, "config/claude.json")
+}
+
+func cursorFileNeedsUpgrade(existing []byte) bool {
+	return matchesStaleManagedFile(existing, "config/cursor.json")
+}
+
+func matchesStaleManagedFile(existing []byte, embedPath string) bool {
+	current, err := readEmbedded(embedPath)
+	if err != nil {
+		return false
+	}
+	stale := strings.Replace(string(current), `gc handoff "context cycle"`, `gc prime --hook`, 1)
+	return string(existing) == stale
 }

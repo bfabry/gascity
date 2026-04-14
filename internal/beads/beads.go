@@ -77,6 +77,26 @@ func IsMoleculeType(t string) bool {
 	return moleculeTypes[t]
 }
 
+// readyExcludeTypes enumerates bead types that Ready() excludes by
+// default. These are infrastructure or workflow-container types that
+// represent internal bookkeeping rather than actionable work. This
+// matches the exclusion list in the bd CLI's GetReadyWork query.
+var readyExcludeTypes = map[string]bool{
+	"merge-request": true, // processed by automation
+	"gate":          true, // async wait conditions
+	"molecule":      true, // workflow containers
+	"message":       true, // mail/communication items
+	"agent":         true, // identity/state tracking beads
+	"role":          true, // agent role definitions
+	"rig":           true, // rig identity beads
+}
+
+// IsReadyExcludedType reports whether the bead type is excluded from
+// Ready() results by default.
+func IsReadyExcludedType(t string) bool {
+	return readyExcludeTypes[t]
+}
+
 // Dep represents a dependency relationship between two beads. The IssueID
 // depends on (is blocked by) DependsOnID. Type describes the relationship
 // kind (e.g. "blocks", "tracks", "relates-to").
@@ -132,29 +152,45 @@ type Store interface {
 	// Returns the number of beads actually closed.
 	CloseAll(ids []string, metadata map[string]string) (int, error)
 
-	// List returns beads, optionally filtered by status. With no arguments,
-	// returns all beads. With a status argument (e.g., "in_progress"),
-	// returns only beads matching that status. In-process stores return
-	// creation order; external stores may not guarantee order.
+	// List returns beads matching the query. Queries must include at least
+	// one filter unless AllowScan is set explicitly.
+	List(query ListQuery) ([]Bead, error)
+
+	// Legacy helper; prefer List with ListQuery in new code.
+	// ListOpen returns non-closed beads by default. With a status argument
+	// (e.g., "in_progress" or "closed"), returns only beads matching that
+	// status. In-process stores return creation order; external stores may not
+	// guarantee order.
 	ListOpen(status ...string) ([]Bead, error)
 
-	// Ready returns all beads with status "open". Same ordering note
+	// Ready returns open, unblocked beads representing actionable work.
+	// Infrastructure types (molecule, message, gate, etc.) are excluded
+	// to match the bd CLI's GetReadyWork semantics. Same ordering note
 	// as List.
 	Ready() ([]Bead, error)
 
+	// Legacy helper; prefer List with ListQuery in new code.
 	// Children returns all beads whose ParentID matches the given ID,
 	// in creation order. Pass IncludeClosed to include closed children.
 	Children(parentID string, opts ...QueryOpt) ([]Bead, error)
 
+	// Legacy helper; prefer List with ListQuery in new code.
 	// ListByLabel returns beads matching an exact label string.
 	// Limit controls max results (0 = unlimited). Results are ordered
 	// newest first where supported; in-process stores return creation order.
 	// Pass IncludeClosed to include closed beads.
 	ListByLabel(label string, limit int, opts ...QueryOpt) ([]Bead, error)
 
+	// Legacy helper; prefer List with ListQuery in new code.
 	// ListByAssignee returns beads assigned to the given agent with the
 	// specified status. Limit controls max results (0 = unlimited).
 	ListByAssignee(assignee, status string, limit int) ([]Bead, error)
+
+	// Legacy helper; prefer List with ListQuery in new code.
+	// ListByMetadata returns beads whose metadata contains all key-value pairs
+	// in filters. Limit controls max results (0 = unlimited). Pass
+	// IncludeClosed to include closed beads.
+	ListByMetadata(filters map[string]string, limit int, opts ...QueryOpt) ([]Bead, error)
 
 	// SetMetadata sets a key-value metadata pair on a bead. Returns
 	// ErrNotFound if the bead does not exist.
@@ -188,8 +224,4 @@ type Store interface {
 	// query: "down" returns what this bead depends on (default),
 	// "up" returns what depends on this bead.
 	DepList(id, direction string) ([]Dep, error)
-
-	// ListByMetadata returns beads whose metadata contains all key-value
-	// pairs in filters. Limit controls max results (0 = unlimited).
-	ListByMetadata(filters map[string]string, limit int) ([]Bead, error)
 }

@@ -444,7 +444,7 @@ func (s *transcriptService) ListMemberships(ctx context.Context, caller Caller, 
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.store.ListByLabel(membershipConversationLabel(ref), 0)
+	items, err := s.store.List(beads.ListQuery{Label: membershipConversationLabel(ref)})
 	if err != nil {
 		return nil, fmt.Errorf("list memberships by conversation label: %w", err)
 	}
@@ -484,7 +484,7 @@ func (s *transcriptService) ListConversationsBySession(ctx context.Context, call
 	if sessionID == "" {
 		return nil, nil
 	}
-	items, err := s.store.ListByLabel(membershipSessionLabel(sessionID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: membershipSessionLabel(sessionID)})
 	if err != nil {
 		return nil, fmt.Errorf("list memberships by session label: %w", err)
 	}
@@ -740,7 +740,7 @@ func (s *transcriptService) ensureStateLocked(ref ConversationRef) (Conversation
 }
 
 func (s *transcriptService) findStateLocked(ref ConversationRef) (*ConversationTranscriptStateRecord, error) {
-	items, err := s.store.ListByLabel(transcriptStateLabel(ref), 0)
+	items, err := s.store.List(beads.ListQuery{Label: transcriptStateLabel(ref)})
 	if err != nil {
 		return nil, fmt.Errorf("list transcript state: %w", err)
 	}
@@ -766,7 +766,7 @@ func (s *transcriptService) findStateLocked(ref ConversationRef) (*ConversationT
 }
 
 func (s *transcriptService) findTranscriptByProviderMessageLocked(ref ConversationRef, providerMessageID string) (*ConversationTranscriptRecord, error) {
-	items, err := s.store.ListByLabel(transcriptProviderMessageLabel(ref, providerMessageID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: transcriptProviderMessageLabel(ref, providerMessageID)})
 	if err != nil {
 		return nil, fmt.Errorf("list transcript by provider message label: %w", err)
 	}
@@ -792,7 +792,7 @@ func (s *transcriptService) findTranscriptByProviderMessageLocked(ref Conversati
 }
 
 func (s *transcriptService) findActiveMembershipLocked(ref ConversationRef, sessionID string) (*ConversationMembershipRecord, error) {
-	items, err := s.store.ListByLabel(membershipExactLabel(ref, sessionID), 0)
+	items, err := s.store.List(beads.ListQuery{Label: membershipExactLabel(ref, sessionID)})
 	if err != nil {
 		return nil, fmt.Errorf("list membership by exact label: %w", err)
 	}
@@ -837,7 +837,7 @@ func (s *transcriptService) listTranscriptLocked(ref ConversationRef, after int6
 	endBucket := transcriptBucket(endSeq)
 	records := make([]ConversationTranscriptRecord, 0, limit)
 	for bucket := startBucket; bucket <= endBucket && len(records) < limit; bucket++ {
-		items, err := s.store.ListByLabel(transcriptBucketLabel(ref, bucket), 0)
+		items, err := s.store.List(beads.ListQuery{Label: transcriptBucketLabel(ref, bucket)})
 		if err != nil {
 			return nil, fmt.Errorf("list transcript bucket %d: %w", bucket, err)
 		}

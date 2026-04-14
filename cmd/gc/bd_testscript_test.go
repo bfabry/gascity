@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -27,17 +28,14 @@ func bdTestCmd() {
 	subcmd := args[0]
 	rest := args[1:]
 
-	// Find city root by walking up from cwd.
+	// Resolve city root: honor GC_CITY (exact validation, no walk-up)
+	// then fall back to bounded parent discovery — mirroring cityForStoreDir.
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bd: %v\n", err)
 		os.Exit(1)
 	}
-	cityPath, err := findCity(cwd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bd: %v\n", err)
-		os.Exit(1)
-	}
+	cityPath := cityForStoreDir(cwd)
 
 	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(cityPath, ".gc", "beads.json"))
 	if err != nil {
@@ -73,7 +71,7 @@ func bdTestCmd() {
 }
 
 func doBdCreate(store beads.Store, rec events.Recorder, args []string) int {
-	_, args = parseBeadFormat(args)
+	format, args := parseBeadFormat(args)
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "bd create: missing title")
 		return 1
@@ -89,12 +87,16 @@ func doBdCreate(store beads.Store, rec events.Recorder, args []string) int {
 		Subject: b.ID,
 		Message: b.Title,
 	})
+	if format == "json" {
+		writeBeadJSON(b, os.Stdout)
+		return 0
+	}
 	fmt.Fprintf(os.Stdout, "Created bead: %s  (status: %s)\n", b.ID, b.Status) //nolint:errcheck // best-effort stdout
 	return 0
 }
 
 func doBdClose(store beads.Store, rec events.Recorder, args []string) int {
-	_, args = parseBeadFormat(args)
+	format, args := parseBeadFormat(args)
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "bd close: missing bead ID")
 		return 1
@@ -108,6 +110,15 @@ func doBdClose(store beads.Store, rec events.Recorder, args []string) int {
 		Actor:   eventActor(),
 		Subject: args[0],
 	})
+	if format == "json" {
+		b, err := store.Get(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bd close: %v\n", err)
+			return 1
+		}
+		writeBeadJSON(b, os.Stdout)
+		return 0
+	}
 	fmt.Fprintf(os.Stdout, "Closed bead: %s\n", args[0]) //nolint:errcheck // best-effort stdout
 	return 0
 }
@@ -115,7 +126,38 @@ func doBdClose(store beads.Store, rec events.Recorder, args []string) int {
 func doBdList(store beads.Store, args []string) int {
 	filters, args := parseBeadFilters(args)
 	format, _ := parseBeadFormat(args)
-	all, err := store.ListOpen()
+	var all []beads.Bead
+	var err error
+	switch {
+	case filters.status != "":
+		all, err = store.ListOpen(filters.status)
+	case filters.all:
+		open, err := store.ListOpen()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bd list: %v\n", err)
+			return 1
+		}
+		closed, err := store.ListOpen("closed")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bd list: %v\n", err)
+			return 1
+		}
+		all = make([]beads.Bead, 0, len(open)+len(closed))
+		all = append(all, open...)
+		all = append(all, closed...)
+		slices.SortFunc(all, func(a, b beads.Bead) int {
+			switch {
+			case a.CreatedAt.Before(b.CreatedAt):
+				return -1
+			case a.CreatedAt.After(b.CreatedAt):
+				return 1
+			default:
+				return strings.Compare(a.ID, b.ID)
+			}
+		})
+	default:
+		all, err = store.ListOpen()
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bd list: %v\n", err)
 		return 1

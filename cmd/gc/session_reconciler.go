@@ -337,6 +337,51 @@ func reconcileSessionBeadsTraced(
 			continue
 		}
 
+		// Drain-ack: agent signaled it's done (gc runtime drain-ack).
+		// Honor the ack even if the agent exited before this tick; otherwise
+		// the session falls through to orphan handling and can block the next
+		// worker wave until the stale awake bead ages out.
+		if dops != nil {
+			if acked, _ := dops.isDrainAcked(name); acked {
+				_ = dops.clearDrain(name)
+				stopped := !alive // already dead = effectively stopped
+				if alive {
+					if err := sp.Stop(name); err != nil {
+						fmt.Fprintf(stderr, "session reconciler: stopping drain-acked %s: %v\n", name, err) //nolint:errcheck
+					} else {
+						stopped = true
+						fmt.Fprintf(stdout, "Stopped drain-acked session '%s'\n", name) //nolint:errcheck
+					}
+				}
+				rec.Record(events.Event{
+					Type:    events.SessionStopped,
+					Actor:   "gc",
+					Subject: tp.DisplayName(),
+					Message: "drain acknowledged by agent",
+				})
+				if stopped && store != nil && session.ID != "" {
+					batch := map[string]string{
+						"state":        "drained",
+						"last_woke_at": "",
+					}
+					if session.Metadata["wake_mode"] == "fresh" {
+						batch["session_key"] = ""
+						batch["started_config_hash"] = ""
+						batch["continuation_reset_pending"] = "true"
+					}
+					_ = store.SetMetadataBatch(session.ID, batch)
+					session.Metadata["state"] = "drained"
+					session.Metadata["last_woke_at"] = ""
+					if session.Metadata["wake_mode"] == "fresh" {
+						session.Metadata["session_key"] = ""
+						session.Metadata["started_config_hash"] = ""
+						session.Metadata["continuation_reset_pending"] = "true"
+					}
+				}
+				continue
+			}
+		}
+
 		policy := resolveSessionSleepPolicy(*session, cfg, sp)
 
 		// Heal advisory state metadata.
@@ -351,9 +396,21 @@ func reconcileSessionBeadsTraced(
 			continue // crash recorded, skip further processing
 		}
 
+		// Churn check: detect context exhaustion death spiral.
+		// Fires for sessions that survived past stabilityThreshold but
+		// died before churnProductivityThreshold — alive long enough to
+		// not be a rapid crash, but too short to be productive.
+		if checkChurn(session, cfg, alive, dt, store, clk) {
+			continue // churn recorded, skip further processing
+		}
+
 		// Clear wake failures for sessions that have been stable long enough.
 		if alive && stableLongEnough(*session, clk) {
 			clearWakeFailures(session, store)
+		}
+		// Clear churn counter for sessions that have been productive.
+		if alive && productiveLongEnough(*session, clk) {
+			clearChurn(session, store)
 		}
 		if alive && shouldRollbackPendingCreate(session) {
 			if err := clearPendingCreateClaim(session, store); err != nil {
@@ -361,37 +418,13 @@ func reconcileSessionBeadsTraced(
 			}
 		}
 
-		// Drain-ack: agent signaled it's done (gc runtime drain-ack).
-		// Stop the session and close its bead. The bead becomes a permanent
-		// historical record of this incarnation. The next work item gets a
-		// brand-new session bead with a fresh session key and clean context.
-		if alive && dops != nil {
-			if acked, _ := dops.isDrainAcked(name); acked {
-				_ = dops.clearDrain(name)
-				if err := sp.Stop(name); err != nil {
-					fmt.Fprintf(stderr, "session reconciler: stopping drain-acked %s: %v\n", name, err) //nolint:errcheck
-				} else {
-					fmt.Fprintf(stdout, "Stopped drain-acked session '%s'\n", name) //nolint:errcheck
-					rec.Record(events.Event{
-						Type:    events.SessionStopped,
-						Actor:   "gc",
-						Subject: tp.DisplayName(),
-						Message: "drain acknowledged by agent",
-					})
-				}
-				if store != nil && session.ID != "" {
-					_ = store.SetMetadata(session.ID, "state", "drained")
-					session.Metadata["state"] = "drained"
-				}
-				continue
-			}
-		}
-
 		// Restart-requested: agent asked for a fresh session
 		// (gc runtime request-restart / gc handoff). Rotate session_key
 		// to a fresh value and clear started_config_hash so the next wake
-		// builds a first-start command (--session-id <new_key>). Then stop
-		// immediately; the next tick will re-create and re-wake.
+		// builds a first-start command (--session-id <new_key>). Also set
+		// continuation_reset_pending so the next wake bumps the continuation
+		// epoch instead of silently reusing the prior continuation lineage.
+		// Then stop immediately; the next tick will re-create and re-wake.
 		//
 		// Check both tmux metadata (dops) and bead metadata. The bead
 		// metadata flag survives tmux session death, so this works even
@@ -408,10 +441,14 @@ func reconcileSessionBeadsTraced(
 				}
 				// Rotate session_key so the next start gets a fresh
 				// conversation. Clearing started_config_hash forces
-				// firstStart=true in resolveSessionCommand.
+				// firstStart=true in resolveSessionCommand. Clearing
+				// last_woke_at masks the intentional death from crash
+				// and churn trackers (both check last_woke_at first).
 				batch := map[string]string{
-					"restart_requested":   "",
-					"started_config_hash": "",
+					"restart_requested":          "",
+					"started_config_hash":        "",
+					"continuation_reset_pending": "true",
+					"last_woke_at":               "",
 				}
 				if newKey, err := sessionpkg.GenerateSessionKey(); err == nil {
 					batch["session_key"] = newKey
@@ -420,6 +457,8 @@ func reconcileSessionBeadsTraced(
 				_ = store.SetMetadataBatch(session.ID, batch)
 				session.Metadata["restart_requested"] = ""
 				session.Metadata["started_config_hash"] = ""
+				session.Metadata["continuation_reset_pending"] = "true"
+				session.Metadata["last_woke_at"] = ""
 				if alive {
 					if err := sp.Stop(name); err != nil {
 						fmt.Fprintf(stderr, "session reconciler: stopping restart-requested %s: %v\n", name, err) //nolint:errcheck
@@ -438,10 +477,11 @@ func reconcileSessionBeadsTraced(
 			if template == "" {
 				template = normalizedSessionTemplate(*session, cfg)
 			}
-			storedHash := session.Metadata["config_hash"]
-			if sh := session.Metadata["started_config_hash"]; sh != "" {
-				storedHash = sh
-			}
+			// Use started_config_hash for drift detection — it records
+			// what config the session actually started with. Before it's
+			// written (during the startup window), skip the drift check
+			// to avoid false-positive drains. Fixes #127.
+			storedHash := session.Metadata["started_config_hash"]
 			if template != "" && storedHash != "" {
 				cfgAgent := findAgentByTemplate(cfg, template)
 				if cfgAgent != nil {
@@ -472,6 +512,12 @@ func reconcileSessionBeadsTraced(
 					currentHash := runtime.CoreFingerprint(agentCfg)
 					if storedHash != currentHash {
 						fmt.Fprintf(stderr, "config-drift %s: stored=%s current=%s cmd=%q\n", name, storedHash[:12], currentHash[:12], agentCfg.Command) //nolint:errcheck
+						// Diagnostic: log per-field breakdown to identify the drifting field.
+						var storedBreakdown map[string]string
+						if raw := session.Metadata["core_hash_breakdown"]; raw != "" {
+							_ = json.Unmarshal([]byte(raw), &storedBreakdown)
+						}
+						runtime.LogCoreFingerprintDrift(stderr, name, storedBreakdown, agentCfg)
 						// Defer config-drift drain while a user is attached.
 						// Killing a session mid-conversation is disruptive;
 						// the drift will be applied when the user detaches.
@@ -506,13 +552,19 @@ func reconcileSessionBeadsTraced(
 					}
 
 					// Core config matches — check live-only drift.
-					storedLive := session.Metadata["live_hash"]
-					if sl := session.Metadata["started_live_hash"]; sl != "" {
-						storedLive = sl
-					}
-					if storedLive != "" {
-						currentLive := runtime.LiveFingerprint(agentCfg)
-						if storedLive != currentLive {
+					// Use started_live_hash exclusively, matching
+					// the started_config_hash pattern above.
+					storedLive := session.Metadata["started_live_hash"]
+					currentLive := runtime.LiveFingerprint(agentCfg)
+					if storedLive != currentLive {
+						if storedLive == "" && len(agentCfg.SessionLive) == 0 {
+							// No stored hash and no live config — silently
+							// backfill the hash without running anything.
+							_ = store.SetMetadataBatch(session.ID, map[string]string{
+								"live_hash":         currentLive,
+								"started_live_hash": currentLive,
+							})
+						} else {
 							fmt.Fprintf(stdout, "Live config changed for '%s', re-applying...\n", tp.DisplayName()) //nolint:errcheck
 							if err := sp.RunLive(name, agentCfg); err != nil {
 								fmt.Fprintf(stderr, "session reconciler: RunLive %s: %v\n", name, err) //nolint:errcheck
@@ -683,6 +735,13 @@ func reconcileSessionBeadsTraced(
 				}, nil, "")
 			}
 		}
+
+		if !shouldWake && !target.alive && isDrainedSessionBead(*target.session) {
+			// Drained pool session: process exited and no wake reason.
+			// Close the bead so syncSessionBeads creates a fresh one
+			// when new work arrives.
+			closeBead(store, target.session.ID, "drained", clk.Now().UTC(), stderr)
+		}
 	}
 
 	plannedWakes := executePlannedStartsTraced(
@@ -852,9 +911,7 @@ func launchIdleProbes(
 		if name == "" || probe == nil {
 			continue
 		}
-		dt.beginIdleProbe()
 		go func(beadID, sessionName string, probe *idleProbeState) {
-			defer dt.doneIdleProbe()
 			err := wp.WaitForIdle(ctx, sessionName, idleSleepProbeTimeout)
 			dt.finishIdleProbe(beadID, probe, err == nil, clk.Now().UTC())
 		}(target.session.ID, name, probe)
@@ -894,7 +951,11 @@ func clearMissingIdleProbes(dt *drainTracker, beadByID map[string]*beads.Bead) {
 // in the worktree that the previous session (or this session's prior run)
 // created, without any prompt-side logic.
 func resolveTaskWorkDir(store beads.Store, agentName string) string {
-	assigned, err := store.ListByAssignee(agentName, "in_progress", 0)
+	assigned, err := store.List(beads.ListQuery{
+		Assignee: agentName,
+		Status:   "in_progress",
+		Sort:     beads.SortCreatedDesc,
+	})
 	if err != nil {
 		return ""
 	}
@@ -910,11 +971,10 @@ func resolveTaskWorkDir(store beads.Store, agentName string) string {
 }
 
 // resolveSessionCommand returns the command to use when starting a session.
-// On first start, or when the caller explicitly requests a fresh wake, it uses
-// SessionIDFlag to create a session with the given key as its ID. On
-// subsequent wakes, it uses resolveResumeCommand to resume the existing
-// session.
-func resolveSessionCommand(command, sessionKey string, rp *config.ResolvedProvider, firstStart bool, forceFresh bool) string {
+// On a fresh provider start (first boot or wake_mode=fresh), it uses
+// SessionIDFlag to create a new provider conversation with the given key as
+// its ID. Otherwise it resumes the existing conversation.
+func resolveSessionCommand(command, sessionKey string, rp *config.ResolvedProvider, firstStart, forceFresh bool) string {
 	if (firstStart || forceFresh) && rp.SessionIDFlag != "" {
 		return command + " " + rp.SessionIDFlag + " " + sessionKey
 	}

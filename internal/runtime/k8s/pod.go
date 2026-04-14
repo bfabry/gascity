@@ -18,7 +18,10 @@ import (
 func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error) {
 	podName := SanitizeName(name)
 	label := SanitizeLabel(name)
-	agentName := cfg.Env["GC_AGENT"]
+	agentName := cfg.Env["GC_ALIAS"]
+	if agentName == "" {
+		agentName = cfg.Env["GC_AGENT"]
+	}
 	if agentName == "" {
 		agentName = "unknown"
 	}
@@ -115,7 +118,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 
 	if !p.prebaked {
 		mainVolMounts = append(mainVolMounts, corev1.VolumeMount{
-			Name: "ws", MountPath: podWorkDir,
+			Name: "ws", MountPath: "/workspace",
 		})
 		volumes = append(volumes, corev1.Volume{
 			Name: "ws", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
@@ -165,7 +168,8 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			ServiceAccountName: p.serviceAccount,
+			RestartPolicy:      corev1.RestartPolicyNever,
 			Containers: []corev1.Container{{
 				Name:            "agent",
 				Image:           p.image,
@@ -225,11 +229,29 @@ func agentSecurityContext(linuxUsername string) *corev1.SecurityContext {
 func buildPodEnv(cfgEnv map[string]string, podWorkDir string) []corev1.EnvVar {
 	// Start with cfg.Env, removing controller-only vars.
 	skip := map[string]bool{
-		"GC_BEADS":     true,
-		"GC_SESSION":   true,
-		"GC_EVENTS":    true,
-		"GC_DOLT_HOST": true,
-		"GC_DOLT_PORT": true,
+		"GC_BEADS":               true,
+		"GC_SESSION":             true,
+		"GC_EVENTS":              true,
+		"GC_DOLT_HOST":           true,
+		"GC_DOLT_PORT":           true,
+		"BEADS_DOLT_SERVER_HOST": true,
+		"BEADS_DOLT_SERVER_PORT": true,
+		// Note: GC_DOLT_USER, GC_DOLT_PASSWORD, BEADS_DOLT_SERVER_USER,
+		// and BEADS_DOLT_PASSWORD are intentionally NOT stripped — agents
+		// need auth credentials to authenticate against the in-cluster
+		// Dolt service. Only host/port are stripped and replaced with
+		// K8s-specific endpoints.
+	}
+
+	// Resolve controller-side city path with the same fallback as buildPod
+	// so GC_RIG_ROOT/BEADS_DIR remap works regardless of which env var the
+	// controller exported.
+	ctrlCity := cfgEnv["GC_CITY"]
+	if ctrlCity == "" {
+		ctrlCity = cfgEnv["GC_CITY_PATH"]
+	}
+	if ctrlCity == "" {
+		ctrlCity = cfgEnv["GC_CITY_ROOT"]
 	}
 
 	var env []corev1.EnvVar
@@ -246,6 +268,10 @@ func buildPodEnv(cfgEnv map[string]string, podWorkDir string) []corev1.EnvVar {
 			val = "/workspace"
 		case "GC_DIR":
 			val = podWorkDir
+		case "GC_RIG_ROOT", "BEADS_DIR", "GT_ROOT", "GC_CITY_RUNTIME_DIR", "GC_PACK_STATE_DIR", "GC_PACK_DIR":
+			if ctrlCity != "" && (val == ctrlCity || strings.HasPrefix(val, ctrlCity+"/")) {
+				val = "/workspace" + val[len(ctrlCity):]
+			}
 		}
 		env = append(env, corev1.EnvVar{Name: k, Value: val})
 	}

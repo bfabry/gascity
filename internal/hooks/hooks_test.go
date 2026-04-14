@@ -1,12 +1,67 @@
 package hooks
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
+
+func claudeHookCommand(t *testing.T, data []byte, event string) string {
+	t.Helper()
+	var cfg struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal claude hooks: %v", err)
+	}
+	entries := cfg.Hooks[event]
+	if len(entries) == 0 || len(entries[0].Hooks) == 0 {
+		t.Fatalf("missing claude hook for %s", event)
+	}
+	return entries[0].Hooks[0].Command
+}
+
+func cursorHookCommand(t *testing.T, data []byte, event string) string {
+	t.Helper()
+	var cfg struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal cursor hooks: %v", err)
+	}
+	entries := cfg.Hooks[event]
+	if len(entries) == 0 {
+		t.Fatalf("missing cursor hook for %s", event)
+	}
+	return entries[0].Command
+}
+
+const openCodePluginPath = "/work/.opencode/plugins/gascity.js"
+
+func installOpenCodePlugin(t *testing.T, existing string) string {
+	t.Helper()
+	fs := fsys.NewFake()
+	if existing != "" {
+		fs.Files[openCodePluginPath] = []byte(existing)
+	}
+	if err := Install(fs, "/city", "/work", []string{"opencode"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	data, ok := fs.Files[openCodePluginPath]
+	if !ok {
+		t.Fatalf("expected %s to be written", openCodePluginPath)
+	}
+	return string(data)
+}
 
 func TestSupportedProviders(t *testing.T) {
 	got := SupportedProviders()
@@ -70,8 +125,11 @@ func TestInstallClaude(t *testing.T) {
 	if string(runtimeData) != string(data) {
 		t.Error("runtime Claude settings should mirror hooks/claude.json")
 	}
-	if !strings.Contains(s, "gc prime") {
-		t.Error("claude settings should contain gc prime")
+	if !strings.Contains(claudeHookCommand(t, data, "SessionStart"), "gc prime --hook") {
+		t.Error("claude SessionStart hook should contain gc prime --hook")
+	}
+	if !strings.Contains(claudeHookCommand(t, data, "PreCompact"), `gc handoff "context cycle"`) {
+		t.Error("claude PreCompact hook should use gc handoff (not gc prime) to avoid context accumulation on compaction")
 	}
 	if !strings.Contains(s, "gc nudge drain --inject") {
 		t.Error("claude settings should contain gc nudge drain --inject")
@@ -84,6 +142,30 @@ func TestInstallClaude(t *testing.T) {
 	}
 	if !strings.Contains(s, `$HOME/go/bin`) {
 		t.Error("claude hook commands should include PATH export")
+	}
+}
+
+func TestInstallClaudeUpgradesStaleGeneratedFile(t *testing.T) {
+	fs := fsys.NewFake()
+	current, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `gc handoff "context cycle"`, `gc prime --hook`, 1)
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	hookData := fs.Files["/city/hooks/claude.json"]
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	if !strings.Contains(claudeHookCommand(t, hookData, "PreCompact"), `gc handoff "context cycle"`) {
+		t.Fatalf("upgraded claude hook missing gc handoff:\n%s", string(hookData))
+	}
+	if string(runtimeData) != string(hookData) {
+		t.Fatalf("runtime Claude settings should mirror upgraded hook settings:\n%s", string(runtimeData))
 	}
 }
 
@@ -135,20 +217,181 @@ func TestInstallCodex(t *testing.T) {
 	if !strings.Contains(s, "gc hook --inject") {
 		t.Error("codex hooks should contain gc hook --inject")
 	}
+	if !strings.Contains(s, "gc mail check --inject") {
+		t.Error("codex hooks should contain gc mail check --inject")
+	}
+	if !strings.Contains(s, "gc nudge drain --inject") {
+		t.Error("codex hooks should contain gc nudge drain --inject")
+	}
 }
 
 func TestInstallOpenCode(t *testing.T) {
-	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"opencode"})
-	if err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	data, ok := fs.Files["/work/.opencode/plugins/gascity.js"]
-	if !ok {
-		t.Fatal("expected /work/.opencode/plugins/gascity.js to be written")
-	}
-	if !strings.Contains(string(data), "gc prime") {
+	s := installOpenCodePlugin(t, "")
+	if !strings.Contains(s, "gc prime") {
 		t.Error("opencode plugin should contain gc prime")
+	}
+	if !strings.Contains(s, `let cachedPrime = null;`) {
+		t.Error("opencode plugin should cache the prime output across turns")
+	}
+	if !strings.Contains(s, `if (force || cachedPrime === null) {`) {
+		t.Error("opencode plugin should treat empty prime output as a cached value")
+	}
+	if !strings.Contains(s, `const prime = await readPrime();`) {
+		t.Error("opencode plugin should reuse the cached prime output in buildPrefix")
+	}
+	if !strings.Contains(s, `"session.deleted"`) {
+		t.Error("opencode plugin should handle session.deleted")
+	}
+	if !strings.Contains(s, "gc hook --inject") {
+		t.Error("opencode plugin should contain gc hook --inject")
+	}
+	if !strings.Contains(s, "export default async function") {
+		t.Error("opencode plugin should use ESM export default plugin format")
+	}
+	if strings.Contains(s, "module.exports") {
+		t.Error("opencode plugin should not use CommonJS exports")
+	}
+	if strings.Contains(s, "output.system.push") {
+		t.Error("opencode plugin should merge prompt into the leading system prompt")
+	}
+	if strings.Contains(s, "output.system[1] = prefix + \"\\n\\n\" + output.system[1]") {
+		t.Error("opencode plugin should not duplicate the prefix into output.system[1]")
+	}
+	if !strings.Contains(s, "output.system[0] = prependText(output.system[0], prefix)") {
+		t.Error("opencode plugin should merge the prefix into output.system[0] when a system prompt already exists")
+	}
+	if !strings.Contains(s, `"chat.message"`) {
+		t.Error("opencode plugin should inject the mayor prompt in chat.message as a runtime-safe fallback")
+	}
+}
+
+func TestInstallOpenCodeUpgradesLegacyManagedPlugin(t *testing.T) {
+	data := installOpenCodePlugin(t, `module.exports = {
+  hooks: {
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push("gc prime --hook")
+    }
+  }
+}`)
+	if !strings.Contains(data, "export default async function") {
+		t.Fatal("legacy opencode plugin was not upgraded")
+	}
+	if strings.Contains(data, "output.system.push") {
+		t.Fatal("legacy opencode plugin push-based transform was not upgraded")
+	}
+	if !strings.Contains(data, `"session.deleted"`) {
+		t.Fatal("upgraded opencode plugin should restore session.deleted handling")
+	}
+	if !strings.Contains(data, "gc hook --inject") {
+		t.Fatal("upgraded opencode plugin should restore gc hook --inject")
+	}
+	if !strings.Contains(data, `"chat.message"`) {
+		t.Fatal("upgraded opencode plugin should include chat.message fallback")
+	}
+}
+
+func TestInstallOpenCodeUpgradesManagedPluginMissingShutdownHook(t *testing.T) {
+	data := installOpenCodePlugin(t, `export default async function gascityPlugin() {
+  return {
+    event: async ({ event }) => {
+      switch (event.type) {
+        case "session.created":
+        case "session.compacted":
+          return "gc prime --hook"
+        default:
+          return
+      }
+    },
+    "chat.message": async () => {},
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.unshift("gc prime --hook")
+    },
+  }
+}`)
+	if !strings.Contains(data, `"session.deleted"`) {
+		t.Fatal("managed opencode plugin missing session.deleted was not upgraded")
+	}
+	if !strings.Contains(data, "gc hook --inject") {
+		t.Fatal("managed opencode plugin missing gc hook --inject was not upgraded")
+	}
+}
+
+func TestInstallOpenCodeUpgradesManagedPluginWithDuplicateTransformInjection(t *testing.T) {
+	data := installOpenCodePlugin(t, `export default async function gascityPlugin() {
+  return {
+    event: async () => {},
+    "chat.message": async () => {},
+    "experimental.chat.system.transform": async (_input, output) => {
+      const prefix = "gc prime --hook"
+      output.system.unshift(prefix)
+      if (output.system[1]) {
+        output.system[1] = prefix + "\n\n" + output.system[1]
+      }
+    },
+  }
+}`)
+	if strings.Contains(data, "output.system[1] = prefix + \"\\n\\n\" + output.system[1]") {
+		t.Fatal("managed opencode plugin with duplicate transform injection was not upgraded")
+	}
+	if !strings.Contains(data, "output.system[0] = prependText(output.system[0], prefix)") {
+		t.Fatal("upgraded opencode plugin should merge into output.system[0]")
+	}
+}
+
+func TestInstallOpenCodeUpgradesManagedPluginWithoutPrimeCache(t *testing.T) {
+	data := installOpenCodePlugin(t, `export default async function gascityPlugin({ directory }) {
+  async function buildPrefix() {
+    const prime = await run(directory, "prime", "--hook");
+    return { prime, extras: [prime].filter(Boolean) };
+  }
+  return {
+    event: async () => {},
+    "chat.message": async () => {},
+    "experimental.chat.system.transform": async () => {},
+  }
+}`)
+	if !strings.Contains(data, `let cachedPrime = null;`) {
+		t.Fatal("managed opencode plugin without prime cache was not upgraded")
+	}
+	if !strings.Contains(data, `if (force || cachedPrime === null) {`) {
+		t.Fatal("upgraded opencode plugin should cache empty prime output")
+	}
+	if !strings.Contains(data, `const prime = await readPrime();`) {
+		t.Fatal("upgraded opencode plugin should read prime output from cache")
+	}
+}
+
+func TestInstallOpenCodeUpgradesManagedPluginWithEmptyStringPrimeCache(t *testing.T) {
+	data := installOpenCodePlugin(t, `export default async function gascityPlugin({ directory }) {
+  let cachedPrime = "";
+  async function readPrime(force = false) {
+    if (force || cachedPrime === "") {
+      cachedPrime = await run(directory, "prime", "--hook");
+    }
+    return cachedPrime;
+  }
+  return {
+    event: async ({ event }) => {
+      switch (event.type) {
+        case "session.created":
+          await readPrime(true);
+          return;
+        case "session.deleted":
+          await run(directory, "hook", "--inject");
+          return;
+        default:
+          return;
+      }
+    },
+    "chat.message": async () => {},
+    "experimental.chat.system.transform": async () => {},
+  }
+}`)
+	if !strings.Contains(data, `let cachedPrime = null;`) {
+		t.Fatal("managed opencode plugin with empty-string prime cache was not upgraded")
+	}
+	if !strings.Contains(data, `if (force || cachedPrime === null) {`) {
+		t.Fatal("upgraded opencode plugin should cache empty prime output")
 	}
 }
 
@@ -299,14 +542,51 @@ func TestInstallCursor(t *testing.T) {
 	if !strings.Contains(string(data), "sessionStart") {
 		t.Error("cursor hooks should contain sessionStart")
 	}
-	if !strings.Contains(string(data), "gc prime --hook") {
-		t.Error("cursor hooks should contain gc prime --hook")
+	if !strings.Contains(cursorHookCommand(t, data, "sessionStart"), "gc prime --hook") {
+		t.Error("cursor sessionStart hook should contain gc prime --hook")
+	}
+	if !strings.Contains(cursorHookCommand(t, data, "preCompact"), `gc handoff "context cycle"`) {
+		t.Error("cursor preCompact hook should contain gc handoff \"context cycle\"")
 	}
 	if !strings.Contains(string(data), "gc mail check --inject") {
 		t.Error("cursor hooks should contain gc mail check --inject")
 	}
 	if !strings.Contains(string(data), "gc nudge drain --inject") {
 		t.Error("cursor hooks should contain gc nudge drain --inject")
+	}
+}
+
+func TestInstallCursorUpgradesStaleGeneratedFile(t *testing.T) {
+	fs := fsys.NewFake()
+	current, err := readEmbedded("config/cursor.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `gc handoff "context cycle"`, `gc prime --hook`, 1)
+	fs.Files["/work/.cursor/hooks.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"cursor"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	got := fs.Files["/work/.cursor/hooks.json"]
+	if !strings.Contains(cursorHookCommand(t, got, "preCompact"), `gc handoff "context cycle"`) {
+		t.Fatalf("upgraded cursor hooks missing gc handoff:\n%s", string(got))
+	}
+}
+
+func TestInstallCursorPreservesExistingCustomFile(t *testing.T) {
+	fs := fsys.NewFake()
+	custom := `{"version":1,"hooks":{"sessionStart":[{"command":"custom-start"}],"preCompact":[{"command":"custom-compact"}]}}`
+	fs.Files["/work/.cursor/hooks.json"] = []byte(custom)
+
+	if err := Install(fs, "/city", "/work", []string{"cursor"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	got := string(fs.Files["/work/.cursor/hooks.json"])
+	if got != custom {
+		t.Errorf("Install overwrote custom cursor hooks: got %q want %q", got, custom)
 	}
 }
 

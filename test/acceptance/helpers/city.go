@@ -29,7 +29,19 @@ type City struct {
 // The city is NOT initialized — call Init() or InitFrom() next.
 func NewCity(t *testing.T, env *Env) *City {
 	t.Helper()
-	dir := t.TempDir()
+	return newCityAt(t, env, t.TempDir())
+}
+
+// NewCityInRoot creates a city under the provided root directory.
+// Useful for flows that need shorter paths than t.TempDir() normally yields
+// (for example Unix socket paths under supervisor-managed acceptance tests).
+func NewCityInRoot(t *testing.T, env *Env, root string) *City {
+	t.Helper()
+	return newCityAt(t, env, root)
+}
+
+func newCityAt(t *testing.T, env *Env, dir string) *City {
+	t.Helper()
 	cityDir := filepath.Join(dir, uniqueName())
 	return NewCityAt(t, env, cityDir)
 }
@@ -40,6 +52,9 @@ func NewCityAt(t *testing.T, env *Env, cityDir string) *City {
 	t.Helper()
 	if err := os.MkdirAll(cityDir, 0o755); err != nil {
 		t.Fatalf("acceptance: creating city dir: %v", err)
+	}
+	if err := EnsureClaudeProjectState(env, cityDir); err != nil {
+		t.Fatalf("acceptance: seeding Claude state for city %s: %v", cityDir, err)
 	}
 	return &City{t: t, Dir: cityDir, Env: env}
 }
@@ -85,6 +100,9 @@ func (c *City) RigAdd(rigPath string, include string) {
 	out, err := RunGC(c.Env, c.Dir, args...)
 	if err != nil {
 		c.t.Fatalf("gc rig add failed: %v\n%s", err, out)
+	}
+	if err := EnsureClaudeProjectState(c.Env, rigPath); err != nil {
+		c.t.Fatalf("acceptance: seeding Claude state for rig %s: %v", rigPath, err)
 	}
 }
 

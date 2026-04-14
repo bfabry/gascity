@@ -1,5 +1,7 @@
 .DS_Store
+.env
 CLAUDE.local.md
+.env
 coverage.txt
 /bin/
 /gc
@@ -8,7 +10,8 @@ coverage.txt
 /br
 *.test
 .beads/
-.claude/
+.claude/*
+!.claude/skills/
 !examples/gastown/packs/gastown/overlays/default/.claude/
 !examples/gastown/packs/gastown/overlays/default/.claude/settings.json
 !examples/gastown/packs/maintenance/overlays/default/.claude/
@@ -28,3 +31,5 @@ reports/
 # Beads / Dolt files (added by bd init)
 .beads-credential-key
 .cache/
+.vscode/settings.json
+.env

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/spf13/cobra"
 )
 
@@ -61,7 +62,7 @@ Use it to prime any CLI coding agent with city-aware instructions:
   codex --prompt "$(gc prime worker)"
 
 Runtime hook profiles may call ` + "`gc prime --hook`" + `.
-When agent-name is omitted, ` + "`GC_AGENT`" + ` is used automatically.
+When agent-name is omitted, ` + "`GC_ALIAS`" + ` is used (falling back to ` + "`GC_AGENT`" + `).
 
 If agent-name matches a configured agent with a prompt_template,
 that template is output. Otherwise outputs a default worker prompt.`,
@@ -80,12 +81,15 @@ that template is output. Otherwise outputs a default worker prompt.`,
 // doPrime is the pure logic for "gc prime". Looks up the agent name in
 // city.toml and outputs the corresponding prompt template. Falls back to
 // the default run-once prompt if no match is found or no city exists.
-func doPrime(args []string, stdout, _ io.Writer) int { //nolint:unparam // always returns 0 by design (graceful fallback)
-	return doPrimeWithMode(args, stdout, io.Discard, false)
+func doPrime(args []string, stdout, stderr io.Writer) int { //nolint:unparam // always returns 0 by design (graceful fallback)
+	return doPrimeWithMode(args, stdout, stderr, false)
 }
 
-func doPrimeWithMode(args []string, stdout, _ io.Writer, hookMode bool) int { //nolint:unparam // always returns 0 by design (graceful fallback)
-	agentName := os.Getenv("GC_AGENT")
+func doPrimeWithMode(args []string, stdout, stderr io.Writer, hookMode bool) int { //nolint:unparam // always returns 0 by design (graceful fallback)
+	agentName := os.Getenv("GC_ALIAS")
+	if agentName == "" {
+		agentName = os.Getenv("GC_AGENT")
+	}
 	if len(args) > 0 {
 		agentName = args[0]
 	}
@@ -134,7 +138,7 @@ func doPrimeWithMode(args []string, stdout, _ io.Writer, hookMode bool) int { //
 				if sessionName == "" {
 					sessionName = cliSessionName(cityPath, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
 				}
-				maybeStartCodexNudgePoller(withNudgeTargetFence(openNudgeBeadStore(cityPath), nudgeTarget{
+				maybeStartNudgePoller(withNudgeTargetFence(openNudgeBeadStore(cityPath), nudgeTarget{
 					cityPath:          cityPath,
 					cityName:          cityName,
 					cfg:               cfg,
@@ -146,13 +150,16 @@ func doPrimeWithMode(args []string, stdout, _ io.Writer, hookMode bool) int { //
 				}))
 			}
 		}
+		var ctx PromptContext
+		if ok && (a.PromptTemplate != "" || hookMode) {
+			ctx = buildPrimeContext(cityPath, &a, cfg.Rigs)
+		}
 		if ok && a.PromptTemplate != "" {
-			ctx := buildPrimeContext(cityPath, &a, cfg.Rigs)
 			fragments := mergeFragmentLists(cfg.Workspace.GlobalFragments, a.InjectFragments)
-			prompt := renderPrompt(fsys.OSFS{}, cityPath, cityName, a.PromptTemplate, ctx, cfg.Workspace.SessionTemplate, io.Discard,
+			prompt := renderPrompt(fsys.OSFS{}, cityPath, cityName, a.PromptTemplate, ctx, cfg.Workspace.SessionTemplate, stderr,
 				cfg.PackDirs, fragments, nil)
 			if prompt != "" {
-				fmt.Fprint(stdout, prompt) //nolint:errcheck // best-effort stdout
+				writePrimePrompt(stdout, cityName, ctx.AgentName, prompt, hookMode)
 				return 0
 			}
 		}
@@ -170,7 +177,7 @@ func doPrimeWithMode(args []string, stdout, _ io.Writer, hookMode bool) int { //
 			}
 			if promptFile != "" {
 				if content, fErr := os.ReadFile(filepath.Join(cityPath, promptFile)); fErr == nil {
-					fmt.Fprint(stdout, string(content)) //nolint:errcheck // best-effort stdout
+					writePrimePrompt(stdout, cityName, ctx.AgentName, string(content), hookMode)
 					return 0
 				}
 			}
@@ -180,6 +187,24 @@ func doPrimeWithMode(args []string, stdout, _ io.Writer, hookMode bool) int { //
 	// Fallback: default run-once prompt.
 	fmt.Fprint(stdout, defaultPrimePrompt) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+func prependHookBeacon(cityName, agentName, prompt string) string {
+	if cityName == "" || agentName == "" {
+		return prompt
+	}
+	beacon := runtime.FormatBeaconAt(cityName, agentName, false, time.Now())
+	if prompt == "" {
+		return beacon
+	}
+	return beacon + "\n\n" + prompt
+}
+
+func writePrimePrompt(stdout io.Writer, cityName, agentName, prompt string, hookMode bool) {
+	if hookMode {
+		prompt = prependHookBeacon(cityName, agentName, prompt)
+	}
+	fmt.Fprint(stdout, prompt) //nolint:errcheck // best-effort stdout
 }
 
 func readPrimeHookContext() (sessionID, source string) {
@@ -314,8 +339,10 @@ func buildPrimeContext(cityPath string, a *config.Agent, rigs []config.Rig) Prom
 		Env:          a.Env,
 	}
 
-	// Agent identity: prefer GC_AGENT env (managed session), else config.
-	if gcAgent := os.Getenv("GC_AGENT"); gcAgent != "" {
+	// Agent identity: prefer GC_ALIAS, then GC_AGENT, else config.
+	if gcAlias := os.Getenv("GC_ALIAS"); gcAlias != "" {
+		ctx.AgentName = gcAlias
+	} else if gcAgent := os.Getenv("GC_AGENT"); gcAgent != "" {
 		ctx.AgentName = gcAgent
 	} else {
 		ctx.AgentName = a.QualifiedName()

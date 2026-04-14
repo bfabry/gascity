@@ -23,6 +23,18 @@ func (s *countingStore) ListOpen(status ...string) ([]beads.Bead, error) {
 	return s.Store.ListOpen(status...)
 }
 
+func (s *countingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	switch {
+	case query.Assignee != "":
+		s.listByAssigneeCalls++
+	case query.Label != "":
+		s.listByLabelCalls++
+	case query.Status != "" || query.AllowScan:
+		s.listCalls++
+	}
+	return s.Store.List(query)
+}
+
 func (s *countingStore) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
 	s.listByLabelCalls++
 	return s.Store.ListByLabel(label, limit, opts...)

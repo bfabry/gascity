@@ -105,6 +105,7 @@ type ProviderResume struct {
 type Manager struct {
 	store             beads.Store
 	sp                runtime.Provider
+	cityPath          string
 	transportResolver func(template string) string
 }
 
@@ -184,6 +185,19 @@ func NewManagerWithTransportResolver(store beads.Store, sp runtime.Provider, res
 	return &Manager{store: store, sp: sp, transportResolver: resolver}
 }
 
+// NewManagerWithCityPath creates a Manager that can persist deferred submits
+// into the city's nudge queue.
+func NewManagerWithCityPath(store beads.Store, sp runtime.Provider, cityPath string) *Manager {
+	return &Manager{store: store, sp: sp, cityPath: cityPath}
+}
+
+// NewManagerWithTransportResolverAndCityPath creates a Manager that can infer
+// session transport from template config and persist deferred submits into the
+// city's nudge queue.
+func NewManagerWithTransportResolverAndCityPath(store beads.Store, sp runtime.Provider, cityPath string, resolver func(template string) string) *Manager {
+	return &Manager{store: store, sp: sp, cityPath: cityPath, transportResolver: resolver}
+}
+
 // Create creates a new chat session bead and starts the runtime session.
 // The command is the full provider command to execute (e.g., "claude --dangerously-skip-permissions").
 // The resume parameter carries provider resume capabilities; if the provider
@@ -259,6 +273,8 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			"continuation_epoch": fmt.Sprintf("%d", DefaultContinuationEpoch),
 			"instance_token":     NewInstanceToken(),
 		}
+		// provider_kind may be injected via extraMeta when the caller has
+		// resolved the canonical builtin kind for a custom provider alias.
 		if alias != "" {
 			meta["alias"] = alias
 		}
@@ -336,6 +352,11 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			DefaultContinuationEpoch,
 			meta["instance_token"],
 		))
+		if gcProvider := meta["provider_kind"]; gcProvider != "" {
+			cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
+		} else if provider != "" {
+			cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": provider})
+		}
 		cfg = runtime.SyncWorkDirEnv(cfg)
 
 		// Start the runtime session.
@@ -471,10 +492,10 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 		if sessionKey != "" {
 			meta["session_key"] = sessionKey
 		}
+		meta["pending_create_claim"] = "true"
 		if explicitName != "" {
 			meta["session_name"] = explicitName
 			meta["session_name_explicit"] = "true"
-			meta["pending_create_claim"] = "true"
 		}
 		for k, v := range extraMeta {
 			meta[k] = v
@@ -760,13 +781,15 @@ func (m *Manager) Prune(before time.Time) (int, error) {
 // PruneDetailed closes suspended sessions whose suspension time is before the
 // given cutoff and reports the affected session IDs and queued wait nudges.
 func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
-	all, err := m.store.ListByLabel(LabelSession, 0)
+	all, err := m.store.List(beads.ListQuery{
+		Label: LabelSession,
+	})
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("listing sessions: %w", err)
 	}
 	result := PruneResult{}
 	for _, b := range all {
-		if b.Type != BeadType {
+		if !IsSessionBeadOrRepairable(b) {
 			continue
 		}
 		if b.Status == "closed" {
@@ -811,16 +834,42 @@ func (m *Manager) Get(id string) (Info, error) {
 	return m.infoFromBead(b), nil
 }
 
+// ListResult holds the results of a ListFull call, including the raw beads
+// to avoid redundant store queries.
+type ListResult struct {
+	Sessions []Info
+	Beads    []beads.Bead // All session beads (unfiltered by state/template)
+}
+
 // List returns all chat sessions, optionally filtered by state and template.
 func (m *Manager) List(stateFilter string, templateFilter string) ([]Info, error) {
-	all, err := m.store.ListByLabel(LabelSession, 0)
+	r, err := m.ListFull(stateFilter, templateFilter)
+	if err != nil {
+		return nil, err
+	}
+	return r.Sessions, nil
+}
+
+// ListFull is like List but also returns the raw session beads to avoid
+// redundant store queries by the caller (e.g., for building a bead index).
+func (m *Manager) ListFull(stateFilter string, templateFilter string) (*ListResult, error) {
+	all, err := m.store.List(beads.ListQuery{
+		Label: LabelSession,
+		Sort:  beads.SortCreatedDesc,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("listing sessions: %w", err)
 	}
+	return m.ListFullFromBeads(all, stateFilter, templateFilter), nil
+}
 
+// ListFullFromBeads is like ListFull but reuses a caller-supplied slice of
+// session-labeled beads. Callers that already loaded session beads can avoid
+// a second store scan by passing the same slice here.
+func (m *Manager) ListFullFromBeads(all []beads.Bead, stateFilter string, templateFilter string) *ListResult {
 	var result []Info
 	for _, b := range all {
-		if b.Type != BeadType {
+		if !IsSessionBeadOrRepairable(b) {
 			continue
 		}
 		state := normalizeInfoState(State(b.Metadata["state"]))
@@ -859,7 +908,7 @@ func (m *Manager) List(stateFilter string, templateFilter string) ([]Info, error
 
 		result = append(result, m.infoFromBead(b))
 	}
-	return result, nil
+	return &ListResult{Sessions: result, Beads: all}
 }
 
 // Peek captures the last N lines of output from the session.

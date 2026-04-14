@@ -18,10 +18,12 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -64,6 +66,11 @@ type TemplateParams struct {
 	WakeMode string
 	// IsACP is true if session = "acp".
 	IsACP bool
+	// HookEnabled reports whether provider hooks are installed for this agent.
+	// Hook-enabled providers receive startup context via their hook path
+	// (for example gc prime --hook), so PromptMode=none should not also
+	// fall back to a delayed startup nudge.
+	HookEnabled bool
 	// DependencyOnly marks a realized cold slot kept only so dependency wake
 	// has something concrete to wake even when pool check wants zero.
 	DependencyOnly bool
@@ -131,12 +138,18 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		command = command + " " + sa
 		settingsFile, relDst := claudeSettingsSource(p.cityPath)
 		if settingsFile != "" {
-			copyFiles = append(copyFiles, runtime.CopyEntry{Src: settingsFile, RelDst: relDst})
+			copyFiles = append(copyFiles, runtime.CopyEntry{
+				Src: settingsFile, RelDst: relDst,
+				Probed: true, ContentHash: runtime.HashPathContent(settingsFile),
+			})
 		}
 	}
 	scriptsDir := citylayout.ScriptsPath(p.cityPath)
 	if info, sErr := os.Stat(scriptsDir); sErr == nil && info.IsDir() {
-		copyFiles = append(copyFiles, runtime.CopyEntry{Src: scriptsDir, RelDst: path.Join(".gc", "scripts")})
+		copyFiles = append(copyFiles, runtime.CopyEntry{
+			Src: scriptsDir, RelDst: path.Join(".gc", "scripts"),
+			Probed: true, ContentHash: runtime.HashPathContent(scriptsDir),
+		})
 	}
 	copyFiles = stageHookFiles(copyFiles, p.cityPath, workDir)
 
@@ -159,9 +172,12 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		}
 	}
 	if sessionBeadID == "" && p.beadStore != nil {
-		if all, err := p.beadStore.ListByLabel("gc:session", 0); err == nil {
+		if all, err := p.beadStore.List(beads.ListQuery{Label: "gc:session"}); err == nil {
 			for _, b := range all {
-				if b.Status != "closed" && b.Metadata["session_name"] == sessName {
+				if !session.IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+					continue
+				}
+				if b.Metadata["session_name"] == sessName {
 					sessionBeadID = b.ID
 					break
 				}
@@ -177,7 +193,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		"GC_SESSION_NAME": sessName,
 		"GC_SESSION_ID":   sessionBeadID,
 		"GC_TEMPLATE":     templateNameFor(cfgAgent, qualifiedName),
-		"GC_AGENT":        sessionBeadID,
+		"GC_AGENT":        qualifiedName,
 		"GC_ALIAS":        qualifiedName,
 		"BEADS_ACTOR":     sessName,
 		"GC_DIR":          workDir,
@@ -196,6 +212,9 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	for key, value := range citylayout.CityRuntimeEnvMap(p.cityPath) {
 		agentEnv[key] = value
 	}
+	// Agent-session data ops must bypass the lifecycle wrapper. See
+	// beadsProvider() docs and #647.
+	agentEnv["GC_BEADS"] = rawBeadsProvider(p.cityPath)
 	if exe, err := os.Executable(); err == nil && exe != "" {
 		agentEnv["GC_BIN"] = exe
 	}
@@ -210,28 +229,26 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 9: Render prompt with beacon.
 	var prompt string
-	if resolved.PromptMode != "none" {
-		fragments := mergeFragmentLists(p.globalFragments, cfgAgent.InjectFragments)
-		prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
-			CityRoot:      p.cityPath,
-			AgentName:     qualifiedName,
-			TemplateName:  cfgAgent.Name,
-			RigName:       rigName,
-			RigRoot:       rigRoot,
-			WorkDir:       workDir,
-			IssuePrefix:   findRigPrefix(rigName, p.rigs),
-			DefaultBranch: defaultBranchFor(workDir),
-			WorkQuery:     cfgAgent.EffectiveWorkQuery(),
-			SlingQuery:    cfgAgent.EffectiveSlingQuery(),
-			Env:           cfgAgent.Env,
-		}, p.sessionTemplate, p.stderr, p.packDirs, fragments, p.beadStore)
-		hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name)
-		beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, !hasHooks, p.beaconTime)
-		if prompt != "" {
-			prompt = beacon + "\n\n" + prompt
-		} else {
-			prompt = beacon
-		}
+	fragments := mergeFragmentLists(p.globalFragments, cfgAgent.InjectFragments)
+	prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
+		CityRoot:      p.cityPath,
+		AgentName:     qualifiedName,
+		TemplateName:  cfgAgent.Name,
+		RigName:       rigName,
+		RigRoot:       rigRoot,
+		WorkDir:       workDir,
+		IssuePrefix:   findRigPrefix(rigName, p.rigs),
+		DefaultBranch: defaultBranchFor(workDir),
+		WorkQuery:     cfgAgent.EffectiveWorkQuery(),
+		SlingQuery:    cfgAgent.EffectiveSlingQuery(),
+		Env:           cfgAgent.Env,
+	}, p.sessionTemplate, p.stderr, p.packDirs, fragments, p.beadStore)
+	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name)
+	beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, !hasHooks, p.beaconTime)
+	if prompt != "" {
+		prompt = beacon + "\n\n" + prompt
+	} else {
+		prompt = beacon
 	}
 
 	// Step 10: Merge environment layers.
@@ -294,6 +311,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		RigRoot:          rigRoot,
 		WakeMode:         cfgAgent.WakeMode,
 		IsACP:            cfgAgent.Session == "acp",
+		HookEnabled:      hasHooks,
 	}, nil
 }
 
@@ -301,24 +319,40 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 	env := map[string]string{
 		// Explicit empty values let tmux unset stale Dolt vars inherited from
 		// the server environment when the current city/rig does not use them.
-		"GC_DOLT_HOST":    "",
-		"GC_DOLT_PORT":    "",
-		"BEADS_DOLT_HOST": "",
-		"BEADS_DOLT_PORT": "",
+		"GC_DOLT_HOST":           "",
+		"GC_DOLT_PORT":           "",
+		"GC_DOLT_USER":           "",
+		"GC_DOLT_PASSWORD":       "",
+		"BEADS_DOLT_SERVER_HOST": "",
+		"BEADS_DOLT_SERVER_PORT": "",
+		"BEADS_DOLT_SERVER_USER": "",
+		"BEADS_DOLT_PASSWORD":    "",
+		// Suppress bd's built-in Dolt auto-start. The gc controller manages
+		// the server; bd's CLI auto-start launches rogue servers from the
+		// agent's cwd with the wrong data_dir.
+		"BEADS_DOLT_AUTO_START": "0",
 	}
 
 	if host := doltHostForCity(cityPath); host != "" {
 		env["GC_DOLT_HOST"] = host
-		env["BEADS_DOLT_HOST"] = host
+		env["BEADS_DOLT_SERVER_HOST"] = host
+	}
+	if user := os.Getenv("GC_DOLT_USER"); user != "" {
+		env["GC_DOLT_USER"] = user
+		env["BEADS_DOLT_SERVER_USER"] = user
+	}
+	if pass := os.Getenv("GC_DOLT_PASSWORD"); pass != "" {
+		env["GC_DOLT_PASSWORD"] = pass
+		env["BEADS_DOLT_PASSWORD"] = pass
 	}
 	if isExternalDolt(cityPath) {
 		if port := doltPortForCity(cityPath); port != "" {
 			env["GC_DOLT_PORT"] = port
-			env["BEADS_DOLT_PORT"] = port
+			env["BEADS_DOLT_SERVER_PORT"] = port
 		}
 	} else if port := currentDoltPort(cityPath); port != "" {
 		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	}
 	if rigRoot == "" {
 		return env
@@ -334,11 +368,11 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 		}
 		if r.DoltHost != "" {
 			env["GC_DOLT_HOST"] = r.DoltHost
-			env["BEADS_DOLT_HOST"] = r.DoltHost
+			env["BEADS_DOLT_SERVER_HOST"] = r.DoltHost
 		}
 		if r.DoltPort != "" {
 			env["GC_DOLT_PORT"] = r.DoltPort
-			env["BEADS_DOLT_PORT"] = r.DoltPort
+			env["BEADS_DOLT_SERVER_PORT"] = r.DoltPort
 		}
 		if r.DoltHost != "" || r.DoltPort != "" {
 			return env
@@ -348,9 +382,9 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 
 	if port := currentDoltPort(rigRoot); port != "" {
 		env["GC_DOLT_HOST"] = ""
-		env["BEADS_DOLT_HOST"] = ""
+		env["BEADS_DOLT_SERVER_HOST"] = ""
 		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	}
 	return env
 }
@@ -362,10 +396,23 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 func templateParamsToConfig(tp TemplateParams) runtime.Config {
 	var promptSuffix string
 	var promptFlag string
+	nudge := tp.Hints.Nudge
 	if tp.Prompt != "" {
-		promptSuffix = shellquote.Quote(tp.Prompt)
-		if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "flag" && tp.ResolvedProvider.PromptFlag != "" {
-			promptFlag = tp.ResolvedProvider.PromptFlag
+		if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none" {
+			// Hook-enabled providers prime themselves on startup, so the
+			// rendered role prompt must not also be replayed as a user nudge.
+			if !tp.HookEnabled || !tp.ResolvedProvider.SupportsHooks {
+				if nudge != "" {
+					nudge = tp.Prompt + "\n\n---\n\n" + nudge
+				} else {
+					nudge = tp.Prompt
+				}
+			}
+		} else {
+			promptSuffix = shellquote.Quote(tp.Prompt)
+			if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "flag" && tp.ResolvedProvider.PromptFlag != "" {
+				promptFlag = tp.ResolvedProvider.PromptFlag
+			}
 		}
 	}
 	return runtime.Config{
@@ -378,7 +425,7 @@ func templateParamsToConfig(tp TemplateParams) runtime.Config {
 		ReadyDelayMs:           tp.Hints.ReadyDelayMs,
 		ProcessNames:           tp.Hints.ProcessNames,
 		EmitsPermissionWarning: tp.Hints.EmitsPermissionWarning,
-		Nudge:                  tp.Hints.Nudge,
+		Nudge:                  nudge,
 		PreStart:               tp.Hints.PreStart,
 		SessionSetup:           tp.Hints.SessionSetup,
 		SessionSetupScript:     tp.Hints.SessionSetupScript,

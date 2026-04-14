@@ -36,8 +36,8 @@ Gas City requires the following tools on your system. `gc init` and
 | jq | Always | — | `brew install jq` | `apt install jq` |
 | pgrep | Always | — | (included in macOS) | `apt install procps` |
 | lsof | Always | — | (included in macOS) | `apt install lsof` |
-| dolt | Beads provider `bd` | 1.80.0 | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) |
-| bd | Beads provider `bd` | 0.61.0 | [releases](https://github.com/gastownhall/beads/releases) | [releases](https://github.com/gastownhall/beads/releases) |
+| dolt | Beads provider `bd` | 1.86.1 | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) |
+| bd | Beads provider `bd` | 1.0.0 | [releases](https://github.com/gastownhall/beads/releases) | [releases](https://github.com/gastownhall/beads/releases) |
 | flock | Beads provider `bd` | — | `brew install flock` | `apt install util-linux` |
 | claude / codex / gemini | Per provider | — | See provider docs | See provider docs |
 
@@ -52,7 +52,7 @@ brew install gastownhall/gascity/gascity
 gc version
 ```
 
-Or build from source:
+Or build from source (requires `make` and Go 1.25+):
 
 ```bash
 make install
@@ -71,7 +71,7 @@ gc session attach mayor
 ```
 
 For the longer walkthrough, start with
-[Tutorial 01](docs/tutorials/01-beads.md).
+[Tutorial 01](docs/tutorials/01-cities-and-rigs.md).
 
 ## Documentation
 
@@ -119,6 +119,45 @@ Useful commands:
 - `make check`
 - `make check-docs`
 - `make test-integration`
+
+### Tutorial Harness
+
+This repo includes a project-scoped coding-agent skill for the tutorial
+acceptance harness at
+[`/.claude/skills/isolated-tutorial-harness`](.claude/skills/isolated-tutorial-harness/SKILL.md).
+Use it when running or debugging the tutorial tests through Codex or Claude:
+
+- invoke `$isolated-tutorial-harness`
+- follow the workflow in the skill
+
+The harness is designed to keep `gc` state isolated in temp homes, temp
+supervisors, and temp runtime dirs while still authenticating provider CLIs
+correctly. It expects a repo-local `.env` file with:
+
+```bash
+CLAUDE_CODE_OAUTH_TOKEN=...
+```
+
+Optional:
+
+```bash
+OPENAI_API_KEY=...
+```
+
+The main validation flow is:
+
+```bash
+go test ./test/acceptance/helpers -run 'TestProviderShim|TestEnsureClaude' -count=1
+go test ./internal/api -run 'TestProbeCommandEnv(PreservesXDGOverridesWhenGHConfigDirIsSet|PassesClaudeOAuthToken)$|TestHandleProviderReadinessAcceptsClaudeOAuthTokenAuth' -count=1
+go test -tags acceptance_c ./test/acceptance/tutorial_goldens -run '^TestTutorial01Cities$' -count=1 -v
+go test -tags acceptance_c ./test/acceptance/tutorial_goldens -run '^TestTutorial04Communication$' -count=1 -v
+go test -tags acceptance_c ./test/acceptance/tutorial_goldens -run '^TestTutorial03Sessions$' -count=1 -v
+go test -tags acceptance_c ./test/acceptance/tutorial_goldens -count=1
+```
+
+If the isolated Claude path regresses, start with the skill before changing the
+tutorials. The common failure mode is provider auth/readiness, not tutorial
+content.
 
 ## License
 

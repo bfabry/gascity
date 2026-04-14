@@ -10,6 +10,7 @@ GOLANGCI_LINT := $(BIN_DIR)/golangci-lint
 BINARY     := gc
 BUILD_DIR  := bin
 INSTALL_DIR := $(BIN_DIR)
+ENABLE_SFW ?= false
 
 # Version metadata injected via ldflags.
 VERSION    := $(shell tag=$$(git describe --tags --exact-match 2>/dev/null || true); if [ -n "$$tag" ]; then printf '%s' "$$tag" | sed 's/^v//'; else echo "dev"; fi)
@@ -20,7 +21,7 @@ LDFLAGS := -X main.version=$(VERSION) \
            -X main.commit=$(COMMIT) \
            -X main.date=$(BUILD_TIME)
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt lint fmt-check fmt vet test test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-regression test-tutorial test-integration test-mcp-mail test-docker test-k8s test-worker-core test-worker-core-phase1 test-worker-core-phase2 test-worker-core-phase3 test-worker-inference setup-worker-inference test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev
+.PHONY: build check check-all check-bd check-docker check-docs check-dolt lint fmt-check fmt vet test test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docker-mail docker-load-desktop docs-dev
 
 ## build: compile gc binary with version metadata
 build:
@@ -111,29 +112,28 @@ test-acceptance:
 test-acceptance-b:
 	go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...
 
-## test-acceptance-c: run Tier C acceptance tests (real inference, ~10 min, manual/nightly)
+## test-acceptance-c: run Tier C acceptance tests (real inference, ~30-40 min, manual/nightly)
 test-acceptance-c:
-	go test -tags acceptance_c -timeout 15m -v ./test/acceptance/tier_c/...
+	go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
 
 ## test-acceptance-all: run all acceptance tiers
 test-acceptance-all: test-acceptance test-acceptance-b test-acceptance-c
 
-## test-tutorial-regression: run manual tutorial regression tests (requires tmux, bd)
-test-tutorial-regression:
-	go test -tags 'integration acceptance' -timeout 10m -v -run TestTutorialRegression ./test/integration/
-
 ## test-integration: run all tests including integration (tmux, etc.)
 test-integration:
-	go test -tags integration -timeout 8m ./...
+	go test -tags integration -timeout 30m ./...
 
 
-## test-tutorial: run tutorial acceptance tests (requires tmux, dolt, bd, claude authed)
-## These exercise the full tutorial flow with real inference — run before each release.
-test-tutorial:
-	go test -tags 'integration acceptance' -timeout 10m -v ./test/integration/ -run 'TestTutorial'
+## test-tutorial-goldens: run tutorial golden acceptance tests (requires tmux, dolt, bd, claude auth)
+## These exercise the published tutorial flow with real inference — run before each release.
+test-tutorial-goldens:
+	go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
 
-## test-tutorial-regression: alias for test-tutorial
-test-tutorial-regression: test-tutorial
+## test-tutorial: alias for tutorial goldens
+test-tutorial: test-tutorial-goldens
+
+## test-tutorial-regression: alias for tutorial goldens
+test-tutorial-regression: test-tutorial-goldens
 
 ## check-docs: verify docs sync tests
 check-docs:
@@ -180,33 +180,6 @@ test-docker: check-docker
 test-k8s:
 	go test -tags integration ./test/integration/ -run TestK8sSessionConformance -v -count=1
 
-## test-worker-core-phase1: run phase-1 worker transcript/continuation conformance tests (set PROFILE=claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli to narrow)
-test-worker-core-phase1:
-	PROFILE="$(PROFILE)" go test ./internal/worker/workertest -run '^TestPhase1' -count=1 -v
-
-## test-worker-core: alias for the current phase-1 worker-core conformance suite
-test-worker-core: test-worker-core-phase1
-
-## test-worker-core-phase2: run phase-2 worker-core conformance tests (set PROFILE=claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli to narrow)
-test-worker-core-phase2:
-	PROFILE="$(PROFILE)" go test ./internal/worker/workertest -run '^TestPhase2' -count=1 -v
-	go test ./internal/runtime/tmux -run '^TestPhase2' -count=1 -v
-
-## test-worker-core-phase3: run phase-3 worker-core conformance tests (set PROFILE=claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli to narrow)
-test-worker-core-phase3:
-	PROFILE="$(PROFILE)" go test ./internal/worker/workertest -run '^TestPhase3' -count=1 -v
-	PROFILE="$(PROFILE)" go test ./cmd/gc -run '^TestPhase3' -count=1 -v
-
-## setup-worker-inference: install the live provider CLI for PROFILE=claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli
-setup-worker-inference:
-	@test -n "$(PROFILE)" || (echo "Error: PROFILE is required (claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli)" && exit 1)
-	python3 scripts/worker_inference_setup.py install --profile "$(PROFILE)"
-
-## test-worker-inference: run the live WorkerInference smoke suite (set PROFILE=claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli)
-test-worker-inference:
-	@test -n "$(PROFILE)" || (echo "Error: PROFILE is required (claude/tmux-cli|codex/tmux-cli|gemini/tmux-cli)" && exit 1)
-	PROFILE="$(PROFILE)" go test -tags acceptance_c -timeout 30m -count=1 -run '^TestWorkerInference' -v ./test/acceptance/worker_inference/...
-
 ## setup: install tools and git hooks
 setup: install-tools
 	git config core.hooksPath .githooks
@@ -216,13 +189,26 @@ setup: install-tools
 docs-dev:
 	cd docs && npx --yes mint@latest dev
 
-## docker-base: build base image with system dependencies (~2.5 min, rebuild rarely)
-docker-base: check-docker
-	docker build -f contrib/k8s/Dockerfile.base -t gc-agent-base:latest .
+# Source pinned dependency versions for Docker builds.
+include deps.env
+export
 
-## docker-agent: build base agent image (~5s on top of base). For prebaked images use: gc build-image
+## docker-base: build base image with system dependencies (~2.5 min, rebuild rarely)
+## Pass ENABLE_SFW=true to include Socket Firewall (default: false)
+docker-base: check-docker
+	. ./deps.env && docker build -f contrib/k8s/Dockerfile.base \
+		--build-arg DOLT_VERSION=$$DOLT_VERSION \
+		--build-arg ENABLE_SFW=$(ENABLE_SFW) \
+		-t gc-agent-base:latest .
+
+## docker-agent: build base agent image. For prebaked images use: gc build-image
 docker-agent: check-docker
-	docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
+	. ./deps.env && docker build -f contrib/k8s/Dockerfile.agent \
+		--build-arg BEADS_VERSION=$$BD_COMMIT \
+		--build-arg BR_VERSION=v$$BR_VERSION \
+		--build-arg GC_VERSION=$(VERSION) \
+		--build-arg GC_COMMIT=$(COMMIT) \
+		-t gc-agent:latest .
 	@if kubectl config current-context 2>/dev/null | grep -q '^kind-'; then \
 		cluster=$$(kubectl config current-context | sed 's/^kind-//'); \
 		echo "Loading gc-agent:latest into kind cluster '$$cluster'..."; \
@@ -237,6 +223,30 @@ docker-controller: check-docker
 		echo "Loading gc-controller:latest into kind cluster '$$cluster'..."; \
 		kind load docker-image gc-controller:latest --name "$$cluster"; \
 	fi
+
+## docker-mail: build mcp-agent-mail image
+docker-mail: check-docker
+	docker build -f contrib/k8s/Dockerfile.mail -t gc-mcp-mail:latest .
+	@if kubectl config current-context 2>/dev/null | grep -q '^kind-'; then \
+		cluster=$$(kubectl config current-context | sed 's/^kind-//'); \
+		echo "Loading gc-mcp-mail:latest into kind cluster '$$cluster'..."; \
+		kind load docker-image gc-mcp-mail:latest --name "$$cluster"; \
+	fi
+
+## docker-load-desktop: load all gc images into Docker Desktop's built-in k8s node
+## (kind clusters are handled automatically by the individual docker-* targets).
+docker-load-desktop: check-docker
+	@if ! docker inspect desktop-control-plane >/dev/null 2>&1; then \
+		echo "Error: desktop-control-plane container not found." >&2; \
+		echo "  This target loads images into Docker Desktop's built-in Kubernetes." >&2; \
+		echo "  For kind clusters, 'make docker-agent/docker-controller/docker-mail' auto-loads." >&2; \
+		exit 1; \
+	fi
+	@set -e; for img in gc-agent-base:latest gc-agent:latest gc-controller:latest gc-mcp-mail:latest; do \
+		echo "Loading $$img into desktop-control-plane..."; \
+		docker save "$$img" | docker exec -i desktop-control-plane ctr -n k8s.io images import -; \
+	done
+	@echo "All images loaded."
 
 ## k8s-secret: create K8s secret with Claude credentials
 ## Usage: make k8s-secret CLAUDE_CONFIG_SRC=~/.claude [GC_K8S_NAMESPACE=gc]

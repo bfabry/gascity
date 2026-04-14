@@ -121,7 +121,7 @@ func (s *Server) extmsgNotifyMembers(conv extmsg.ConversationRef, inboundMsg ext
 				log.Printf("extmsg: resolve session %s failed: %v", sessionID, err)
 				return
 			}
-			if err := s.sendMessageToSession(ctx, store, resolvedID, nudge); err != nil {
+			if err := s.sendBackgroundMessageToSession(ctx, store, resolvedID, nudge); err != nil {
 				log.Printf("extmsg: notify %s failed: %v", sessionID, err)
 			}
 		}(m.SessionID)

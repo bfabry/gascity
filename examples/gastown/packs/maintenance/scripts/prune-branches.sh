@@ -5,10 +5,13 @@
 # After work is merged and the remote branch deleted, local tracking
 # branches persist indefinitely. This script prunes them.
 #
+# NOTE on `bd batch` (beads#6): this script has no `bd` calls. All
+# operations use `git` and `gc rig list`.
+#
 # Runs as an exec order (no LLM, no agent, no wisp).
 set -euo pipefail
 
-CITY="${GC_CITY_ROOT:-.}"
+CITY="${GC_CITY:-.}"
 PRUNED=0
 
 # Get all rig paths.

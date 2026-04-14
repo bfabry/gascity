@@ -18,8 +18,12 @@ func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agen
 		return nil
 	}
 	var source map[string]string
-	if agentCfg.Dir != "" {
-		source = bdRuntimeEnvForRig(cityPath, cfg, agentCommandDir(cityPath, agentCfg, cfg.Rigs))
+	if rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs); rigName != "" {
+		if rigRoot := rigRootForName(rigName, cfg.Rigs); rigRoot != "" {
+			source = bdRuntimeEnvForRig(cityPath, cfg, rigRoot)
+		} else {
+			source = bdRuntimeEnv(cityPath)
+		}
 	} else {
 		source = bdRuntimeEnv(cityPath)
 	}
@@ -27,16 +31,24 @@ func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agen
 		return nil
 	}
 	env := map[string]string{}
-	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_HOST", "BEADS_DOLT_PORT"} {
+	// Only include connection coordinates (host/port) in the prefix — NOT
+	// credentials. Passwords serialized into the shell prefix would be
+	// visible in process listings. Auth vars (GC_DOLT_USER, GC_DOLT_PASSWORD,
+	// BEADS_DOLT_SERVER_USER, BEADS_DOLT_PASSWORD) are inherited from the
+	// controller's process env set by cityRuntimeProcessEnv.
+	for _, key := range []string{
+		"GC_DOLT_HOST", "GC_DOLT_PORT",
+		"BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT",
+	} {
 		if value, ok := source[key]; ok {
 			env[key] = value
 		}
 	}
-	if env["BEADS_DOLT_HOST"] == "" {
-		env["BEADS_DOLT_HOST"] = env["GC_DOLT_HOST"]
+	if env["BEADS_DOLT_SERVER_HOST"] == "" {
+		env["BEADS_DOLT_SERVER_HOST"] = env["GC_DOLT_HOST"]
 	}
-	if env["BEADS_DOLT_PORT"] == "" {
-		env["BEADS_DOLT_PORT"] = env["GC_DOLT_PORT"]
+	if env["BEADS_DOLT_SERVER_PORT"] == "" {
+		env["BEADS_DOLT_SERVER_PORT"] = env["GC_DOLT_PORT"]
 	}
 	if len(env) == 0 {
 		return nil
@@ -91,7 +103,7 @@ func probeSessionNameForTemplate(
 	if cfg != nil {
 		if spec, ok := findNamedSessionSpec(cfg, cityName, identity); ok {
 			if sessionBeads != nil {
-				if bead, ok := findCanonicalNamedSessionBead(sessionBeads, spec.Identity); ok {
+				if bead, ok := findCanonicalNamedSessionBead(sessionBeads, spec); ok {
 					if sn := strings.TrimSpace(bead.Metadata["session_name"]); sn != "" {
 						return sn
 					}

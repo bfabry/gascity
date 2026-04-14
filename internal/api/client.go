@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -60,6 +61,14 @@ type Client struct {
 }
 
 const sessionMessageTimeout = 95 * time.Second
+
+// SessionSubmitResponse mirrors POST /v0/session/{id}/submit.
+type SessionSubmitResponse struct {
+	Status string               `json:"status"`
+	ID     string               `json:"id"`
+	Queued bool                 `json:"queued"`
+	Intent session.SubmitIntent `json:"intent"`
+}
 
 // NewClient creates a new API client targeting the given base URL
 // (e.g., "http://127.0.0.1:8080").
@@ -164,12 +173,27 @@ func (c *Client) KillSession(id string) error {
 	return c.doMutation("POST", "/v0/session/"+url.PathEscape(id)+"/kill", nil)
 }
 
-// SendSessionMessage delivers a message to a session via
-// POST /v0/session/{id}/messages. The server resumes suspended sessions when
-// possible before nudging the message into the runtime.
+// SendSessionMessage delivers a message to a session via the compatibility
+// POST /v0/session/{id}/messages endpoint.
 func (c *Client) SendSessionMessage(id, message string) error {
 	body := map[string]string{"message": message}
 	return c.doMutationWithTimeout("POST", "/v0/session/"+url.PathEscape(id)+"/messages", body, sessionMessageTimeout)
+}
+
+// SubmitSession sends a semantic submit request to a session.
+// The id may be either a bead ID or a resolvable session alias/name.
+func (c *Client) SubmitSession(id, message string, intent session.SubmitIntent) (SessionSubmitResponse, error) {
+	body := map[string]any{
+		"message": message,
+	}
+	if intent != "" {
+		body["intent"] = intent
+	}
+	var resp SessionSubmitResponse
+	if err := c.doPostJSON("/v0/session/"+url.PathEscape(id)+"/submit", body, &resp); err != nil {
+		return SessionSubmitResponse{}, err
+	}
+	return resp, nil
 }
 
 // escapeName escapes each segment of a potentially qualified name (e.g.,
@@ -279,6 +303,63 @@ func (c *Client) doGet(path string, out any) error {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
 		return fmt.Errorf("API returned %d", resp.StatusCode)
+	}
+	if apiErr.Message != "" {
+		return fmt.Errorf("API error: %s", apiErr.Message)
+	}
+	if apiErr.Error != "" {
+		return fmt.Errorf("API error: %s", apiErr.Error)
+	}
+	return fmt.Errorf("API returned %d", resp.StatusCode)
+}
+
+func (c *Client) doPostJSON(path string, body any, out any) error {
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.urlForPath(path), bodyReader)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("X-GC-Request", "true")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if out == nil {
+			return nil
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return fmt.Errorf("decode response: %w", err)
+		}
+		return nil
+	}
+
+	var apiErr struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
+		return fmt.Errorf("API returned %d", resp.StatusCode)
+	}
+
+	if apiErr.Error == "read_only" {
+		msg := apiErr.Message
+		if msg == "" {
+			msg = "mutations disabled (read-only server)"
+		}
+		return &readOnlyError{msg: msg}
 	}
 	if apiErr.Message != "" {
 		return fmt.Errorf("API error: %s", apiErr.Message)

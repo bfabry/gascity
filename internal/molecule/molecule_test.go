@@ -2,6 +2,7 @@ package molecule
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestInstantiateSimple(t *testing.T) {
 		Name:        "test-formula",
 		Description: "A test formula",
 		Steps: []formula.RecipeStep{
-			{ID: "test-formula", Title: "{{title}}", Type: "epic", IsRoot: true},
+			{ID: "test-formula", Title: "{{title}}", Type: "molecule", IsRoot: true},
 			{ID: "test-formula.step-a", Title: "Step A", Type: "task"},
 			{ID: "test-formula.step-b", Title: "Step B: {{feature}}", Type: "task"},
 		},
@@ -142,6 +143,59 @@ func TestInstantiateUsesGraphApplyStoreWhenAvailable(t *testing.T) {
 	}
 	if !hasParentChild {
 		t.Fatalf("edges = %+v, want at least one parent-child edge", store.plan.Edges)
+	}
+}
+
+func TestBuildRecipeApplyPlan_GraphWorkflowOwnershipUsesTracks(t *testing.T) {
+	recipe := &formula.Recipe{
+		Name: "wf",
+		Steps: []formula.RecipeStep{
+			{ID: "wf", Title: "Workflow", Type: "task", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"}},
+			{ID: "wf.body", Title: "Body", Type: "task", Metadata: map[string]string{"gc.kind": "scope"}},
+			{ID: "wf.workflow-finalize", Title: "Finalize", Type: "task", Metadata: map[string]string{"gc.kind": "workflow-finalize"}},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "wf", DependsOnID: "wf.workflow-finalize", Type: "blocks"},
+			{StepID: "wf.workflow-finalize", DependsOnID: "wf.body", Type: "blocks"},
+		},
+	}
+
+	plan, graphWorkflow, rootKey, err := buildRecipeApplyPlan(recipe, Options{})
+	if err != nil {
+		t.Fatalf("buildRecipeApplyPlan: %v", err)
+	}
+	if !graphWorkflow {
+		t.Fatal("graphWorkflow = false, want true")
+	}
+	if rootKey != "wf" {
+		t.Fatalf("rootKey = %q, want wf", rootKey)
+	}
+
+	var rootBlocksFinalize bool
+	var bodyTracksRoot bool
+	var finalizeTracksRoot bool
+	for _, edge := range plan.Edges {
+		if edge.Type == "belongs-to" {
+			t.Fatalf("unexpected belongs-to edge in plan: %+v", edge)
+		}
+		if edge.FromKey == "wf" && edge.ToKey == "wf.workflow-finalize" && edge.Type == "blocks" {
+			rootBlocksFinalize = true
+		}
+		if edge.FromKey == "wf.body" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			bodyTracksRoot = true
+		}
+		if edge.FromKey == "wf.workflow-finalize" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			finalizeTracksRoot = true
+		}
+	}
+	if !rootBlocksFinalize {
+		t.Fatal("missing root -> workflow-finalize blocks edge")
+	}
+	if !bodyTracksRoot {
+		t.Fatal("missing body -> root tracks ownership edge")
+	}
+	if !finalizeTracksRoot {
+		t.Fatal("missing workflow-finalize -> root tracks ownership edge")
 	}
 }
 
@@ -270,7 +324,7 @@ func TestInstantiatePriorityOverrideCopiesToAllBeads(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "priority-copy",
 		Steps: []formula.RecipeStep{
-			{ID: "priority-copy", Title: "Root", Type: "epic", IsRoot: true, Priority: priorityPtr(4)},
+			{ID: "priority-copy", Title: "Root", Type: "molecule", IsRoot: true, Priority: priorityPtr(4)},
 			{ID: "priority-copy.step-a", Title: "Step A", Type: "task"},
 			{ID: "priority-copy.step-b", Title: "Step B", Type: "task", Priority: priorityPtr(0)},
 		},
@@ -436,7 +490,7 @@ func TestInstantiateWithParentID(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "child-formula",
 		Steps: []formula.RecipeStep{
-			{ID: "child-formula", Title: "Child", Type: "epic", IsRoot: true},
+			{ID: "child-formula", Title: "Child", Type: "molecule", IsRoot: true},
 		},
 	}
 
@@ -596,7 +650,7 @@ func TestInstantiateWithIdempotencyKey(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "idem-formula",
 		Steps: []formula.RecipeStep{
-			{ID: "idem-formula", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "idem-formula", Title: "Root", Type: "molecule", IsRoot: true},
 		},
 	}
 
@@ -653,13 +707,53 @@ func TestInstantiateFragmentInheritsRootPriority(t *testing.T) {
 	}
 }
 
+func TestBuildFragmentApplyPlan_UsesTracksOwnershipEdges(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "Workflow root",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+
+	recipe := &formula.FragmentRecipe{
+		Steps: []formula.RecipeStep{
+			{ID: "frag.scope", Title: "Scope", Type: "task"},
+			{ID: "frag.work", Title: "Work", Type: "task"},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "frag.work", DependsOnID: "frag.scope", Type: "blocks"},
+		},
+	}
+
+	plan, err := buildFragmentApplyPlan(store, recipe, FragmentOptions{RootID: root.ID})
+	if err != nil {
+		t.Fatalf("buildFragmentApplyPlan: %v", err)
+	}
+
+	tracksToRoot := 0
+	for _, edge := range plan.Edges {
+		if edge.Type == "belongs-to" {
+			t.Fatalf("unexpected belongs-to edge in fragment plan: %+v", edge)
+		}
+		if edge.Type == "tracks" && edge.ToID == root.ID {
+			tracksToRoot++
+		}
+	}
+	if tracksToRoot != len(recipe.Steps) {
+		t.Fatalf("tracks ownership edges = %d, want %d", tracksToRoot, len(recipe.Steps))
+	}
+}
+
 func TestInstantiateRootOnly(t *testing.T) {
 	store := beads.NewMemStore()
 	recipe := &formula.Recipe{
 		Name:     "patrol",
 		RootOnly: true,
 		Steps: []formula.RecipeStep{
-			{ID: "patrol", Title: "Patrol", Type: "epic", IsRoot: true},
+			{ID: "patrol", Title: "Patrol", Type: "molecule", IsRoot: true},
 			{ID: "patrol.scan", Title: "Scan", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -688,7 +782,7 @@ func TestInstantiateVarDefaults(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "var-test",
 		Steps: []formula.RecipeStep{
-			{ID: "var-test", Title: "{{title}}", Type: "epic", IsRoot: true},
+			{ID: "var-test", Title: "{{title}}", Type: "molecule", IsRoot: true},
 			{ID: "var-test.step", Title: "Branch: {{branch}}", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -721,7 +815,7 @@ func TestInstantiateSubstitutesAssigneeVars(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "assignee-vars",
 		Steps: []formula.RecipeStep{
-			{ID: "assignee-vars", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "assignee-vars", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "assignee-vars.step", Title: "Assigned", Type: "task", Assignee: "{{target}}"},
 		},
 		Deps: []formula.RecipeDep{
@@ -743,6 +837,43 @@ func TestInstantiateSubstitutesAssigneeVars(t *testing.T) {
 	}
 	if step.Assignee != "codex" {
 		t.Fatalf("step.Assignee = %q, want codex", step.Assignee)
+	}
+}
+
+func TestInstantiateSubstitutesLabelVars(t *testing.T) {
+	store := beads.NewMemStore()
+	epicDefault := "CLOUD-100"
+	recipe := &formula.Recipe{
+		Name: "label-vars",
+		Steps: []formula.RecipeStep{
+			{ID: "label-vars", Title: "Root", Type: "molecule", IsRoot: true},
+			{ID: "label-vars.step", Title: "Tagged", Type: "task", Labels: []string{"{{epic}}", "review"}},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "label-vars.step", DependsOnID: "label-vars", Type: "parent-child"},
+		},
+		Vars: map[string]*formula.VarDef{
+			"epic": {Description: "Epic label", Default: &epicDefault},
+		},
+	}
+
+	result, err := Instantiate(context.Background(), store, recipe, Options{})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+
+	step, err := store.Get(result.IDMapping["label-vars.step"])
+	if err != nil {
+		t.Fatalf("get step: %v", err)
+	}
+	if len(step.Labels) != 2 {
+		t.Fatalf("step.Labels = %v, want [CLOUD-100 review]", step.Labels)
+	}
+	if step.Labels[0] != "CLOUD-100" {
+		t.Errorf("step.Labels[0] = %q, want CLOUD-100 (substituted)", step.Labels[0])
+	}
+	if step.Labels[1] != "review" {
+		t.Errorf("step.Labels[1] = %q, want review", step.Labels[1])
 	}
 }
 
@@ -784,7 +915,7 @@ func TestInstantiateCreateFailure(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "fail-test",
 		Steps: []formula.RecipeStep{
-			{ID: "fail-test", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "fail-test", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "fail-test.step", Title: "Step", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -824,7 +955,7 @@ func TestInstantiateDepFailure(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "dep-fail",
 		Steps: []formula.RecipeStep{
-			{ID: "dep-fail", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "dep-fail", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "dep-fail.b", Title: "B", Type: "task"},
 			{ID: "dep-fail.a", Title: "A", Type: "task"},
 		},
@@ -968,8 +1099,8 @@ timeout = "2m"
 		t.Fatalf("Cook: %v", err)
 	}
 
-	if result.Created != 4 {
-		t.Fatalf("Created = %d, want 4 (root + design + control + iteration)", result.Created)
+	if result.Created != 5 {
+		t.Fatalf("Created = %d, want 5 (root + design + control + spec + iteration)", result.Created)
 	}
 
 	root, err := store.Get(result.RootID)
@@ -979,6 +1110,10 @@ timeout = "2m"
 	control, err := store.Get(result.IDMapping["ralph-demo.implement"])
 	if err != nil {
 		t.Fatalf("get control: %v", err)
+	}
+	spec, err := store.Get(result.IDMapping["ralph-demo.implement.spec"])
+	if err != nil {
+		t.Fatalf("get spec: %v", err)
 	}
 	iteration, err := store.Get(result.IDMapping["ralph-demo.implement.iteration.1"])
 	if err != nil {
@@ -999,6 +1134,25 @@ timeout = "2m"
 	}
 	if control.Metadata["gc.check_path"] != ".gascity/checks/widget.sh" {
 		t.Fatalf("control gc.check_path = %q, want .gascity/checks/widget.sh", control.Metadata["gc.check_path"])
+	}
+	if _, ok := control.Metadata["gc.source_step_spec"]; ok {
+		t.Fatalf("control still has inline gc.source_step_spec metadata")
+	}
+	if spec.Metadata["gc.kind"] != "spec" {
+		t.Fatalf("spec gc.kind = %q, want spec", spec.Metadata["gc.kind"])
+	}
+	if spec.Metadata["gc.spec_for"] != "implement" {
+		t.Fatalf("spec gc.spec_for = %q, want implement", spec.Metadata["gc.spec_for"])
+	}
+	if spec.Metadata["gc.spec_for_ref"] != "ralph-demo.implement" {
+		t.Fatalf("spec gc.spec_for_ref = %q, want ralph-demo.implement", spec.Metadata["gc.spec_for_ref"])
+	}
+	var frozenSpec formula.Step
+	if err := json.Unmarshal([]byte(spec.Description), &frozenSpec); err != nil {
+		t.Fatalf("unmarshal spec description: %v", err)
+	}
+	if frozenSpec.ID != "implement" {
+		t.Fatalf("frozen spec id = %q, want implement", frozenSpec.ID)
 	}
 	if iteration.Metadata["gc.ralph_step_id"] != "implement" {
 		t.Fatalf("iteration gc.ralph_step_id = %q, want implement", iteration.Metadata["gc.ralph_step_id"])
@@ -1157,4 +1311,147 @@ metadata = { "gc.scope_ref" = "body", "gc.scope_role" = "teardown", "gc.kind" = 
 	if got := finalizer.Metadata["gc.root_bead_id"]; got != result.RootID {
 		t.Fatalf("workflow-finalize gc.root_bead_id = %q, want %q", got, result.RootID)
 	}
+}
+
+func TestInstantiateRejectsResidualTitleVars(t *testing.T) {
+	store := beads.NewMemStore()
+	recipe := &formula.Recipe{
+		Name: "residual-check",
+		Steps: []formula.RecipeStep{
+			{ID: "residual-check", Title: "{{title}}", Type: "molecule", IsRoot: true},
+			{ID: "residual-check.step-a", Title: "[{{epic}}] Implement: {{feature}}", Type: "task"},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "residual-check.step-a", DependsOnID: "residual-check", Type: "parent-child"},
+		},
+		Vars: map[string]*formula.VarDef{
+			"title":   {Description: "Title"},
+			"epic":    {Description: "Epic ID"},
+			"feature": {Description: "Feature slug"},
+		},
+	}
+
+	t.Run("unresolved vars in child title rejected", func(t *testing.T) {
+		_, err := Instantiate(context.Background(), store, recipe, Options{
+			Title: "My Feature",
+			Vars:  map[string]string{"epic": "CLOUD-123"},
+		})
+		if err == nil {
+			t.Fatal("Instantiate should reject unresolved {{feature}} in step title")
+		}
+		if !strings.Contains(err.Error(), "unresolved variable") {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !strings.Contains(err.Error(), "feature") {
+			t.Errorf("error should mention 'feature': %v", err)
+		}
+	})
+
+	t.Run("all vars resolved succeeds", func(t *testing.T) {
+		result, err := Instantiate(context.Background(), store, recipe, Options{
+			Title: "My Feature",
+			Vars:  map[string]string{"epic": "CLOUD-123", "feature": "auth"},
+		})
+		if err != nil {
+			t.Fatalf("Instantiate should succeed: %v", err)
+		}
+		if result.Created != 2 {
+			t.Errorf("Created = %d, want 2", result.Created)
+		}
+	})
+
+	t.Run("root title override bypasses residual check", func(t *testing.T) {
+		// Root step has {{title}} but opts.Title overrides it — should succeed
+		// even without providing the "title" var.
+		result, err := Instantiate(context.Background(), store, &formula.Recipe{
+			Name: "root-override",
+			Steps: []formula.RecipeStep{
+				{ID: "root-override", Title: "{{title}}", Type: "molecule", IsRoot: true},
+			},
+			Vars: map[string]*formula.VarDef{"title": {Description: "Title"}},
+		}, Options{Title: "Overridden"})
+		if err != nil {
+			t.Fatalf("should succeed with title override: %v", err)
+		}
+		if result.Created != 1 {
+			t.Errorf("Created = %d, want 1", result.Created)
+		}
+	})
+
+	t.Run("graph-apply path rejects unresolved vars", func(t *testing.T) {
+		gaStore := &graphApplySpyStore{MemStore: beads.NewMemStore()}
+		GraphApplyEnabled = true
+		t.Cleanup(func() { GraphApplyEnabled = false })
+
+		_, err := Instantiate(context.Background(), gaStore, recipe, Options{
+			Title: "My Feature",
+			Vars:  map[string]string{"epic": "CLOUD-123"},
+		})
+		if err == nil {
+			t.Fatal("graph-apply Instantiate should reject unresolved {{feature}}")
+		}
+		if !strings.Contains(err.Error(), "unresolved variable") {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !strings.Contains(err.Error(), "feature") {
+			t.Errorf("error should mention 'feature': %v", err)
+		}
+	})
+}
+
+func TestInstantiateFragmentRejectsResidualTitleVars(t *testing.T) {
+	fragment := &formula.FragmentRecipe{
+		Name: "frag-residual",
+		Steps: []formula.RecipeStep{
+			{ID: "frag-residual.step-a", Title: "[{{epic}}] Implement: {{feature}}", Type: "task"},
+		},
+		Vars: map[string]*formula.VarDef{
+			"epic":    {Description: "Epic ID"},
+			"feature": {Description: "Feature slug"},
+		},
+	}
+
+	t.Run("sequential path rejects unresolved vars", func(t *testing.T) {
+		store := beads.NewMemStore()
+		root, err := store.Create(beads.Bead{Title: "root", Type: "molecule"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		GraphApplyEnabled = false
+		t.Cleanup(func() { GraphApplyEnabled = false })
+
+		_, err = InstantiateFragment(context.Background(), store, fragment, FragmentOptions{
+			RootID: root.ID,
+			Vars:   map[string]string{"epic": "CLOUD-123"},
+		})
+		if err == nil {
+			t.Fatal("InstantiateFragment should reject unresolved {{feature}}")
+		}
+		if !strings.Contains(err.Error(), "unresolved variable") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("graph-apply path rejects unresolved vars", func(t *testing.T) {
+		gaStore := &graphApplySpyStore{MemStore: beads.NewMemStore()}
+		root, err := gaStore.Create(beads.Bead{Title: "root", Type: "molecule"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		GraphApplyEnabled = true
+		t.Cleanup(func() { GraphApplyEnabled = false })
+
+		_, err = InstantiateFragment(context.Background(), gaStore, fragment, FragmentOptions{
+			RootID: root.ID,
+			Vars:   map[string]string{"epic": "CLOUD-123"},
+		})
+		if err == nil {
+			t.Fatal("graph-apply InstantiateFragment should reject unresolved {{feature}}")
+		}
+		if !strings.Contains(err.Error(), "unresolved variable") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
 }

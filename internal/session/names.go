@@ -270,12 +270,15 @@ func ensureSessionNameAvailableForSelf(store beads.Store, name, selfID string) e
 	if name == "" {
 		return nil
 	}
-	all, err := store.ListByLabel(LabelSession, 0)
+	all, err := store.List(beads.ListQuery{
+		Label:         LabelSession,
+		IncludeClosed: true,
+	})
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 	for _, b := range all {
-		if b.Type != BeadType {
+		if !IsSessionBeadOrRepairable(b) {
 			continue
 		}
 		if b.ID == selfID {
@@ -283,7 +286,16 @@ func ensureSessionNameAvailableForSelf(store beads.Store, name, selfID string) e
 		}
 		// Explicit session names are permanent identities; once claimed by any
 		// session bead, including a closed one, they are never reused.
+		//
+		// Exception: closed beads that belong to a configured named session
+		// (configured_named_session=true) release their session_name so the
+		// reconciler can re-materialize a fresh canonical bead for the same
+		// identity. The design doc specifies: "Closed historical beads do not
+		// poison future canonical materialization of the reserved identity."
 		if strings.TrimSpace(b.Metadata["session_name"]) == name {
+			if b.Status == "closed" && strings.TrimSpace(b.Metadata["configured_named_session"]) == "true" {
+				continue
+			}
 			return fmt.Errorf("%w: %q already belongs to %s", ErrSessionNameExists, name, b.ID)
 		}
 		if b.Status == "closed" {
@@ -354,13 +366,29 @@ func configuredNamedSessionOwnerForSessionName(cfg *config.City, b beads.Bead, r
 
 func ensureConfiguredSessionNameAvailable(store beads.Store, cfg *config.City, name, selfID, selfOwner string) error {
 	if err := ensureSessionNameAvailableForSelf(store, name, selfID); err != nil {
-		return err
+		// When a closed bead blocks the name and the caller is materializing
+		// a configured named session that owns this name, allow it. This
+		// handles legacy beads that predate the configured_named_session flag
+		// and were closed with a terminal reason (orphaned, reconfigured, etc.)
+		// but still hold the session_name. Without this, cold-boot recovery
+		// is permanently blocked by stale closed beads.
+		if !errors.Is(err, ErrSessionNameExists) || cfg == nil || selfOwner == "" {
+			return err
+		}
+		if !isConfiguredNamedSessionRuntimeName(cfg, name, selfOwner) {
+			return err
+		}
+		if !noLiveSessionNameCollisions(store, name, selfID) {
+			return err
+		}
+		// All holders are closed and the name belongs to a configured named
+		// session owned by selfOwner — allow reuse.
 	}
 	if cfg == nil || name == "" {
 		return nil
 	}
 	if selfOwner == "" && selfID != "" {
-		if self, getErr := store.Get(selfID); getErr == nil && self.Type == BeadType {
+		if self, getErr := store.Get(selfID); getErr == nil && IsSessionBeadOrRepairable(self) {
 			selfOwner = configuredNamedSessionOwnerForSessionName(cfg, self, name)
 		}
 	}
@@ -380,6 +408,63 @@ func ensureConfiguredSessionNameAvailable(store beads.Store, cfg *config.City, n
 	return nil
 }
 
+// isConfiguredNamedSessionRuntimeName reports whether name is the runtime
+// session name for a configured named session with the given owner identity.
+func isConfiguredNamedSessionRuntimeName(cfg *config.City, name, owner string) bool {
+	for _, named := range cfg.NamedSessions {
+		reserved := strings.TrimSpace(named.QualifiedName())
+		if reserved == "" || reserved != owner {
+			continue
+		}
+		if config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, reserved) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// noLiveSessionNameCollisions reports whether no live bead conflicts with
+// the given name via session_name, alias, alias_history, or identifier
+// fields. This mirrors the full collision check in
+// ensureSessionNameAvailableForSelf so the legacy-bypass path cannot
+// suppress rejections from live alias or identifier collisions.
+func noLiveSessionNameCollisions(store beads.Store, name, selfID string) bool {
+	all, err := store.List(beads.ListQuery{
+		Label:         LabelSession,
+		IncludeClosed: true,
+	})
+	if err != nil {
+		return false
+	}
+	for _, b := range all {
+		if !IsSessionBeadOrRepairable(b) || b.ID == selfID {
+			continue
+		}
+		// A live bead holding the name as session_name blocks.
+		if strings.TrimSpace(b.Metadata["session_name"]) == name && b.Status != "closed" {
+			return false
+		}
+		if b.Status == "closed" {
+			continue
+		}
+		// Live alias collision blocks.
+		if strings.TrimSpace(b.Metadata["alias"]) == name {
+			return false
+		}
+		// Live alias history collision blocks.
+		for _, historicalAlias := range AliasHistory(b.Metadata) {
+			if historicalAlias == name {
+				return false
+			}
+		}
+		// Live identifier collision blocks.
+		if sessionNameConflictsWithExistingIdentifier(b, name) {
+			return false
+		}
+	}
+	return true
+}
+
 func ensureSessionAliasAvailable(store beads.Store, cfg *config.City, alias, selfID, selfOwner string) error {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
@@ -390,17 +475,19 @@ func ensureSessionAliasAvailable(store beads.Store, cfg *config.City, alias, sel
 		hasSelfBead bool
 	)
 	if cfg != nil && selfID != "" {
-		if self, getErr := store.Get(selfID); getErr == nil && self.Type == BeadType {
+		if self, getErr := store.Get(selfID); getErr == nil && IsSessionBeadOrRepairable(self) {
 			selfBead = self
 			hasSelfBead = true
 		}
 	}
-	all, err := store.ListByLabel(LabelSession, 0)
+	all, err := store.List(beads.ListQuery{
+		Label: LabelSession,
+	})
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 	for _, b := range all {
-		if b.Type != BeadType || b.ID == selfID {
+		if !IsSessionBeadOrRepairable(b) || b.ID == selfID {
 			continue
 		}
 		if b.Status == "closed" {

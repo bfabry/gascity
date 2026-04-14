@@ -268,14 +268,14 @@ func TestDoSlingEnvPassthrough(t *testing.T) {
 func TestShellSlingRunnerOverridesInheritedBDEnv(t *testing.T) {
 	t.Setenv("GC_DOLT_HOST", "stale-host")
 	t.Setenv("GC_DOLT_PORT", "9999")
-	t.Setenv("BEADS_DOLT_HOST", "stale-host")
-	t.Setenv("BEADS_DOLT_PORT", "9999")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "9999")
 
-	out, err := shellSlingRunner("", `printf '%s|%s|%s|%s' "$GC_DOLT_HOST" "$GC_DOLT_PORT" "$BEADS_DOLT_HOST" "$BEADS_DOLT_PORT"`, map[string]string{
-		"GC_DOLT_HOST":    "rig-db.example.com",
-		"GC_DOLT_PORT":    "3307",
-		"BEADS_DOLT_HOST": "rig-db.example.com",
-		"BEADS_DOLT_PORT": "3307",
+	out, err := shellSlingRunner("", `printf '%s|%s|%s|%s' "$GC_DOLT_HOST" "$GC_DOLT_PORT" "$BEADS_DOLT_SERVER_HOST" "$BEADS_DOLT_SERVER_PORT"`, map[string]string{
+		"GC_DOLT_HOST":           "rig-db.example.com",
+		"GC_DOLT_PORT":           "3307",
+		"BEADS_DOLT_SERVER_HOST": "rig-db.example.com",
+		"BEADS_DOLT_SERVER_PORT": "3307",
 	})
 	if err != nil {
 		t.Fatalf("shellSlingRunner: %v", err)
@@ -721,6 +721,25 @@ func (q *fakeChildQuerier) Children(parentID string, _ ...beads.QueryOpt) ([]bea
 		return nil, q.childrenErr
 	}
 	return q.childrenOf[parentID], nil
+}
+
+func (q *fakeChildQuerier) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.ParentID == "" {
+		return nil, beads.ErrQueryRequiresScan
+	}
+	children, err := q.Children(query.ParentID)
+	if err != nil {
+		return nil, err
+	}
+	normalized := make([]beads.Bead, len(children))
+	copy(normalized, children)
+	for i := range normalized {
+		if normalized[i].ParentID == "" {
+			normalized[i].ParentID = query.ParentID
+		}
+	}
+	query.ParentID = ""
+	return beads.ApplyListQuery(normalized, query), nil
 }
 
 func TestCheckBeadStateAssigneeWarns(t *testing.T) {
@@ -1690,7 +1709,7 @@ func TestOnFormulaWithTitle(t *testing.T) {
 }
 
 func TestPokeSupervisorReturnsWithoutWaitingForReloadAck(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", shortSocketTempDir(t, "gc-run-"))
 	runtimeDir := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "gc")
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(%q): %v", runtimeDir, err)
@@ -2811,12 +2830,12 @@ func TestDryRunNilQuerier(t *testing.T) {
 // --- Idempotency detection (checkBeadState + integration) tests ---
 
 func TestCheckBeadStateIdempotentFixedAgent(t *testing.T) {
-	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Assignee: "mayor"}}
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Metadata: map[string]string{"gc.routed_to": "mayor"}}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 
 	result := checkBeadState(q, "BL-42", a)
 	if !result.Idempotent {
-		t.Error("expected Idempotent=true for matching assignee")
+		t.Error("expected Idempotent=true for matching gc.routed_to")
 	}
 	if len(result.Warnings) != 0 {
 		t.Errorf("expected no warnings, got %v", result.Warnings)
@@ -2824,12 +2843,12 @@ func TestCheckBeadStateIdempotentFixedAgent(t *testing.T) {
 }
 
 func TestCheckBeadStateIdempotentPool(t *testing.T) {
-	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Labels: []string{"pool:hw/polecat"}}}
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Metadata: map[string]string{"gc.routed_to": "hw/polecat"}}}
 	a := config.Agent{Name: "polecat", Dir: "hw", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)}
 
 	result := checkBeadState(q, "BL-42", a)
 	if !result.Idempotent {
-		t.Error("expected Idempotent=true for matching pool label")
+		t.Error("expected Idempotent=true for matching gc.routed_to")
 	}
 	if len(result.Warnings) != 0 {
 		t.Errorf("expected no warnings, got %v", result.Warnings)
@@ -2838,14 +2857,15 @@ func TestCheckBeadStateIdempotentPool(t *testing.T) {
 
 func TestCheckBeadStateIdempotentPoolMultiLabels(t *testing.T) {
 	q := &fakeQuerier{bead: beads.Bead{
-		ID:     "BL-42",
-		Labels: []string{"priority:high", "pool:hw/polecat", "sprint:3"},
+		ID:       "BL-42",
+		Labels:   []string{"priority:high", "sprint:3"},
+		Metadata: map[string]string{"gc.routed_to": "hw/polecat"},
 	}}
 	a := config.Agent{Name: "polecat", Dir: "hw", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)}
 
 	result := checkBeadState(q, "BL-42", a)
 	if !result.Idempotent {
-		t.Error("expected Idempotent=true for matching pool label among others")
+		t.Error("expected Idempotent=true for matching gc.routed_to among other labels")
 	}
 }
 
@@ -2902,7 +2922,7 @@ func TestDoSlingIdempotentSkipsRouting(t *testing.T) {
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
-	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Assignee: "mayor"}}
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Metadata: map[string]string{"gc.routed_to": "mayor"}}}
 
 	deps, stdout, _ := testDeps(cfg, sp, runner.run)
 	opts := testOpts(a, "BL-42")
@@ -3541,7 +3561,7 @@ func TestDefaultFormulaApplied(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
 	deps.Store = beads.NewMemStoreFrom(1, []beads.Bead{
@@ -3586,7 +3606,7 @@ func TestDefaultFormulaNoFormulaOverride(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	deps, _, stderr := testDeps(cfg, sp, runner.run)
 	opts := testOpts(a, "HW-42")
@@ -3609,7 +3629,7 @@ func TestDefaultFormulaExplicitOnOverrides(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
 	opts := testOpts(a, "HW-42")
@@ -3637,7 +3657,7 @@ func TestDefaultFormulaExplicitFormulaOverrides(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	deps, _, stderr := testDeps(cfg, sp, runner.run)
 	opts := testOpts(a, "code-review")
@@ -3665,7 +3685,7 @@ func TestDefaultFormulaBatchApplied(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	querier := newFakeChildQuerier()
 	querier.beadsByID["CVY-1"] = beads.Bead{ID: "CVY-1", Type: "convoy", Status: "open"}
@@ -3701,7 +3721,7 @@ func TestDefaultFormulaDryRun(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: "mol-polecat-work"}
+	a := config.Agent{Name: "polecat", Dir: "hw", DefaultSlingFormula: strPtr("mol-polecat-work")}
 
 	deps, stdout, _ := testDeps(cfg, sp, runner.run)
 	opts := testOpts(a, "HW-42")
@@ -4035,6 +4055,18 @@ func TestLooksLikeBeadID(t *testing.T) {
 		{"BL-42a", true},
 		{"g6-53b", true},
 
+		// Valid bead IDs (5-char base36 suffix from bd).
+		{"gc-56nqn", true},
+		{"mp-a1b2c", true},
+
+		// Valid bead IDs (longer base36 hash suffixes from bd, up to 8 chars).
+		{"gc-8bi3tk", true},
+		{"gc-r5sr6bm", true},
+
+		// Valid bead IDs (5-digit numeric suffix from bd counter mode).
+		{"gc-10000", true},
+		{"gc-99999", true},
+
 		// Valid bead IDs (hierarchical / epic children with dot notation).
 		{"ProjectWrenUnity-0fze.1", true},
 		{"gc-42.3", true},
@@ -4052,8 +4084,10 @@ func TestLooksLikeBeadID(t *testing.T) {
 		{"-1", false},
 		{"42-abc", false},      // digits before dash
 		{"BL-", false},         // nothing after dash
-		{"code-review", false}, // multiple words (formula name)
-		{"hello-world", false}, // multiple words
+		{"code-review", false}, // long suffix (6+ chars, formula name)
+		{"hello-world", false}, // all-alpha suffix (no digit), treated as inline text
+		{"hello-there", false}, // all-alpha suffix, not a bead ID
+		{"od-zzzzz", false},    // all-alpha suffix, rare but caught by beadExistsInStore fallback
 	}
 	for _, tt := range tests {
 		got := looksLikeBeadID(tt.input)

@@ -12,8 +12,11 @@ type hiddenMessageStore struct {
 	*beads.MemStore
 }
 
-func (s hiddenMessageStore) List(_ ...string) ([]beads.Bead, error) {
-	all, err := s.ListOpen()
+func (s hiddenMessageStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == "gc:message" {
+		return s.MemStore.List(query)
+	}
+	all, err := s.MemStore.List(beads.ListQuery{AllowScan: true})
 	if err != nil {
 		return nil, err
 	}
@@ -23,7 +26,114 @@ func (s hiddenMessageStore) List(_ ...string) ([]beads.Bead, error) {
 			filtered = append(filtered, b)
 		}
 	}
-	return filtered, nil
+	return beads.ApplyListQuery(filtered, query), nil
+}
+
+// noListScanStore errors when List is called without a filter, proving that
+// Inbox/Count/All use targeted queries (assignee+type or label) instead
+// of broad scans.
+type noListScanStore struct {
+	*beads.MemStore
+}
+
+func (s noListScanStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if !query.HasFilter() {
+		return nil, errors.New("unfiltered List() must not be called — use targeted queries")
+	}
+	return s.MemStore.List(query)
+}
+
+func TestInboxDoesNotCallBroadList(t *testing.T) {
+	base := beads.NewMemStore()
+	p := New(noListScanStore{MemStore: base})
+
+	if _, err := p.Send("human", "mayor", "", "targeted"); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := p.Inbox("mayor")
+	if err != nil {
+		t.Fatalf("Inbox should use targeted queries: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("Inbox = %d messages, want 1", len(msgs))
+	}
+}
+
+func TestCountDoesNotCallBroadList(t *testing.T) {
+	base := beads.NewMemStore()
+	p := New(noListScanStore{MemStore: base})
+
+	if _, err := p.Send("human", "mayor", "", "count me"); err != nil {
+		t.Fatal(err)
+	}
+
+	total, unread, err := p.Count("mayor")
+	if err != nil {
+		t.Fatalf("Count should use targeted queries: %v", err)
+	}
+	if total != 1 || unread != 1 {
+		t.Errorf("Count = (%d, %d), want (1, 1)", total, unread)
+	}
+}
+
+func TestAllDoesNotCallBroadList(t *testing.T) {
+	base := beads.NewMemStore()
+	p := New(noListScanStore{MemStore: base})
+
+	if _, err := p.Send("human", "mayor", "", "all msg"); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := p.All("mayor")
+	if err != nil {
+		t.Fatalf("All should use targeted queries: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("All = %d messages, want 1", len(msgs))
+	}
+}
+
+// --- Empty-recipient (global) path ---
+
+func TestCountEmptyRecipient(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	if _, err := p.Send("human", "mayor", "", "msg1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send("human", "deacon", "", "msg2"); err != nil {
+		t.Fatal(err)
+	}
+
+	total, unread, err := p.Count("")
+	if err != nil {
+		t.Fatalf("Count empty recipient: %v", err)
+	}
+	if total != 2 || unread != 2 {
+		t.Errorf("Count(\"\") = (%d, %d), want (2, 2)", total, unread)
+	}
+}
+
+func TestAllEmptyRecipient(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	if _, err := p.Send("human", "mayor", "", "msg1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send("human", "deacon", "", "msg2"); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := p.All("")
+	if err != nil {
+		t.Fatalf("All empty recipient: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("All(\"\") = %d messages, want 2", len(msgs))
+	}
 }
 
 // --- Send ---

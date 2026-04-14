@@ -87,8 +87,8 @@ Agent defines a configured agent in the city.
 | `on_boot` | string |  |  | OnBoot is a shell command run once at controller startup for this agent. |
 | `on_death` | string |  |  | OnDeath is a shell command run when a session dies unexpectedly. |
 | `namepool` | string |  |  | Namepool is the path to a plain text file with one name per line. When set, sessions use names from the file as display aliases. |
-| `work_query` | string |  |  | WorkQuery is the shell command to find available work for this agent. Used by gc hook and available in prompt templates as &#123;&#123;.WorkQuery&#125;&#125;. Default for fixed agents: "bd ready --assignee=&lt;qualified-name&gt;". Default for pool agents: "bd ready --metadata-field gc.routed_to=&lt;qualified-name&gt; --unassigned --json --limit=1 2&gt;/dev/null". Override to integrate with external task systems. |
-| `sling_query` | string |  |  | SlingQuery is the command template to route a bead to this agent/pool. Used by gc sling to make a bead visible to the target's work_query. The placeholder &#123;&#125; is replaced with the bead ID at runtime. Default for fixed agents: "bd update &#123;&#125; --assignee=&lt;qualified-name&gt;". Default for pool agents: "bd update &#123;&#125; --add-label=pool:&lt;qualified-name&gt;". Pool agents must set both sling_query and work_query, or neither. |
+| `work_query` | string |  |  | WorkQuery is the shell command to find available work for this agent. Used by gc hook and available in prompt templates as &#123;&#123;.WorkQuery&#125;&#125;. If unset, Gas City uses a three-tier default query:   1. in_progress work assigned to this session/alias (crash recovery)   2. ready work assigned to this session/alias (pre-assigned work)   3. ready unassigned work with gc.routed_to=&lt;qualified-name&gt; When the controller probes for demand without session context, only the routed_to tier applies. Override to integrate with external task systems. |
+| `sling_query` | string |  |  | SlingQuery is the command template to route a bead to this agent/pool. Used by gc sling to make a bead visible to the target's work_query. The placeholder &#123;&#125; is replaced with the bead ID at runtime. Default for all agents: "bd update &#123;&#125; --set-metadata gc.routed_to=&lt;qualified-name&gt;". Routing is metadata-based; sling stamps the target template and the reconciler/scale_check paths decide when sessions are created. Pool agents must set both sling_query and work_query, or neither. |
 | `idle_timeout` | string |  |  | IdleTimeout is the maximum time an agent session can be inactive before the controller kills and restarts it. Duration string (e.g., "15m", "1h"). Empty (default) disables idle checking. |
 | `sleep_after_idle` | string |  |  | SleepAfterIdle overrides idle sleep policy for this agent. Accepts a duration string (e.g., "30s") or "off". |
 | `install_agent_hooks` | []string |  |  | InstallAgentHooks overrides workspace-level install_agent_hooks for this agent. When set, replaces (not adds to) the workspace default. |
@@ -113,6 +113,7 @@ AgentDefaults provides default values applied to all agents that don't explicitl
 |-------|------|----------|---------|-------------|
 | `model` | string |  |  | Model is the default model name for agents (e.g., "claude-sonnet-4-6"). Agents with their own model override take precedence. |
 | `wake_mode` | string |  |  | WakeMode is the default wake mode ("resume" or "fresh"). Enum: `resume`, `fresh` |
+| `default_sling_formula` | string |  |  | DefaultSlingFormula is the city-level default formula used for agents that inherit [agent_defaults]. Explicit agents only receive this value when agent_defaults.default_sling_formula is set; implicit pool agents are seeded with "mol-do-work" elsewhere when no explicit default is set. |
 | `allow_overlay` | []string |  |  | AllowOverlay lists template fields that sessions may override at creation time (e.g., ["model", "prompt", "title"]). |
 | `allow_env_override` | []string |  |  | AllowEnvOverride lists environment variable names that sessions may override at creation time. Names must match ^[A-Z][A-Z0-9_]&#123;0,127&#125;$. |
 
@@ -158,6 +159,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
 | `scale_check` | string |  |  | ScaleCheck overrides the shell command whose output determines desired session count. |
+| `option_defaults` | map[string]string |  |  | OptionDefaults adds or overrides provider option defaults for this agent. Keys are option keys, values are choice values. Merges additively (override keys win over existing agent keys). Example: option_defaults = &#123; model = "sonnet" &#125; |
 
 ## AgentPatch
 
@@ -201,6 +203,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
 | `scale_check` | string |  |  | ScaleCheck overrides the shell command whose output determines desired session count. |
+| `option_defaults` | map[string]string |  |  | OptionDefaults adds or overrides provider option defaults for this agent. Keys are option keys, values are choice values. Merges additively (patch keys win over existing agent keys). Example: option_defaults = &#123; model = "sonnet" &#125; |
 
 ## BeadsConfig
 
@@ -243,6 +246,7 @@ DaemonConfig holds controller daemon settings.
 | `wisp_ttl` | string |  |  | WispTTL is how long a closed molecule survives before being purged. Duration string (e.g., "24h", "7d"). Wisp GC is disabled unless both WispGCInterval and WispTTL are set. |
 | `drift_drain_timeout` | string |  | `2m` | DriftDrainTimeout is the maximum time to wait for an agent to acknowledge a drain signal during a config-drift restart. If the agent doesn't ack within this window, the controller force-kills and restarts it. Duration string (e.g., "2m", "5m"). Defaults to "2m". |
 | `observe_paths` | []string |  |  | ObservePaths lists extra directories to search for Claude JSONL session files (e.g., aimux session paths). The default search path (~/.claude/projects/) is always included. |
+| `probe_concurrency` | integer |  | `8` | ProbeConcurrency bounds the number of concurrent bd subprocess probes issued by the pool scale_check and work_query paths. bd serializes on a shared dolt sql-server, so unbounded parallelism causes contention. Nil (unset) defaults to 8. Set higher for workspaces with a fast dedicated dolt server, or lower to reduce contention on slow storage. |
 
 ## DoltConfig
 
@@ -420,6 +424,7 @@ ProviderSpec defines a named provider's startup parameters.
 | `path_check` | string |  |  | PathCheck overrides the binary name used for PATH detection. When set, lookupProvider and detectProviderName use this instead of Command for exec.LookPath checks. Useful when Command is a shell wrapper (e.g. sh -c '...') but we need to verify the real binary is installed. |
 | `supports_acp` | boolean |  |  | SupportsACP indicates the binary speaks the Agent Client Protocol (JSON-RPC 2.0 over stdio). When an agent sets session = "acp", its resolved provider must have SupportsACP = true. |
 | `supports_hooks` | boolean |  |  | SupportsHooks indicates the provider has an executable hook mechanism (settings.json, plugins, etc.) for lifecycle events. |
+| `needs_nudge_poller` | boolean |  |  | NeedsNudgePoller indicates the provider cannot drain queued nudges via turn-boundary hooks (like Claude's UserPromptSubmit) and requires a background poller that delivers on idle quiescence. Codex is the canonical case. See engdocs/architecture/nudge-delivery.md. |
 | `instructions_file` | string |  |  | InstructionsFile is the filename the provider reads for project instructions (e.g., "CLAUDE.md", "AGENTS.md"). Empty defaults to "AGENTS.md". |
 | `resume_flag` | string |  |  | ResumeFlag is the CLI flag for resuming a session by ID. Empty means the provider does not support resume. Examples: "--resume" (claude), "resume" (codex) |
 | `resume_style` | string |  |  | ResumeStyle controls how ResumeFlag is applied:   "flag"       → command --resume &lt;key&gt;              (default)   "subcommand" → command resume &lt;key&gt; |
@@ -448,7 +453,7 @@ Rig defines an external project registered in the city.
 | `default_sling_target` | string |  |  | DefaultSlingTarget is the agent qualified name used when gc sling is invoked with only a bead ID (no explicit target). Resolved via resolveAgentIdentity. Example: "rig/polecat" |
 | `session_sleep` | SessionSleepConfig |  |  | SessionSleep overrides workspace-level idle sleep defaults for agents in this rig. |
 | `dolt_host` | string |  |  | DoltHost overrides the city-level Dolt host for this rig's beads. Use when the rig's database lives on a different Dolt server (e.g., shared from another city). |
-| `dolt_port` | string |  |  | DoltPort overrides the city-level Dolt port for this rig's beads. When set, controller commands (scale_check, work_query) prefix their shell invocations with BEADS_DOLT_PORT=&lt;port&gt; so bd connects to the correct server instead of the city-level default. |
+| `dolt_port` | string |  |  | DoltPort overrides the city-level Dolt port for this rig's beads. When set, controller commands (scale_check, work_query) prefix their shell invocations with BEADS_DOLT_SERVER_PORT=&lt;port&gt; so bd connects to the correct server instead of the city-level default. |
 
 ## RigPatch
 

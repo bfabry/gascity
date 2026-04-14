@@ -28,6 +28,12 @@ type Fake struct {
 	Responses            map[string][]InteractionResponse
 	SleepCapabilityValue SessionSleepCapability
 	WaitForIdleErrors    map[string]error
+	// WaitForIdleGates blocks WaitForIdle on a per-name channel until the
+	// caller closes it. A nil or absent entry returns the configured
+	// WaitForIdleErrors value immediately. The gate is read under f.mu
+	// and the lock is released before the block, so other Fake methods
+	// remain callable while a probe is gated.
+	WaitForIdleGates map[string]chan struct{}
 }
 
 // Call records a single method invocation on [Fake].
@@ -57,6 +63,7 @@ func NewFake() *Fake {
 		Responses:            make(map[string][]InteractionResponse),
 		SleepCapabilityValue: SessionSleepCapabilityFull,
 		WaitForIdleErrors:    make(map[string]error),
+		WaitForIdleGates:     make(map[string]chan struct{}),
 	}
 }
 
@@ -74,6 +81,7 @@ func NewFailFake() *Fake {
 		Responses:            make(map[string][]InteractionResponse),
 		SleepCapabilityValue: SessionSleepCapabilityFull,
 		WaitForIdleErrors:    make(map[string]error),
+		WaitForIdleGates:     make(map[string]chan struct{}),
 		broken:               true,
 	}
 }
@@ -199,6 +207,22 @@ func (f *Fake) Nudge(name string, content []ContentBlock) error {
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, Call{
 		Method:  "Nudge",
+		Name:    name,
+		Message: FlattenText(content),
+		Content: content,
+	})
+	if f.broken {
+		return fmt.Errorf("session unavailable")
+	}
+	return nil
+}
+
+// NudgeNow records the call and returns nil (or an error if broken).
+func (f *Fake) NudgeNow(name string, content []ContentBlock) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, Call{
+		Method:  "NudgeNow",
 		Name:    name,
 		Message: FlattenText(content),
 		Content: content,
@@ -385,17 +409,30 @@ func (f *Fake) ClearScrollback(name string) error {
 	return nil
 }
 
-// WaitForIdle records the call and returns the configured result.
-func (f *Fake) WaitForIdle(_ context.Context, name string, _ time.Duration) error {
+// WaitForIdle records the call and returns the configured result. When
+// WaitForIdleGates[name] is set, the method releases f.mu and blocks on
+// the gate (or ctx cancellation) before returning, giving tests
+// deterministic control over when the call completes.
+func (f *Fake) WaitForIdle(ctx context.Context, name string, _ time.Duration) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, Call{Method: "WaitForIdle", Name: name})
 	if f.broken {
+		f.mu.Unlock()
 		return fmt.Errorf("session unavailable")
 	}
 	err, ok := f.WaitForIdleErrors[name]
 	if !ok {
+		f.mu.Unlock()
 		return ErrInteractionUnsupported
+	}
+	gate := f.WaitForIdleGates[name]
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return err
 }

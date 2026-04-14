@@ -31,6 +31,7 @@
 #   GC_K8S_MEM_REQUEST - Pod memory request (default: 1Gi)
 #   GC_K8S_CPU_LIMIT   - Pod CPU limit (default: 2)
 #   GC_K8S_MEM_LIMIT   - Pod memory limit (default: 4Gi)
+#   GC_K8S_SERVICE_ACCOUNT - Pod service account name (default: namespace default)
 
 set -euo pipefail
 
@@ -52,6 +53,7 @@ CPU_REQ="${GC_K8S_CPU_REQUEST:-500m}"
 MEM_REQ="${GC_K8S_MEM_REQUEST:-1Gi}"
 CPU_LIM="${GC_K8S_CPU_LIMIT:-2}"
 MEM_LIM="${GC_K8S_MEM_LIMIT:-4Gi}"
+SERVICE_ACCOUNT="${GC_K8S_SERVICE_ACCOUNT:-}"
 
 # Build kubectl base command with optional context.
 KUBECTL=(kubectl)
@@ -228,7 +230,9 @@ case "$op" in
       --arg mcp_mail_project "$mail_project" \
       --arg tmux_session "$TMUX_SESSION" \
       --arg pod_dir "$pod_work_dir" '
-      del(.GC_DOLT_HOST, .GC_DOLT_PORT, .GC_BEADS, .GC_SESSION, .GC_EVENTS,
+      del(.GC_DOLT_HOST, .GC_DOLT_PORT,
+          .BEADS_DOLT_SERVER_HOST, .BEADS_DOLT_SERVER_PORT,
+          .GC_BEADS, .GC_SESSION, .GC_EVENTS,
           .GC_MAIL, .GC_MCP_MAIL_URL, .GC_MCP_MAIL_PROJECT)
       | .GC_CITY = "/workspace" | .GC_DIR = $pod_dir
       | to_entries
@@ -299,6 +303,7 @@ case "$op" in
         --arg cpu_lim "$CPU_LIM" \
         --arg mem_lim "$MEM_LIM" \
         --arg work_dir "$pod_work_dir" \
+        --arg sa "$SERVICE_ACCOUNT" \
         --argjson env "$env_array" \
         "${extra_jq_args[@]}" \
         '{
@@ -317,6 +322,7 @@ case "$op" in
             }
           },
           spec: {
+            serviceAccountName: $sa,
             restartPolicy: "Never",
             initContainers: [{
               name: "stage",
@@ -365,6 +371,7 @@ case "$op" in
         --arg cpu_lim "$CPU_LIM" \
         --arg mem_lim "$MEM_LIM" \
         --arg work_dir "$pod_work_dir" \
+        --arg sa "$SERVICE_ACCOUNT" \
         --argjson env "$env_array" \
         "${extra_jq_args[@]}" \
         '{
@@ -383,6 +390,7 @@ case "$op" in
             }
           },
           spec: {
+            serviceAccountName: $sa,
             restartPolicy: "Never",
             containers: [{
               name: "agent",

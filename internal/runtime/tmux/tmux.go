@@ -1144,7 +1144,7 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
+// Uses: literal mode + 500ms debounce + separate Enter.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
 //
@@ -1178,10 +1178,15 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
 
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", target, "Escape")
-	time.Sleep(100 * time.Millisecond)
+	// 3. Send Escape only for TUIs where it's an insert-mode escape, not a
+	// semantic input key. Claude, Codex, and Gemini all treat Escape as a
+	// semantic control key in some busy states, so default submit must not
+	// synthesize it for them.
+	if t.shouldSendEscapeBeforeEnter(target) {
+		// See: https://github.com/anthropics/gastown/issues/307
+		_, _ = t.run("send-keys", "-t", target, "Escape")
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// 4. Send Enter with retry (critical for message submission)
 	var lastErr error
@@ -1220,10 +1225,11 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
 
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", pane, "Escape")
-	time.Sleep(100 * time.Millisecond)
+	// 3. See NudgeSession for why Escape is provider-specific.
+	if t.shouldSendEscapeBeforeEnter(pane) {
+		_, _ = t.run("send-keys", "-t", pane, "Escape")
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// 4. Send Enter with retry (critical for message submission)
 	var lastErr error
@@ -1240,6 +1246,35 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		return nil
 	}
 	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+}
+
+func (t *Tmux) shouldSendEscapeBeforeEnter(target string) bool {
+	provider, err := t.GetEnvironment(target, "GC_PROVIDER")
+	if err == nil {
+		switch strings.TrimSpace(provider) {
+		case "claude", "codex", "gemini":
+			return false
+		default:
+			// Unrecognized provider (custom alias) — fall through to
+			// process-tree detection instead of assuming escape is needed.
+		}
+	}
+	if t.targetLooksLikeNoEscapeProvider(target) {
+		return false
+	}
+	return true
+}
+
+func (t *Tmux) targetLooksLikeNoEscapeProvider(target string) bool {
+	noEscapeProviders := []string{"claude", "codex", "gemini"}
+	pid, err := t.GetPanePID(target)
+	if err != nil || strings.TrimSpace(pid) == "" {
+		return false
+	}
+	if processMatchesNames(pid, noEscapeProviders) {
+		return true
+	}
+	return hasDescendantWithNames(pid, noEscapeProviders, 0)
 }
 
 // AcceptStartupDialogs dismisses all Claude Code startup dialogs that can block
@@ -1432,19 +1467,44 @@ func (t *Tmux) IsSessionRunning(session string) bool {
 	return !dead
 }
 
-// GetSessionActivity returns the last activity time for a session.
-// This is updated whenever there's any activity in the session (input/output).
+// GetSessionActivity returns the last meaningful activity time for a session.
+//
+// For detached agent sessions, tmux's #{session_activity} does not advance on
+// pane I/O — it effectively sticks to creation/attach time. Query per-window
+// activity instead and take the most recent timestamp so detached output and
+// send-keys both count as activity.
 func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
-	out, err := t.run("display-message", "-t", session, "-p", "#{session_activity}")
+	out, err := t.run("list-windows", "-t", session, "-F", "#{window_activity}")
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	timestamp, err := latestActivityTimestamp(out)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+		return time.Time{}, err
 	}
 	return time.Unix(timestamp, 0), nil
+}
+
+func latestActivityTimestamp(out string) (int64, error) {
+	var latest int64
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		timestamp, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parsing window activity %q: %w", line, err)
+		}
+		if timestamp > latest {
+			latest = timestamp
+		}
+	}
+	if latest == 0 {
+		return 0, fmt.Errorf("parsing window activity: no timestamps found")
+	}
+	return latest, nil
 }
 
 // ZombieStatus describes the liveness state of a tmux agent session.
@@ -1528,6 +1588,11 @@ func processMatchesNames(pid string, names []string) bool {
 	if len(names) == 0 {
 		return false
 	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		nameSet[name] = struct{}{}
+	}
+
 	// Use ps to get the command name (COMM column gives the executable name)
 	cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
 	out, err := cmd.Output()
@@ -1537,11 +1602,58 @@ func processMatchesNames(pid string, names []string) bool {
 	// Get just the base name (in case it's a full path like /Users/.../claude)
 	commPath := strings.TrimSpace(string(out))
 	comm := filepath.Base(commPath)
+	if _, ok := nameSet[comm]; ok {
+		return true
+	}
 
-	// Check if any name matches
-	for _, name := range names {
-		if comm == name {
-			return true
+	// Fall back to argv[0] from the full command line. This catches wrapper
+	// scripts launched as "/path/to/codex" where COMM may report "bash" or
+	// another interpreter instead of the provider name.
+	cmd = exec.Command("ps", "-p", pid, "-o", "args=")
+	out, err = cmd.Output()
+	if err != nil {
+		return false
+	}
+	args := strings.Fields(strings.TrimSpace(string(out)))
+	if len(args) == 0 {
+		return false
+	}
+	argv0 := filepath.Base(args[0])
+	if _, ok := nameSet[argv0]; ok {
+		return true
+	}
+
+	// Wrapper runtimes often execute providers through interpreters such as bun,
+	// node, or npx, leaving the actual provider name only in the first positional
+	// argument. Only check the first non-flag argument after a known interpreter
+	// to avoid false positives (e.g., "vim claude.txt" or "tail -f gemini.log").
+	knownInterpreters := map[string]struct{}{
+		"node": {}, "bun": {}, "npx": {}, "deno": {},
+	}
+	// Runner subcommands (e.g., "bun run gemini") that should be skipped
+	// when scanning for the provider name in positional args.
+	runnerSubcommands := map[string]struct{}{
+		"run": {}, "exec": {}, "x": {},
+	}
+	if _, isInterpreter := knownInterpreters[argv0]; isInterpreter {
+		for _, token := range args[1:] {
+			token = strings.TrimSpace(token)
+			if token == "" || strings.HasPrefix(token, "-") {
+				continue
+			}
+			// Skip known runner subcommands like "run" in "bun run gemini".
+			if _, isRunner := runnerSubcommands[token]; isRunner {
+				continue
+			}
+			base := filepath.Base(token)
+			if _, ok := nameSet[base]; ok {
+				return true
+			}
+			baseNoExt := strings.TrimSuffix(base, filepath.Ext(base))
+			if _, ok := nameSet[baseNoExt]; ok {
+				return true
+			}
+			break // only check the first positional argument
 		}
 	}
 	return false
@@ -1555,37 +1667,23 @@ func hasDescendantWithNames(pid string, names []string, depth int) bool {
 	if len(names) == 0 || depth > maxDepth {
 		return false
 	}
-	// Use pgrep to find child processes
-	cmd := exec.Command("pgrep", "-P", pid, "-l")
+	// Use pgrep to find child processes.
+	cmd := exec.Command("pgrep", "-P", pid)
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	// Build a set of names for fast lookup
-	nameSet := make(map[string]bool, len(names))
-	for _, n := range names {
-		nameSet[n] = true
-	}
-	// Check if any child matches, or recursively check grandchildren
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		childPid := strings.TrimSpace(line)
+		if childPid == "" {
 			continue
 		}
-		// Format: "PID name" e.g., "29677 node"
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			childPid := parts[0]
-			childName := parts[1]
-			// Direct match
-			if nameSet[childName] {
-				return true
-			}
-			// Recursive check of descendants
-			if hasDescendantWithNames(childPid, names, depth+1) {
-				return true
-			}
+		if processMatchesNames(childPid, names) {
+			return true
+		}
+		if hasDescendantWithNames(childPid, names, depth+1) {
+			return true
 		}
 	}
 	return false
@@ -2026,7 +2124,17 @@ func (t *Tmux) WaitForRuntimeReady(ctx context.Context, session string, rc *Runt
 
 // DefaultReadyPromptPrefix is the Claude Code prompt prefix used for idle detection.
 // Claude Code uses ❯ (U+276F) as the prompt character.
-const DefaultReadyPromptPrefix = "❯ "
+const (
+	DefaultReadyPromptPrefix = "❯ "
+	sessionReadyPromptEnvKey = "GC_READY_PROMPT_PREFIX"
+)
+
+func idlePromptPrefix(configured string) string {
+	if strings.TrimSpace(configured) != "" {
+		return configured
+	}
+	return DefaultReadyPromptPrefix
+}
 
 // WaitForIdle polls until the agent appears to be at an idle prompt.
 // Unlike WaitForRuntimeReady (which is for bootstrap), this is for steady-state
@@ -2041,6 +2149,9 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Duration) error {
 	promptPrefix := DefaultReadyPromptPrefix
+	if configured, err := t.GetEnvironment(session, sessionReadyPromptEnvKey); err == nil {
+		promptPrefix = idlePromptPrefix(configured)
+	}
 	prefix := strings.TrimSpace(promptPrefix)
 
 	consecutiveIdle := 0
@@ -2123,7 +2234,9 @@ func waitForIdlePoll(ctx context.Context, d time.Duration) error {
 // the status bar while running tools or generating responses.
 func paneContainsBusyIndicator(lines []string) bool {
 	for _, line := range lines {
-		if strings.Contains(line, "esc to interrupt") {
+		if strings.Contains(line, "esc to interrupt") ||
+			strings.Contains(line, "Press Esc or Ctrl+C to cancel") ||
+			strings.Contains(line, "[current working directory ") {
 			return true
 		}
 	}

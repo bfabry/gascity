@@ -11,6 +11,8 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
+func strPtr(s string) *string { return &s }
+
 func TestDefaultCity(t *testing.T) {
 	c := DefaultCity("bright-lights")
 	if c.Workspace.Name != "bright-lights" {
@@ -24,9 +26,6 @@ func TestDefaultCity(t *testing.T) {
 	}
 	if c.Agents[0].PromptTemplate != "prompts/mayor.md" {
 		t.Errorf("Agents[0].PromptTemplate = %q, want %q", c.Agents[0].PromptTemplate, "prompts/mayor.md")
-	}
-	if c.Agents[0].MaxActiveSessions == nil || *c.Agents[0].MaxActiveSessions != 1 {
-		t.Errorf("Agents[0].MaxActiveSessions = %v, want 1", c.Agents[0].MaxActiveSessions)
 	}
 }
 
@@ -81,7 +80,7 @@ func TestMarshalDefaultCityFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	want := "[workspace]\nname = \"bright-lights\"\n\n[[agent]]\nname = \"mayor\"\nprompt_template = \"prompts/mayor.md\"\nmax_active_sessions = 1\n\n[[named_session]]\ntemplate = \"mayor\"\nmode = \"always\"\n"
+	want := "[workspace]\nname = \"bright-lights\"\n\n[[agent]]\nname = \"mayor\"\nprompt_template = \"prompts/mayor.md\"\n\n[[named_session]]\ntemplate = \"mayor\"\nmode = \"always\"\n"
 	if string(data) != want {
 		t.Errorf("Marshal output:\ngot:\n%s\nwant:\n%s", data, want)
 	}
@@ -619,9 +618,6 @@ func TestWizardCity(t *testing.T) {
 	if c.Agents[0].PromptTemplate != "prompts/mayor.md" {
 		t.Errorf("Agents[0].PromptTemplate = %q, want %q", c.Agents[0].PromptTemplate, "prompts/mayor.md")
 	}
-	if c.Agents[0].MaxActiveSessions == nil || *c.Agents[0].MaxActiveSessions != 1 {
-		t.Errorf("Agents[0].MaxActiveSessions = %v, want 1", c.Agents[0].MaxActiveSessions)
-	}
 }
 
 func TestWizardCityMarshal(t *testing.T) {
@@ -636,9 +632,6 @@ func TestWizardCityMarshal(t *testing.T) {
 	}
 	if !strings.Contains(s, `name = "mayor"`) {
 		t.Errorf("Marshal output missing mayor agent:\n%s", s)
-	}
-	if !strings.Contains(s, `max_active_sessions = 1`) {
-		t.Errorf("Marshal output missing singleton mayor cap:\n%s", s)
 	}
 	// Round-trip parse.
 	got, err := Parse(data)
@@ -1325,8 +1318,8 @@ func TestDefaultPoolCheckUsesBdReady(t *testing.T) {
 	if !strings.Contains(check, "--status=in_progress") {
 		t.Errorf("EffectiveScaleCheck() = %q, want --status=in_progress for active work", check)
 	}
-	if !strings.Contains(check, "--no-assignee") {
-		t.Errorf("EffectiveScaleCheck() = %q, want --no-assignee for active routed work", check)
+	if !strings.Contains(check, "--type=molecule") {
+		t.Errorf("EffectiveScaleCheck() = %q, want --type=molecule for formula-dispatched work", check)
 	}
 }
 
@@ -1420,7 +1413,7 @@ func TestEffectiveScaleCheckDefaults(t *testing.T) {
 		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(1),
 	}
 	check := a.EffectiveScaleCheck()
-	// Default check uses bd ready (blocker-aware) + in_progress count via gc.routed_to.
+	// Default check uses bd ready (blocker-aware) + in_progress count + molecule count via gc.routed_to.
 	if !strings.Contains(check, "gc.routed_to=refinery") {
 		t.Errorf("EffectiveScaleCheck = %q, want gc.routed_to=refinery", check)
 	}
@@ -1428,7 +1421,13 @@ func TestEffectiveScaleCheckDefaults(t *testing.T) {
 		t.Errorf("EffectiveScaleCheck = %q, want --status=in_progress for active work", check)
 	}
 	if !strings.Contains(check, "--no-assignee") {
-		t.Errorf("EffectiveScaleCheck = %q, want --no-assignee for active routed work", check)
+		t.Errorf("EffectiveScaleCheck = %q, want --no-assignee for active unassigned work", check)
+	}
+	if !strings.Contains(check, "--type=molecule") {
+		t.Errorf("EffectiveScaleCheck = %q, want --type=molecule for formula-dispatched work", check)
+	}
+	if !strings.Contains(check, "${molecules:-0}") {
+		t.Errorf("EffectiveScaleCheck = %q, want ${molecules:-0} in arithmetic sum", check)
 	}
 }
 
@@ -1447,7 +1446,48 @@ func TestEffectiveScaleCheckDefaultsQualified(t *testing.T) {
 		t.Errorf("EffectiveScaleCheck = %q, want --status=in_progress for active work", check)
 	}
 	if !strings.Contains(check, "--no-assignee") {
-		t.Errorf("EffectiveScaleCheck = %q, want --no-assignee for active routed work", check)
+		t.Errorf("EffectiveScaleCheck = %q, want --no-assignee for active unassigned work", check)
+	}
+	if !strings.Contains(check, "--type=molecule") {
+		t.Errorf("EffectiveScaleCheck = %q, want --type=molecule for formula-dispatched work", check)
+	}
+}
+
+func TestEffectiveScaleCheckMoleculeQuery(t *testing.T) {
+	// Regression test for GH #505: default scale check must detect
+	// formula-dispatched molecule beads that bd ready excludes.
+	a := Agent{
+		Name:              "worker",
+		Dir:               "myrig",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(3),
+	}
+	check := a.EffectiveScaleCheck()
+
+	// Must contain three separate queries summed together.
+	if !strings.Contains(check, "bd ready") {
+		t.Errorf("missing bd ready query for blocker-aware task counting")
+	}
+	if !strings.Contains(check, "--status=in_progress") {
+		t.Errorf("missing in_progress query for active work")
+	}
+	if !strings.Contains(check, "--status=open --type=molecule") {
+		t.Errorf("missing molecule query for formula-dispatched work (GH #505)")
+	}
+
+	// All three variables must appear in the arithmetic sum.
+	if !strings.Contains(check, "${ready:-0}") {
+		t.Errorf("missing ${ready:-0} in arithmetic sum")
+	}
+	if !strings.Contains(check, "${active:-0}") {
+		t.Errorf("missing ${active:-0} in arithmetic sum")
+	}
+	if !strings.Contains(check, "${molecules:-0}") {
+		t.Errorf("missing ${molecules:-0} in arithmetic sum")
+	}
+
+	// Molecule query must use the qualified name for routing.
+	if !strings.Contains(check, "gc.routed_to=myrig/worker") {
+		t.Errorf("molecule query missing gc.routed_to=myrig/worker")
 	}
 }
 
@@ -2005,6 +2045,70 @@ name = "mayor"
 	got := cfg.Daemon.DriftDrainTimeoutDuration()
 	if got != 3*time.Minute {
 		t.Errorf("DriftDrainTimeoutDuration() = %v, want 3m", got)
+	}
+}
+
+// --- ProbeConcurrency tests ---
+
+func TestDaemonProbeConcurrencyDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.ProbeConcurrencyOrDefault()
+	if got != DefaultProbeConcurrency {
+		t.Errorf("ProbeConcurrencyOrDefault() = %d, want %d", got, DefaultProbeConcurrency)
+	}
+}
+
+func TestDaemonProbeConcurrencyExplicit(t *testing.T) {
+	v := 16
+	d := DaemonConfig{ProbeConcurrency: &v}
+	got := d.ProbeConcurrencyOrDefault()
+	if got != 16 {
+		t.Errorf("ProbeConcurrencyOrDefault() = %d, want 16", got)
+	}
+}
+
+func TestDaemonProbeConcurrencyZeroClamped(t *testing.T) {
+	v := 0
+	d := DaemonConfig{ProbeConcurrency: &v}
+	got := d.ProbeConcurrencyOrDefault()
+	if got != 1 {
+		t.Errorf("ProbeConcurrencyOrDefault() = %d, want 1 (clamped)", got)
+	}
+}
+
+func TestDaemonProbeConcurrencyNegativeClamped(t *testing.T) {
+	v := -5
+	d := DaemonConfig{ProbeConcurrency: &v}
+	got := d.ProbeConcurrencyOrDefault()
+	if got != 1 {
+		t.Errorf("ProbeConcurrencyOrDefault() = %d, want 1 (clamped)", got)
+	}
+}
+
+func TestParseProbeConcurrency(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+probe_concurrency = 12
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.ProbeConcurrency == nil {
+		t.Fatal("Daemon.ProbeConcurrency is nil, want 12")
+	}
+	if *cfg.Daemon.ProbeConcurrency != 12 {
+		t.Errorf("Daemon.ProbeConcurrency = %d, want 12", *cfg.Daemon.ProbeConcurrency)
+	}
+	got := cfg.Daemon.ProbeConcurrencyOrDefault()
+	if got != 12 {
+		t.Errorf("ProbeConcurrencyOrDefault() = %d, want 12", got)
 	}
 }
 
@@ -2901,7 +3005,7 @@ func TestDefaultSlingFormulaRoundTrip(t *testing.T) {
 	c := City{
 		Workspace: Workspace{Name: "test"},
 		Agents: []Agent{
-			{Name: "polecat", Dir: "rig", DefaultSlingFormula: "mol-polecat-work"},
+			{Name: "polecat", Dir: "rig", DefaultSlingFormula: strPtr("mol-polecat-work")},
 		},
 	}
 	data, err := c.Marshal()
@@ -2912,8 +3016,8 @@ func TestDefaultSlingFormulaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(Marshal output): %v", err)
 	}
-	if got.Agents[0].DefaultSlingFormula != "mol-polecat-work" {
-		t.Errorf("DefaultSlingFormula = %q, want %q", got.Agents[0].DefaultSlingFormula, "mol-polecat-work")
+	if got.Agents[0].EffectiveDefaultSlingFormula() != "mol-polecat-work" {
+		t.Errorf("DefaultSlingFormula = %q, want %q", got.Agents[0].EffectiveDefaultSlingFormula(), "mol-polecat-work")
 	}
 }
 
@@ -3745,6 +3849,193 @@ func TestInjectImplicitAgents_RigInjection(t *testing.T) {
 				t.Errorf("rig agent %s/%s: unexpected scaling min=%v max=%v, want nil/nil", a.Dir, a.Name, a.MinActiveSessions, a.MaxActiveSessions)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// agent_defaults.default_sling_formula
+// ---------------------------------------------------------------------------
+
+func TestAgentDefaultsSlingFormula_ImplicitAgents(t *testing.T) {
+	// When agent_defaults.default_sling_formula is set, implicit agents
+	// should use it instead of the hardcoded "mol-do-work".
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"claude": {},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	for _, a := range cfg.Agents {
+		if a.Implicit && a.Name != ControlDispatcherAgentName && a.EffectiveDefaultSlingFormula() != "mol-focus-review" {
+			t.Errorf("implicit agent %q: DefaultSlingFormula = %q, want %q",
+				a.Name, a.EffectiveDefaultSlingFormula(), "mol-focus-review")
+		}
+	}
+}
+
+func TestAgentDefaultsSlingFormula_ExplicitAgentInherits(t *testing.T) {
+	// Explicit agents without their own default_sling_formula should
+	// inherit from agent_defaults.
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"claude": {},
+		},
+		Agents: []Agent{
+			{Name: "worker", Provider: "claude"},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	for _, a := range cfg.Agents {
+		if a.Name == "worker" {
+			if a.EffectiveDefaultSlingFormula() != "mol-focus-review" {
+				t.Errorf("explicit agent %q: DefaultSlingFormula = %q, want %q",
+					a.Name, a.EffectiveDefaultSlingFormula(), "mol-focus-review")
+			}
+			return
+		}
+	}
+	t.Fatal("explicit agent 'worker' not found")
+}
+
+func TestAgentDefaultsSlingFormula_ExplicitOverrideWins(t *testing.T) {
+	// Explicit agents with their own default_sling_formula should NOT be
+	// overridden by agent_defaults.
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"claude": {},
+		},
+		Agents: []Agent{
+			{Name: "worker", Provider: "claude", DefaultSlingFormula: strPtr("mol-custom")},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	for _, a := range cfg.Agents {
+		if a.Name == "worker" {
+			if a.EffectiveDefaultSlingFormula() != "mol-custom" {
+				t.Errorf("explicit agent %q: DefaultSlingFormula = %q, want %q (explicit override)",
+					a.Name, a.EffectiveDefaultSlingFormula(), "mol-custom")
+			}
+			return
+		}
+	}
+	t.Fatal("explicit agent 'worker' not found")
+}
+
+func TestAgentDefaultsSlingFormula_FallbackToMolDoWork(t *testing.T) {
+	// When agent_defaults.default_sling_formula is empty, implicit agents
+	// should still get "mol-do-work" as the fallback.
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"claude": {},
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	for _, a := range cfg.Agents {
+		if a.Implicit && a.Name != ControlDispatcherAgentName && a.EffectiveDefaultSlingFormula() != "mol-do-work" {
+			t.Errorf("implicit agent %q: DefaultSlingFormula = %q, want %q (fallback)",
+				a.Name, a.EffectiveDefaultSlingFormula(), "mol-do-work")
+		}
+	}
+}
+
+func TestAgentDefaultsSlingFormula_RigScoped(t *testing.T) {
+	// Rig-scoped implicit agents should also inherit from agent_defaults.
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"claude": {},
+		},
+		Rigs: []Rig{
+			{Name: "myrig", Path: "/tmp/myrig"},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	for _, a := range cfg.Agents {
+		if a.Dir == "myrig" && a.Implicit && a.Name != ControlDispatcherAgentName && a.EffectiveDefaultSlingFormula() != "mol-focus-review" {
+			t.Errorf("rig-scoped agent %s/%s: DefaultSlingFormula = %q, want %q",
+				a.Dir, a.Name, a.EffectiveDefaultSlingFormula(), "mol-focus-review")
+		}
+	}
+}
+
+func TestAgentDefaultsSlingFormula_NoProviders(t *testing.T) {
+	// Explicit agents should receive the default even when no providers
+	// are configured (InjectImplicitAgents early-returns in this case).
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "worker"},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	InjectImplicitAgents(cfg)
+	ApplyAgentDefaults(cfg)
+
+	if cfg.Agents[0].EffectiveDefaultSlingFormula() != "mol-focus-review" {
+		t.Errorf("explicit agent with no providers: DefaultSlingFormula = %q, want %q",
+			cfg.Agents[0].EffectiveDefaultSlingFormula(), "mol-focus-review")
+	}
+}
+
+func TestAgentDefaultsSlingFormula_ExplicitEmptyClearSurvives(t *testing.T) {
+	// An explicit empty-string clear via AgentPatch should survive
+	// ApplyAgentDefaults — the city default must not clobber it.
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "worker", DefaultSlingFormula: strPtr("")},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	ApplyAgentDefaults(cfg)
+
+	if cfg.Agents[0].DefaultSlingFormula == nil {
+		t.Fatal("DefaultSlingFormula is nil, want explicit empty string")
+	}
+	if *cfg.Agents[0].DefaultSlingFormula != "" {
+		t.Errorf("DefaultSlingFormula = %q, want %q (explicit clear should survive)",
+			*cfg.Agents[0].DefaultSlingFormula, "")
+	}
+}
+
+func TestAgentDefaultsSlingFormula_ControlDispatcherSkipped(t *testing.T) {
+	// Control-dispatcher agents should not receive the city default.
+	cfg := &City{
+		Agents: []Agent{
+			{Name: ControlDispatcherAgentName, Implicit: true},
+		},
+		AgentDefaults: AgentDefaults{
+			DefaultSlingFormula: "mol-focus-review",
+		},
+	}
+	ApplyAgentDefaults(cfg)
+
+	if cfg.Agents[0].DefaultSlingFormula != nil {
+		t.Errorf("control-dispatcher got DefaultSlingFormula = %q, want nil",
+			*cfg.Agents[0].DefaultSlingFormula)
 	}
 }
 

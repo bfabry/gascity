@@ -54,8 +54,8 @@ type CityRuntime struct {
 	poolDeathHandlers map[string]poolDeathInfo
 	suspendedNames    map[string]bool
 
-	standaloneCityStore beads.Store            // non-nil when API disabled; for chat auto-suspend
-	standaloneRigStores map[string]beads.Store // standalone-mode rig stores for cross-store work visibility
+	standaloneCityStore beads.Store // non-nil when API disabled; for chat auto-suspend
+	standaloneRigStores map[string]beads.Store
 
 	// Bead-driven reconciler state (Phase 2f).
 	sessionDrains *drainTracker // in-memory drain tracker; nil when bead reconciler disabled
@@ -71,6 +71,10 @@ type CityRuntime struct {
 	shutdownOnce   sync.Once
 	logPrefix      string // "gc start" or "gc supervisor"
 	stdout, stderr io.Writer
+
+	// halt gates tick work without killing the process. State is
+	// owned by the reconciliation goroutine and never shared.
+	halt haltGate
 }
 
 // CityRuntimeParams holds the caller-provided parameters for creating a
@@ -120,6 +124,27 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 	if p.Cfg.Daemon.WispGCEnabled() {
 		wg = newWispGC(p.Cfg.Daemon.WispGCIntervalDuration(),
 			p.Cfg.Daemon.WispTTLDuration(), bdCommandRunnerForCity(p.CityPath))
+	}
+
+	// Clear stale halt file from a previous session so a service restart
+	// always begins in the running state. An operator who wants the halt
+	// to survive a restart can re-issue "gc halt" after startup.
+	if isCityHalted(p.CityPath) {
+		if err := removeHaltFile(p.CityPath); err != nil {
+			fmt.Fprintf(p.Stderr, "%s: clear stale halt file: %v\n", p.LogPrefix, err) //nolint:errcheck // best-effort stderr
+		} else {
+			fmt.Fprintf(p.Stderr, "%s: cleared stale halt file from previous session\n", p.LogPrefix) //nolint:errcheck // best-effort stderr
+		}
+	}
+
+	// Sweep orphaned order-tracking beads on startup only (not config reload).
+	// A previous controller instance may have left tracking beads open
+	// (goroutines killed on restart, or silent Close failures).
+	sweepStore := beads.NewBdStore(p.CityPath, bdCommandRunnerForCity(p.CityPath))
+	if n, err := sweepOrphanedOrderTracking(sweepStore); err != nil {
+		fmt.Fprintf(p.Stderr, "gc start: order tracking sweep (closed %d): %v\n", n, err) //nolint:errcheck // best-effort stderr
+	} else if n > 0 {
+		fmt.Fprintf(p.Stderr, "gc start: closed %d orphaned order-tracking beads\n", n) //nolint:errcheck // best-effort stderr
 	}
 
 	od := buildOrderDispatcher(p.CityPath, p.Cfg, bdCommandRunnerForCity(p.CityPath), p.Rec, p.Stderr)
@@ -194,15 +219,23 @@ func (cr *CityRuntime) crashTrack() crashTracker {
 // the per-city main loop — it watches config, reconciles agents, runs
 // wisp GC, and dispatches orders.
 func (cr *CityRuntime) run(ctx context.Context) {
-	defer cr.shutdown()
-
 	dirty := &atomic.Bool{}
 	if cr.tomlPath != "" {
-		dirs := cr.watchDirs
-		if len(dirs) == 0 {
-			dirs = []string{filepath.Dir(cr.tomlPath)}
+		watchPaths := append([]string{}, cr.watchDirs...)
+		if len(watchPaths) == 0 {
+			watchPaths = []string{filepath.Dir(cr.tomlPath)}
 		}
-		cleanup := watchConfigDirs(dirs, dirty, cr.stderr)
+		var hasTomlPath bool
+		for _, path := range watchPaths {
+			if samePath(path, cr.tomlPath) {
+				hasTomlPath = true
+				break
+			}
+		}
+		if !hasTomlPath {
+			watchPaths = append(watchPaths, cr.tomlPath)
+		}
+		cleanup := watchConfigDirs(watchPaths, dirty, cr.pokeCh, cr.stderr)
 		defer cleanup()
 	}
 
@@ -224,8 +257,8 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			fmt.Fprintf(cr.stderr, "%s: city bead store: %v (auto-suspend disabled)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
 		} else {
 			cr.standaloneCityStore = store
-			cr.refreshStandaloneRigStores()
 		}
+		cr.standaloneRigStores = buildStandaloneRigStores(cr.cfg, cr.cityPath, cr.stderr)
 	}
 
 	// Record bead store health metric.
@@ -275,6 +308,16 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	startupTrace := cr.beginTraceCycle("startup", "initial_reconcile", sessionBeads)
 	result := cr.buildDesiredState(sessionBeads, startupTrace)
 	sessionBeads = cr.syncBeadsAndUpdateIndex(result.State, sessionBeads)
+	result = refreshDesiredStateWithSessionBeads(
+		result,
+		cr.cityName,
+		cr.cityPath,
+		cr.cfg,
+		cr.sp,
+		cr.cityBeadStore(),
+		sessionBeads,
+		cr.stderr,
+	)
 	if ctx.Err() != nil {
 		if startupTrace != nil {
 			startupTrace.end(TraceCompletionAborted, traceRecordPayload{"phase": "startup"})
@@ -336,8 +379,12 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			// are atomic, so each request is processed exactly once.
 			// Note: ordering relative to convergenceTick is non-deterministic
 			// via this path, but handlers are idempotent so interleaving is safe.
-			reply := cr.safeHandleConvergenceRequest(ctx, req)
-			req.replyCh <- reply
+			if cr.halt.check(cr.cityPath, cr.stderr) {
+				req.replyCh <- convergenceReply{Error: "city halted"}
+			} else {
+				reply := cr.safeHandleConvergenceRequest(ctx, req)
+				req.replyCh <- reply
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -355,6 +402,12 @@ func (cr *CityRuntime) tick(
 	prevPoolRunning *map[string]bool,
 	trigger string,
 ) {
+	// Soft circuit breaker: if "gc halt" has placed a flag file in
+	// the city's runtime dir, skip all tick work. The log line fires
+	// only on the running → halted transition, not every tick.
+	if cr.halt.check(cr.cityPath, cr.stderr) {
+		return
+	}
 	sessionBeads := cr.loadSessionBeadSnapshot()
 	trace := cr.beginTraceCycle(trigger, "controller_tick", sessionBeads)
 	// Detect pool instance deaths since last tick.
@@ -367,7 +420,7 @@ func (cr *CityRuntime) tick(
 		if *prevPoolRunning != nil {
 			for sn, info := range cr.poolDeathHandlers {
 				if (*prevPoolRunning)[sn] && !currentSet[sn] {
-					if _, err := shellScaleCheck(info.Command, info.Dir); err != nil {
+					if _, err := shellRunHook(info.Command, info.Dir); err != nil {
 						fmt.Fprintf(cr.stderr, "on_death %s: %v\n", sn, err) //nolint:errcheck // best-effort stderr
 					}
 				}
@@ -384,6 +437,9 @@ func (cr *CityRuntime) tick(
 	if dirty.Swap(false) {
 		cr.reloadConfigTraced(ctx, lastProviderName, cityRoot, trace)
 	}
+	if ctx.Err() != nil {
+		return
+	}
 
 	// Session bead sync BEFORE reconciliation (one-tick state lag; see run()).
 	// Post-reconcile sync was intentionally removed: the daemon's next tick
@@ -396,10 +452,23 @@ func (cr *CityRuntime) tick(
 	// stamped on adopted beads). The CachingStore has the updated data
 	// from SetMetadataBatch write-through.
 	sessionBeads = cr.loadSessionBeadSnapshot()
+	result = refreshDesiredStateWithSessionBeads(
+		result,
+		cr.cityName,
+		cr.cityPath,
+		cr.cfg,
+		cr.sp,
+		cr.cityBeadStore(),
+		sessionBeads,
+		cr.stderr,
+	)
 
 	// Bead-driven reconciliation (requires bead store / drain tracker).
 	if cr.sessionDrains != nil {
 		cr.beadReconcileTick(ctx, result, sessionBeads, trace)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	// Wisp GC: purge expired closed molecules.
@@ -412,9 +481,16 @@ func (cr *CityRuntime) tick(
 		}
 	}
 
+	if ctx.Err() != nil {
+		return
+	}
+
 	// Order dispatch.
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, time.Now())
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	if cr.svc != nil {
@@ -424,6 +500,9 @@ func (cr *CityRuntime) tick(
 	// Chat session auto-suspend: suspend detached idle sessions.
 	if idleTimeout := cr.cfg.ChatSessions.IdleTimeoutDuration(); idleTimeout > 0 {
 		autoSuspendChatSessions(cr.cityBeadStore(), cr.sp, idleTimeout, clock.Real{}, cr.stdout, cr.stderr)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	// Drain queued convergence requests (CLI commands) BEFORE tick so
@@ -608,8 +687,8 @@ func (cr *CityRuntime) reloadConfigTraced(
 			}
 		} else {
 			cr.standaloneCityStore = s
-			cr.refreshStandaloneRigStores()
 		}
+		cr.standaloneRigStores = buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr)
 	}
 
 	// Ensure drain tracker is initialized when bead store becomes available.
@@ -648,7 +727,14 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// same scale_check counts that buildDesiredState already computed (no
 	// duplicate shell-outs). Resume tier from cross-referenced assigned
 	// work beads + new tier from scale_check + min fill.
-	poolDesired := computePoolDesiredCountsForTick(cr.cfg, sessionBeads, result, trace)
+	poolDesired := PoolDesiredCounts(ComputePoolDesiredStatesTraced(
+		cr.cfg, result.AssignedWorkBeads, sessionBeads.Open(), result.ScaleCheckCounts, trace))
+	// Merge named-session assignee demand so on-demand named sessions with
+	// direct work (Assignee match, no gc.routed_to) stay config-eligible.
+	if poolDesired == nil {
+		poolDesired = make(map[string]int)
+	}
+	mergeNamedSessionDemand(poolDesired, result.NamedSessionDemand, cr.cfg)
 	for tmpl, count := range poolDesired {
 		if count > 0 {
 			fmt.Fprintf(cr.stderr, "poolDesired: %s = %d\n", tmpl, count) //nolint:errcheck
@@ -664,9 +750,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		sessionBeads,
 		desiredState,
 		result.AssignedWorkBeads,
-		result.StoreQueryPartial,
 		cr.cfg,
 		cr.sp,
+		result.StoreQueryPartial,
 	) > 0 {
 		sessionBeads = cr.loadSessionBeadSnapshot()
 	}
@@ -677,7 +763,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 
 	cfgNames := configuredSessionNamesWithSnapshot(cr.cfg, cityName, sessionBeads)
 
-	readyWaitSet, err := prepareWaitWakeState(store, time.Now())
+	readyWaitSet, err := prepareWaitWakeState(store, cr.rigBeadStores(), time.Now())
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: preparing waits: %v\n", cr.logPrefix, err) //nolint:errcheck
 		readyWaitSet = nil
@@ -774,6 +860,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		cr.cfg.Daemon.DriftDrainTimeoutDuration(),
 		cr.stdout, cr.stderr, trace,
 	)
+	cr.requestDeferredDrainFollowUpTick()
 	if trace != nil {
 		for _, bead := range open {
 			template := normalizedSessionTemplate(bead, cr.cfg)
@@ -786,11 +873,24 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			})
 		}
 	}
-	if err := dispatchReadyWaitNudges(cr.cityPath, store, cr.sp, time.Now()); err != nil {
+	if err := dispatchReadyWaitNudges(cr.cityPath, store, cr.sp, time.Now(), cr.cfg.Providers); err != nil {
 		fmt.Fprintf(cr.stderr, "%s: dispatching wait nudges: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
 
 	// Idle recovery: detect pool sessions stuck at the prompt after
+}
+
+func (cr *CityRuntime) requestDeferredDrainFollowUpTick() {
+	if cr == nil || cr.sessionDrains == nil {
+		return
+	}
+	if !cr.sessionDrains.consumeFollowUpTick() {
+		return
+	}
+	select {
+	case cr.pokeCh <- struct{}{}:
+	default:
+	}
 }
 
 func sweepUndesiredPoolSessionBeads(
@@ -798,9 +898,9 @@ func sweepUndesiredPoolSessionBeads(
 	sessionBeads *sessionBeadSnapshot,
 	desiredState map[string]TemplateParams,
 	assignedWorkBeads []beads.Bead,
-	storeQueryPartial bool,
 	cfg *config.City,
 	sp runtime.Provider,
+	storeQueryPartial bool,
 ) int {
 	if store == nil || sessionBeads == nil || cfg == nil || storeQueryPartial {
 		return 0
@@ -811,9 +911,6 @@ func sweepUndesiredPoolSessionBeads(
 			continue
 		}
 		if _, desired := desiredState[bead.Metadata["session_name"]]; desired {
-			continue
-		}
-		if normalizeBeadState(bead.Metadata["state"]) == "creating" {
 			continue
 		}
 		if bead.Metadata["manual_session"] == boolMetadata(true) || isNamedSessionBead(bead) {
@@ -833,6 +930,11 @@ func sweepUndesiredPoolSessionBeads(
 }
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
+	// Respect the halt gate: if the city is halted, skip controller
+	// dispatch too — halting means no reconciliation work of any kind.
+	if cr.halt.check(cr.cityPath, cr.stderr) {
+		return
+	}
 	store := cr.cityBeadStore()
 	if store == nil || cr.sessionDrains == nil {
 		return
@@ -851,7 +953,7 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 		filteredCfg,
 		cr.sp,
 		store,
-		nil,
+		cr.rigBeadStores(),
 		sessionBeads,
 		nil,
 		cr.stderr,
@@ -872,7 +974,11 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 	)
 	open := filterSessionBeadsByName(updated, cfgNames)
 	poolDesired := PoolDesiredCounts(ComputePoolDesiredStates(
-		filteredCfg, nil, sessionBeads.Open(), wfcResult.ScaleCheckCounts))
+		filteredCfg, wfcResult.AssignedWorkBeads, open, wfcResult.ScaleCheckCounts))
+	if poolDesired == nil {
+		poolDesired = make(map[string]int)
+	}
+	mergeNamedSessionDemand(poolDesired, wfcResult.NamedSessionDemand, filteredCfg)
 	reconcileSessionBeadsAtPath(
 		ctx,
 		cr.cityPath,
@@ -898,6 +1004,7 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 		cr.stdout,
 		cr.stderr,
 	)
+	cr.requestDeferredDrainFollowUpTick()
 }
 
 // syncBeadsAndUpdateIndex runs syncSessionBeads.
@@ -917,6 +1024,15 @@ func (cr *CityRuntime) cityBeadStore() beads.Store {
 		return cr.cs.CityBeadStore()
 	}
 	return cr.standaloneCityStore
+}
+
+func (cr *CityRuntime) rigBeadStores() map[string]beads.Store {
+	if cr.cs != nil {
+		stores := cr.cs.BeadStores()
+		delete(stores, cr.cityName)
+		return stores
+	}
+	return cr.standaloneRigStores
 }
 
 func (cr *CityRuntime) loadSessionBeadSnapshot() *sessionBeadSnapshot {
@@ -947,45 +1063,36 @@ func filterSessionBeadsByName(snapshot *sessionBeadSnapshot, names map[string]bo
 
 func (cr *CityRuntime) buildDesiredState(sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
 	store := cr.cityBeadStore()
-	var rigStores map[string]beads.Store
-	if cr.cs != nil {
-		rigStores = cr.cs.BeadStores()
-	} else {
-		rigStores = cr.standaloneRigStores
-	}
+	rigStores := cr.rigBeadStores()
 	if cr.buildFnWithSessionBeads != nil {
 		return cr.buildFnWithSessionBeads(cr.cfg, cr.sp, store, rigStores, sessionBeads, trace)
 	}
 	return cr.buildFn(cr.cfg, cr.sp, store)
 }
 
-func (cr *CityRuntime) refreshStandaloneRigStores() {
-	if cr.cs != nil || cr.cfg == nil {
-		return
-	}
-	cs := &controllerState{
-		cfg:      cr.cfg,
-		cityPath: cr.cityPath,
-	}
-	cr.standaloneRigStores = cs.buildStores(cr.cfg)
+func buildStandaloneRigStores(cfg *config.City, cityPath string, stderr io.Writer) map[string]beads.Store {
+	return buildRigStores(cfg, cityPath, "gc supervisor", stderr)
 }
 
-func computePoolDesiredCountsForTick(
-	cfg *config.City,
-	sessionBeads *sessionBeadSnapshot,
-	result DesiredStateResult,
-	trace *sessionReconcilerTraceCycle,
-) map[string]int {
-	if cfg == nil || sessionBeads == nil {
+// buildRigStores opens bead stores for all rigs attached to the city.
+// Errors on individual rigs are logged with logPrefix and skipped.
+func buildRigStores(cfg *config.City, cityPath, logPrefix string, stderr io.Writer) map[string]beads.Store {
+	if cfg == nil || len(cfg.Rigs) == 0 {
 		return nil
 	}
-	return PoolDesiredCounts(ComputePoolDesiredStatesTraced(
-		cfg,
-		result.AssignedWorkBeads,
-		sessionBeads.Open(),
-		result.ScaleCheckCounts,
-		trace,
-	))
+	stores := make(map[string]beads.Store, len(cfg.Rigs))
+	for _, rig := range cfg.Rigs {
+		store, err := openStoreAtForCity(rig.Path, cityPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: rig bead store %q: %v\n", logPrefix, rig.Name, err) //nolint:errcheck // best-effort stderr
+			continue
+		}
+		stores[rig.Name] = store
+	}
+	if len(stores) == 0 {
+		return nil
+	}
+	return stores
 }
 
 func (cr *CityRuntime) beginTraceCycle(trigger, detail string, sessionBeads *sessionBeadSnapshot) *sessionReconcilerTraceCycle {

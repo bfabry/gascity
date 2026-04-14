@@ -7,6 +7,7 @@ import (
 )
 
 func TestBuildGCResourceAttrs_Empty(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
 	t.Setenv("GC_RIG", "")
 	t.Setenv("GC_CITY", "")
@@ -18,6 +19,7 @@ func TestBuildGCResourceAttrs_Empty(t *testing.T) {
 }
 
 func TestBuildGCResourceAttrs_AllVars(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "mayor")
 	t.Setenv("GC_RIG", "tower")
 	t.Setenv("GC_CITY", "/tmp/bright-lights")
@@ -31,6 +33,7 @@ func TestBuildGCResourceAttrs_AllVars(t *testing.T) {
 }
 
 func TestBuildGCResourceAttrs_Comma(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "a")
 	t.Setenv("GC_RIG", "b")
 	t.Setenv("GC_CITY", "")
@@ -38,6 +41,21 @@ func TestBuildGCResourceAttrs_Comma(t *testing.T) {
 	result := buildGCResourceAttrs()
 	if !strings.Contains(result, ",") {
 		t.Errorf("expected comma-separated result, got %q", result)
+	}
+}
+
+func TestBuildGCResourceAttrs_PrefersAlias(t *testing.T) {
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_AGENT", "bl-9jl")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_CITY", "")
+
+	result := buildGCResourceAttrs()
+	if !strings.Contains(result, "gc.agent=mayor") {
+		t.Errorf("expected gc.agent=mayor (from GC_ALIAS), got %q", result)
+	}
+	if strings.Contains(result, "bl-9jl") {
+		t.Errorf("gc.agent should not contain bead ID, got %q", result)
 	}
 }
 
@@ -52,6 +70,7 @@ func TestOTELEnvMap_Disabled(t *testing.T) {
 func TestOTELEnvMap_Enabled(t *testing.T) {
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "http://localhost:9428/insert/opentelemetry/v1/logs")
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
 	t.Setenv("GC_RIG", "")
 	t.Setenv("GC_CITY", "")
@@ -74,6 +93,7 @@ func TestOTELEnvMap_Enabled(t *testing.T) {
 func TestOTELEnvMap_NoLogsURL(t *testing.T) {
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "")
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
 	t.Setenv("GC_RIG", "")
 	t.Setenv("GC_CITY", "")
@@ -87,6 +107,7 @@ func TestOTELEnvMap_NoLogsURL(t *testing.T) {
 func TestOTELEnvMap_WithResourceAttrs(t *testing.T) {
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "")
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "mayor")
 	t.Setenv("GC_RIG", "tower")
 	t.Setenv("GC_CITY", "")
@@ -109,6 +130,7 @@ func TestOTELEnvForSubprocess_Disabled(t *testing.T) {
 func TestOTELEnvForSubprocess_BothURLs(t *testing.T) {
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "http://localhost:9428/insert/opentelemetry/v1/logs")
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
 	t.Setenv("GC_RIG", "")
 	t.Setenv("GC_CITY", "")
@@ -152,6 +174,7 @@ func TestSetProcessOTELAttrs_Enabled(t *testing.T) {
 	logsURL := "http://localhost:9428/insert/opentelemetry/v1/logs"
 	t.Setenv(EnvMetricsURL, metricsURL)
 	t.Setenv(EnvLogsURL, logsURL)
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
 	t.Setenv("GC_RIG", "")
 	t.Setenv("GC_CITY", "")
@@ -172,6 +195,7 @@ func TestSetProcessOTELAttrs_Enabled(t *testing.T) {
 func TestSetProcessOTELAttrs_SetsResourceAttrs(t *testing.T) {
 	t.Setenv(EnvMetricsURL, "http://localhost:8428/opentelemetry/api/v1/push")
 	t.Setenv(EnvLogsURL, "")
+	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "mayor")
 	t.Setenv("GC_RIG", "tower")
 	t.Setenv("GC_CITY", "")

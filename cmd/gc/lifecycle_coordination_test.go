@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -278,5 +280,135 @@ func TestLifecycleCoordination_InitDirIfReady_BdDeferred(t *testing.T) {
 		if !strings.Contains(metaText, needle) {
 			t.Fatalf("deferred metadata missing %s:\n%s", needle, metaText)
 		}
+	}
+}
+
+func TestLifecycleCoordination_InitDirIfReady_BdDeferredPreservesExistingDoltDatabaseWhenCanonicalUnknown(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"gascity"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	MaterializeBeadsBdScript(dir) //nolint:errcheck
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+
+	deferred, err := initDirIfReady(dir, dir, "gc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deferred {
+		t.Fatal("expected bd provider to defer init")
+	}
+
+	metaData, err := os.ReadFile(filepath.Join(dir, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(meta["dolt_database"])); got != "gascity" {
+		t.Fatalf("dolt_database = %q, want %q", got, "gascity")
+	}
+}
+
+func TestSeedDeferredManagedBeadsUsesExplicitDoltDatabase(t *testing.T) {
+	dir := t.TempDir()
+
+	seedDeferredManagedBeads(dir, "gc", "gascity")
+
+	configData, err := os.ReadFile(filepath.Join(dir, ".beads", "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if got := string(configData); !strings.Contains(got, "issue_prefix: gc") {
+		t.Fatalf("config should keep the bead prefix, got:\n%s", got)
+	}
+
+	metaData, err := os.ReadFile(filepath.Join(dir, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	metaText := string(metaData)
+	for _, needle := range []string{`"backend": "dolt"`, `"database": "dolt"`, `"dolt_mode": "server"`, `"dolt_database": "gascity"`} {
+		if !strings.Contains(metaText, needle) {
+			t.Fatalf("metadata missing %s:\n%s", needle, metaText)
+		}
+	}
+}
+
+func TestSeedDeferredManagedBeadsPreservesExistingDoltDatabaseWhenCanonicalUnknown(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"gascity"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	seedDeferredManagedBeads(dir, "gc", "")
+
+	metaData, err := os.ReadFile(filepath.Join(dir, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(meta["dolt_database"])); got != "gascity" {
+		t.Fatalf("dolt_database = %q, want %q", got, "gascity")
+	}
+}
+
+// TestSeedDeferredManagedBeadsCreatesDirWith0700 asserts that fresh .beads
+// directories created during deferred init satisfy bd's recommended 0700
+// permission. Wider perms cause bd to emit a warning on every call, which
+// spams agent pod output and is treated as a hard failure by the
+// controller's collectAssignedWorkBeads stderr-as-error path (hl-39km).
+func TestSeedDeferredManagedBeadsCreatesDirWith0700(t *testing.T) {
+	dir := t.TempDir()
+
+	seedDeferredManagedBeads(dir, "gc", "test")
+
+	info, err := os.Stat(filepath.Join(dir, ".beads"))
+	if err != nil {
+		t.Fatalf("stat .beads: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf(".beads perm = %o, want 0700", perm)
+	}
+}
+
+// TestSeedDeferredManagedBeadsTightensExistingDir asserts that pre-existing
+// .beads directories with looser permissions are tightened on next call.
+// Required because persistent volumes carry directories created by older
+// gascity versions that used 0o755.
+func TestSeedDeferredManagedBeadsTightensExistingDir(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Force 0755 explicitly — the test process umask may have reduced it.
+	if err := os.Chmod(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	seedDeferredManagedBeads(dir, "gc", "test")
+
+	info, err := os.Stat(beadsDir)
+	if err != nil {
+		t.Fatalf("stat .beads: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf(".beads perm = %o, want 0700", perm)
 	}
 }

@@ -27,16 +27,18 @@ var _ runtime.Provider = (*Provider)(nil)
 // Eliminates subprocess overhead by making direct API calls over reused
 // HTTP/2 connections. Pod manifests are compatible with gc-session-k8s.
 type Provider struct {
-	ops        k8sOps
-	namespace  string
-	image      string
-	k8sContext string
-	cpuRequest string
-	memRequest string
-	cpuLimit   string
-	memLimit   string
-	prebaked   bool      // skip staging + init container for prebaked images
-	stderr     io.Writer // warning output (default os.Stderr)
+	ops             k8sOps
+	namespace       string
+	image           string
+	k8sContext      string
+	cpuRequest      string
+	memRequest      string
+	cpuLimit        string
+	memLimit        string
+	serviceAccount  string        // pod service account name (GC_K8S_SERVICE_ACCOUNT)
+	prebaked        bool          // skip staging + init container for prebaked images
+	postStartSettle time.Duration // settle time before post-start liveness check
+	stderr          io.Writer     // warning output (default os.Stderr)
 }
 
 // NewProvider creates a K8s session provider.
@@ -44,6 +46,7 @@ type Provider struct {
 //   - GC_K8S_NAMESPACE — namespace (default: "gc")
 //   - GC_K8S_IMAGE — container image (required for Start)
 //   - GC_K8S_CONTEXT — kubectl context (default: current)
+//   - GC_K8S_SERVICE_ACCOUNT — pod service account name (default: namespace default)
 //   - GC_K8S_CPU_REQUEST, GC_K8S_MEM_REQUEST — resource requests
 //   - GC_K8S_CPU_LIMIT, GC_K8S_MEM_LIMIT — resource limits
 //
@@ -70,15 +73,17 @@ func NewProvider() (*Provider, error) {
 			restConfig: restConfig,
 			namespace:  namespace,
 		},
-		namespace:  namespace,
-		image:      image,
-		k8sContext: k8sContext,
-		cpuRequest: envOrDefault("GC_K8S_CPU_REQUEST", "500m"),
-		memRequest: envOrDefault("GC_K8S_MEM_REQUEST", "1Gi"),
-		cpuLimit:   envOrDefault("GC_K8S_CPU_LIMIT", "2"),
-		memLimit:   envOrDefault("GC_K8S_MEM_LIMIT", "4Gi"),
-		prebaked:   os.Getenv("GC_K8S_PREBAKED") == "true",
-		stderr:     os.Stderr,
+		namespace:       namespace,
+		image:           image,
+		k8sContext:      k8sContext,
+		cpuRequest:      envOrDefault("GC_K8S_CPU_REQUEST", "500m"),
+		memRequest:      envOrDefault("GC_K8S_MEM_REQUEST", "1Gi"),
+		cpuLimit:        envOrDefault("GC_K8S_CPU_LIMIT", "2"),
+		memLimit:        envOrDefault("GC_K8S_MEM_LIMIT", "4Gi"),
+		serviceAccount:  os.Getenv("GC_K8S_SERVICE_ACCOUNT"),
+		prebaked:        os.Getenv("GC_K8S_PREBAKED") == "true",
+		postStartSettle: 3 * time.Second,
+		stderr:          os.Stderr,
 	}, nil
 }
 
@@ -115,7 +120,13 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 			if tmuxErr == nil {
 				return fmt.Errorf("%w: session %q (pod: %s)", runtime.ErrSessionExists, name, pod.Name)
 			}
-			// Stale pod — tmux dead, recreate.
+			// tmux dead — but if the pod is young, workspace init may still
+			// be blocking the tmux server from starting. Don't delete pods
+			// that are still within the startup window.
+			if time.Since(pod.CreationTimestamp.Time) < startupGracePeriod {
+				return fmt.Errorf("%w: session %q (pod: %s)", runtime.ErrSessionInitializing, name, pod.Name)
+			}
+			// Stale pod — tmux dead and past grace period, recreate.
 		}
 		// Clean up existing pod.
 		_ = p.ops.deletePod(ctx, pod.Name, 5)
@@ -214,6 +225,34 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 			_, _ = p.ops.execInPod(ctx, podName, "agent",
 				[]string{"sh"}, strings.NewReader(string(script)))
 		}
+	}
+
+	// Post-start liveness check: verify the session survived startup.
+	// Agents that fail immediately (e.g. --resume with a stale session key)
+	// exit within a second. A brief settle lets us detect this before
+	// returning success to the reconciler, which triggers recordWakeFailure
+	// and the crash-loop recovery (clear session_key, bump continuation_epoch).
+	if p.postStartSettle > 0 {
+		timer := time.NewTimer(p.postStartSettle)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			cleanup("post-start settle canceled")
+			return fmt.Errorf("waiting for post-start settle for session %q: %w", name, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	_, tmuxErr := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
+	if tmuxErr != nil {
+		cleanup("session died immediately after startup")
+		return fmt.Errorf("%w: session %q died immediately after startup: %w",
+			runtime.ErrSessionDiedDuringStartup, name, tmuxErr)
+	}
+
+	// Send initial nudge if configured (matches tmux adapter step 6).
+	if cfg.Nudge != "" {
+		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 
 	return nil
@@ -635,9 +674,11 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) er
 	if err := copyDirToPod(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src"); err != nil {
 		return err
 	}
-	// Run gc init --from.
+	// Run gc init --from with GC_DOLT=skip so gc init does not attempt to
+	// start a local Dolt server. In K8s, the in-cluster Dolt service is
+	// configured by initBeadsInPod which runs after this function.
 	_, err := ops.execInPod(ctx, podName, "agent",
-		[]string{"gc", "init", "--from", "/tmp/city-src", "/workspace"}, nil)
+		[]string{"env", "GC_DOLT=skip", "gc", "init", "--from", "/tmp/city-src", "/workspace"}, nil)
 	if err != nil {
 		return err
 	}
@@ -708,16 +749,24 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 
 	// The shell command decodes the base64 values, so no user-controlled
 	// content is ever interpreted as shell syntax.
+	//
+	// project_id is dropped from the staged metadata because the controller's
+	// project_id is wrong for the agent pod — the staged copy carries the
+	// controller's identity but the pod talks to the in-cluster Dolt server,
+	// where bd will rediscover the correct project_id. Leaving it in place
+	// causes bd to fail with PROJECT IDENTITY MISMATCH on first use.
 	patchCmd := fmt.Sprintf(
 		`WD=$(echo '%s' | base64 -d) && cd "$WD" && PATCH=$(echo '%s' | base64 -d) && `+
 			`if [ -f .beads/metadata.json ]; then `+
 			`python3 -c "import json,sys; `+
 			`m=json.load(open('.beads/metadata.json')); `+
 			`p=json.loads(sys.argv[1]); m.update(p); `+
+			`m.pop('project_id', None); `+
 			`json.dump(m,open('.beads/metadata.json','w'),indent=2)" "$PATCH" 2>/dev/null || `+
 			`python3 -c "import json,sys; `+
 			`m=json.load(open('.beads/metadata.json')); `+
 			`p=json.loads(sys.stdin.read()); m.update(p); `+
+			`m.pop('project_id', None); `+
 			`json.dump(m,open('.beads/metadata.json','w'),indent=2)" <<< "$PATCH"; `+
 			`else PREFIX=$(echo '%s' | base64 -d) && `+
 			`DOLT_HOST=$(echo '%s' | base64 -d) && `+

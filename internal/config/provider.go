@@ -3,7 +3,7 @@ package config
 import "github.com/gastownhall/gascity/internal/shellquote"
 
 // ProviderOption declares a single configurable option for a provider.
-// Options are rendered as UI controls in Mission Control's session creation form.
+// Options are rendered as UI controls in a dashboard's session creation form.
 type ProviderOption struct {
 	Key     string         `toml:"key"     json:"key"`
 	Label   string         `toml:"label"   json:"label"`
@@ -59,6 +59,11 @@ type ProviderSpec struct {
 	// SupportsHooks indicates the provider has an executable hook mechanism
 	// (settings.json, plugins, etc.) for lifecycle events.
 	SupportsHooks bool `toml:"supports_hooks,omitempty"`
+	// NeedsNudgePoller indicates the provider cannot drain queued nudges via
+	// turn-boundary hooks (like Claude's UserPromptSubmit) and requires a
+	// background poller that delivers on idle quiescence. Codex is the
+	// canonical case. See engdocs/architecture/nudge-delivery.md.
+	NeedsNudgePoller bool `toml:"needs_nudge_poller,omitempty"`
 	// InstructionsFile is the filename the provider reads for project instructions
 	// (e.g., "CLAUDE.md", "AGENTS.md"). Empty defaults to "AGENTS.md".
 	InstructionsFile string `toml:"instructions_file,omitempty"`
@@ -81,9 +86,10 @@ type ProviderSpec struct {
 	SessionIDFlag string `toml:"session_id_flag,omitempty"`
 	// PermissionModes maps permission mode names to CLI flags.
 	// Example: {"unrestricted": "--dangerously-skip-permissions", "plan": "--permission-mode plan"}
-	// This is a config-only lookup table consumed by external clients (e.g., Mission Control)
-	// to populate permission mode dropdowns. Launch-time flag substitution is planned
-	// for a follow-up PR — currently no runtime code reads this field.
+	// This is a config-only lookup table consumed by external clients
+	// (e.g., Mission Control) to populate permission mode dropdowns.
+	// Launch-time flag substitution is planned for a follow-up PR —
+	// currently no runtime code reads this field.
 	PermissionModes map[string]string `toml:"permission_modes,omitempty"`
 	// OptionDefaults overrides the Default value in OptionsSchema entries
 	// without redefining the schema itself. Keys are option keys (e.g.,
@@ -110,7 +116,11 @@ type ProviderSpec struct {
 // ResolvedProvider is the fully-merged, ready-to-use provider config.
 // All fields are populated after resolution (built-in + city override + agent override).
 type ResolvedProvider struct {
-	Name                   string
+	Name string
+	// Kind is the canonical builtin provider name when this provider derives
+	// from a builtin (e.g. "claude" even if Name is "my-fast-claude"). Empty
+	// when the provider is fully custom with no builtin base.
+	Kind                   string
 	Command                string
 	Args                   []string
 	PromptMode             string
@@ -122,6 +132,7 @@ type ResolvedProvider struct {
 	Env                    map[string]string
 	SupportsACP            bool
 	SupportsHooks          bool
+	NeedsNudgePoller       bool
 	InstructionsFile       string
 	ResumeFlag             string
 	ResumeStyle            string
@@ -290,6 +301,7 @@ func BuiltinProviders() map[string]ProviderSpec {
 			ReadyDelayMs:     3000,
 			ProcessNames:     []string{"codex"},
 			SupportsHooks:    true,
+			NeedsNudgePoller: true,
 			InstructionsFile: "AGENTS.md",
 			PrintArgs:        []string{"exec"},
 			TitleModel:       "o4-mini",
@@ -346,13 +358,14 @@ func BuiltinProviders() map[string]ProviderSpec {
 			OptionDefaults: map[string]string{
 				"permission_mode": "unrestricted",
 			},
-			PromptMode:       "arg",
-			ReadyDelayMs:     5000,
-			ProcessNames:     []string{"gemini"},
-			SupportsHooks:    true,
-			InstructionsFile: "AGENTS.md",
-			PrintArgs:        []string{"-p"},
-			TitleModel:       "gemini-2.5-flash",
+			PromptMode:        "arg",
+			ReadyPromptPrefix: "> ",
+			ReadyDelayMs:      5000,
+			ProcessNames:      []string{"gemini", "node"},
+			SupportsHooks:     true,
+			InstructionsFile:  "AGENTS.md",
+			PrintArgs:         []string{"-p"},
+			TitleModel:        "gemini-2.5-flash",
 			PermissionModes: map[string]string{
 				"default":      "--approval-mode default",
 				"auto-edit":    "--approval-mode auto_edit",

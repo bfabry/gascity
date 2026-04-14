@@ -190,11 +190,11 @@
         },
         "work_query": {
           "type": "string",
-          "description": "WorkQuery is the shell command to find available work for this agent.\nUsed by gc hook and available in prompt templates as {{.WorkQuery}}.\nDefault for fixed agents: \"bd ready --assignee=\u003cqualified-name\u003e\".\nDefault for pool agents:\n\"bd ready --metadata-field gc.routed_to=\u003cqualified-name\u003e --unassigned --json --limit=1 2\u003e/dev/null\".\nOverride to integrate with external task systems."
+          "description": "WorkQuery is the shell command to find available work for this agent.\nUsed by gc hook and available in prompt templates as {{.WorkQuery}}.\nIf unset, Gas City uses a three-tier default query:\n  1. in_progress work assigned to this session/alias (crash recovery)\n  2. ready work assigned to this session/alias (pre-assigned work)\n  3. ready unassigned work with gc.routed_to=\u003cqualified-name\u003e\nWhen the controller probes for demand without session context, only the\nrouted_to tier applies. Override to integrate with external task systems."
         },
         "sling_query": {
           "type": "string",
-          "description": "SlingQuery is the command template to route a bead to this agent/pool.\nUsed by gc sling to make a bead visible to the target's work_query.\nThe placeholder {} is replaced with the bead ID at runtime.\nDefault for fixed agents: \"bd update {} --assignee=\u003cqualified-name\u003e\".\nDefault for pool agents: \"bd update {} --add-label=pool:\u003cqualified-name\u003e\".\nPool agents must set both sling_query and work_query, or neither."
+          "description": "SlingQuery is the command template to route a bead to this agent/pool.\nUsed by gc sling to make a bead visible to the target's work_query.\nThe placeholder {} is replaced with the bead ID at runtime.\nDefault for all agents:\n\"bd update {} --set-metadata gc.routed_to=\u003cqualified-name\u003e\".\nRouting is metadata-based; sling stamps the target template and the\nreconciler/scale_check paths decide when sessions are created.\nPool agents must set both sling_query and work_query, or neither."
         },
         "idle_timeout": {
           "type": "string",
@@ -296,6 +296,10 @@
             "fresh"
           ],
           "description": "WakeMode is the default wake mode (\"resume\" or \"fresh\")."
+        },
+        "default_sling_formula": {
+          "type": "string",
+          "description": "DefaultSlingFormula is the city-level default formula used for agents\nthat inherit [agent_defaults]. Explicit agents only receive this value\nwhen agent_defaults.default_sling_formula is set; implicit pool agents\nare seeded with \"mol-do-work\" elsewhere when no explicit default is set."
         },
         "allow_overlay": {
           "items": {
@@ -504,6 +508,13 @@
         "scale_check": {
           "type": "string",
           "description": "ScaleCheck overrides the shell command whose output determines desired session count."
+        },
+        "option_defaults": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "OptionDefaults adds or overrides provider option defaults for this agent.\nKeys are option keys, values are choice values. Merges additively\n(override keys win over existing agent keys).\nExample: option_defaults = { model = \"sonnet\" }"
         }
       },
       "additionalProperties": false,
@@ -701,6 +712,13 @@
         "scale_check": {
           "type": "string",
           "description": "ScaleCheck overrides the shell command whose output determines desired session count."
+        },
+        "option_defaults": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "OptionDefaults adds or overrides provider option defaults for this agent.\nKeys are option keys, values are choice values. Merges additively\n(patch keys win over existing agent keys).\nExample: option_defaults = { model = \"sonnet\" }"
         }
       },
       "additionalProperties": false,
@@ -920,6 +938,11 @@
           },
           "type": "array",
           "description": "ObservePaths lists extra directories to search for Claude JSONL session\nfiles (e.g., aimux session paths). The default search path\n(~/.claude/projects/) is always included."
+        },
+        "probe_concurrency": {
+          "type": "integer",
+          "description": "ProbeConcurrency bounds the number of concurrent bd subprocess probes\nissued by the pool scale_check and work_query paths. bd serializes on\na shared dolt sql-server, so unbounded parallelism causes contention.\nNil (unset) defaults to 8. Set higher for workspaces with a fast\ndedicated dolt server, or lower to reduce contention on slow storage.",
+          "default": 8
         }
       },
       "additionalProperties": false,
@@ -1402,6 +1425,10 @@
           "type": "boolean",
           "description": "SupportsHooks indicates the provider has an executable hook mechanism\n(settings.json, plugins, etc.) for lifecycle events."
         },
+        "needs_nudge_poller": {
+          "type": "boolean",
+          "description": "NeedsNudgePoller indicates the provider cannot drain queued nudges via\nturn-boundary hooks (like Claude's UserPromptSubmit) and requires a\nbackground poller that delivers on idle quiescence. Codex is the\ncanonical case. See engdocs/architecture/nudge-delivery.md."
+        },
         "instructions_file": {
           "type": "string",
           "description": "InstructionsFile is the filename the provider reads for project instructions\n(e.g., \"CLAUDE.md\", \"AGENTS.md\"). Empty defaults to \"AGENTS.md\"."
@@ -1427,7 +1454,7 @@
             "type": "string"
           },
           "type": "object",
-          "description": "PermissionModes maps permission mode names to CLI flags.\nExample: {\"unrestricted\": \"--dangerously-skip-permissions\", \"plan\": \"--permission-mode plan\"}\nThis is a config-only lookup table consumed by external clients (e.g., Mission Control)\nto populate permission mode dropdowns. Launch-time flag substitution is planned\nfor a follow-up PR — currently no runtime code reads this field."
+          "description": "PermissionModes maps permission mode names to CLI flags.\nExample: {\"unrestricted\": \"--dangerously-skip-permissions\", \"plan\": \"--permission-mode plan\"}\nThis is a config-only lookup table consumed by external clients\n(e.g., Mission Control) to populate permission mode dropdowns.\nLaunch-time flag substitution is planned for a follow-up PR —\ncurrently no runtime code reads this field."
         },
         "option_defaults": {
           "additionalProperties": {
@@ -1513,7 +1540,7 @@
         },
         "dolt_port": {
           "type": "string",
-          "description": "DoltPort overrides the city-level Dolt port for this rig's beads.\nWhen set, controller commands (scale_check, work_query) prefix their\nshell invocations with BEADS_DOLT_PORT=\u003cport\u003e so bd connects to the\ncorrect server instead of the city-level default."
+          "description": "DoltPort overrides the city-level Dolt port for this rig's beads.\nWhen set, controller commands (scale_check, work_query) prefix their\nshell invocations with BEADS_DOLT_SERVER_PORT=\u003cport\u003e so bd connects to the\ncorrect server instead of the city-level default."
         }
       },
       "additionalProperties": false,

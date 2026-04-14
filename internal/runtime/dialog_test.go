@@ -50,6 +50,11 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "gemini trust dialog",
+			content: "Do you trust the files in this folder?\n1. Trust folder",
+			want:    true,
+		},
+		{
 			name:    "normal prompt text",
 			content: "> waiting for input",
 			want:    false,
@@ -96,6 +101,60 @@ func TestAcceptStartupDialogsAcceptsCodexTrustDialog(t *testing.T) {
 	}
 }
 
+func TestAcceptStartupDialogsAcceptsGeminiTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	peekCall := 0
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			peekCall++
+			if peekCall == 1 {
+				return "Do you trust the files in this folder?\n● 1. Trust folder (city)\n  2. Trust parent folder\n  3. Don't trust", nil
+			}
+			return "Type your message or @path/to/file", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsPeeksDeepEnoughForLateTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(lines int) (string, error) {
+			if lines < 100 {
+				return "› Implement {feature}", nil
+			}
+			return "Do you trust the contents of this directory?\n› Implement {feature}", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
 func TestAcceptStartupDialogsAcceptsBypassPermissionsWarning(t *testing.T) {
 	withZeroDialogTimings(t)
 	dialogPollTimeout = time.Second
@@ -122,6 +181,34 @@ func TestAcceptStartupDialogsAcceptsBypassPermissionsWarning(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
 		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsAcceptsCustomAPIKeyDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	call := 0
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			call++
+			if call <= 2 {
+				return "normal startup output", nil
+			}
+			return "Detected a custom API key in your environment\nDo you want to use this API key?\n1. Yes\n2. No (recommended)", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Up", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Up Enter]", sent)
 	}
 }
 
@@ -271,6 +358,40 @@ func TestContainsRateLimitDialog(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := containsRateLimitDialog(tt.content); got != tt.want {
 				t.Errorf("containsRateLimitDialog(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsCustomAPIKeyDialog(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "custom api key prompt",
+			content: "Detected a custom API key in your environment\nDo you want to use this API key?",
+			want:    true,
+		},
+		{
+			name:    "question only",
+			content: "Do you want to use this API key?",
+			want:    true,
+		},
+		{
+			name:    "normal output",
+			content: "Starting Claude Code...",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsCustomAPIKeyDialog(tt.content); got != tt.want {
+				t.Fatalf("containsCustomAPIKeyDialog(%q) = %v, want %v", tt.content, got, tt.want)
 			}
 		})
 	}

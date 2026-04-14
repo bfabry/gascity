@@ -569,3 +569,44 @@ func TestResumeTier_AsleepSessionWithAssignedWork(t *testing.T) {
 		t.Fatal("resume tier must fire for asleep session with assigned work")
 	}
 }
+
+// Regression: routed-but-unassigned queue work must not directly create pool
+// demand here. New worker creation comes from scale_check/work_query.
+func TestComputePoolDesiredStates_RoutedButUnassignedDoesNotSpawnNew(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", nil, 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "claude", "", "open", 5),
+	}
+
+	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 0 {
+		t.Fatalf("total requests = %d, want 0", total)
+	}
+}
+
+// Regression: same as above but for a rig-scoped agent.
+func TestComputePoolDesiredStates_RoutedRigScopedDoesNotSpawnNew(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "myrig", nil, 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "myrig/claude", "", "open", 3),
+	}
+
+	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 0 {
+		t.Fatalf("total requests = %d, want 0", total)
+	}
+}

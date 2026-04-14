@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
 )
@@ -731,7 +732,7 @@ func TestProcessRalphCheckResumesExistingRetryAttemptWithoutDuplicates(t *testin
 	if err := store.Close(run1.ID); err != nil {
 		t.Fatalf("close run1: %v", err)
 	}
-	if _, err := appendRalphRetry(store, logical.ID, run1, check1, 2); err != nil {
+	if _, err := appendRalphRetry(store, logical.ID, run1, check1, 2, cityPath); err != nil {
 		t.Fatalf("appendRalphRetry: %v", err)
 	}
 
@@ -782,7 +783,7 @@ func TestAppendRalphRetryDefersAssigneesUntilDepsAreWired(t *testing.T) {
 	run1 = mustGetBead(t, inspect, run1.ID)
 	check1 = mustGetBead(t, inspect, check1.ID)
 
-	mapping, err := appendRalphRetry(inspect, logical.ID, run1, check1, 2)
+	mapping, err := appendRalphRetry(inspect, logical.ID, run1, check1, 2, "")
 	if err != nil {
 		t.Fatalf("appendRalphRetry: %v", err)
 	}
@@ -803,18 +804,34 @@ func TestAppendRalphRetryDefersAssigneesUntilDepsAreWired(t *testing.T) {
 func TestAppendRalphRetryClearsPoolAssignee(t *testing.T) {
 	t.Parallel()
 
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "test-city"
+provider = "claude"
+
+[[agent]]
+name = "polecat"
+
+[agent.pool]
+min = 0
+max = -1
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
 	store, logical, run1, check1 := newSimpleRalphLoop(t, "implement", "unused", 3)
 	poolSlot := "polecat-2"
 	if err := store.Update(run1.ID, beads.UpdateOpts{
 		Assignee: &poolSlot,
-		Labels:   []string{"pool:polecat"},
+		Metadata: map[string]string{"gc.routed_to": "polecat"},
 	}); err != nil {
 		t.Fatalf("assign pooled run1: %v", err)
 	}
 	run1 = mustGetBead(t, store, run1.ID)
 	check1 = mustGetBead(t, store, check1.ID)
 
-	mapping, err := appendRalphRetry(store, logical.ID, run1, check1, 2)
+	mapping, err := appendRalphRetry(store, logical.ID, run1, check1, 2, cityPath)
 	if err != nil {
 		t.Fatalf("appendRalphRetry: %v", err)
 	}
@@ -921,7 +938,7 @@ func TestAppendRalphRetryRemapsNestedRetryLogicalRefs(t *testing.T) {
 	mustDepAdd(t, store, check1.ID, run1.ID, "blocks")
 	mustDepAdd(t, store, logical.ID, check1.ID, "blocks")
 
-	mapping, err := appendRalphRetry(store, logical.ID, run1, check1, 2)
+	mapping, err := appendRalphRetry(store, logical.ID, run1, check1, 2, "")
 	if err != nil {
 		t.Fatalf("appendRalphRetry: %v", err)
 	}
@@ -959,7 +976,7 @@ func TestBuildRalphRetryGraphNodeRemapsNestedRetryLogicalRef(t *testing.T) {
 	}, "top-logical", "demo.review-loop.run.1", "demo.review-loop.run.2", 1, 2, map[string]bool{
 		"old-eval":    true,
 		"old-logical": true,
-	})
+	}, (*config.City)(nil))
 
 	if got := node.Metadata["gc.step_ref"]; got != "demo.review-loop.run.2.review-claude.eval.1" {
 		t.Fatalf("node gc.step_ref = %q, want demo.review-loop.run.2.review-claude.eval.1", got)
@@ -989,7 +1006,7 @@ func TestBuildRalphRetryGraphNodeRemapsNestedScopeCheckControlForFromStepRef(t *
 			"gc.step_ref":    "mol-adopt-pr-v2.review-loop.run.3.review-pipeline.review-codex.run.1-scope-check",
 			"gc.control_for": "review-loop.run.3.review-pipeline.review-codex.run.1",
 		},
-	}, "top-logical", "mol-adopt-pr-v2.review-loop.run.3", "mol-adopt-pr-v2.review-loop.run.4", 3, 4, nil)
+	}, "top-logical", "mol-adopt-pr-v2.review-loop.run.3", "mol-adopt-pr-v2.review-loop.run.4", 3, 4, nil, (*config.City)(nil))
 
 	if got := node.Metadata["gc.step_ref"]; got != "mol-adopt-pr-v2.review-loop.run.4.review-pipeline.review-codex.run.1-scope-check" {
 		t.Fatalf("node gc.step_ref = %q, want rewritten outer Ralph scope with nested retry attempt unchanged", got)

@@ -428,7 +428,7 @@ func TestBdStoreList(t *testing.T) {
 		out []byte
 		err error
 	}{
-		`bd list --json --limit 0 --include-infra`: {
+		`bd list --json --include-infra --limit 0`: {
 			out: []byte(`[{"id":"bd-aaa","title":"first","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},{"id":"bd-bbb","title":"second","status":"closed","issue_type":"bug","created_at":"2025-01-15T10:31:00Z"}]`),
 		},
 	})
@@ -437,14 +437,14 @@ func TestBdStoreList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("List() returned %d beads, want 2", len(got))
+	if len(got) != 1 {
+		t.Fatalf("ListOpen() returned %d beads, want 1", len(got))
 	}
 	if got[0].ID != "bd-aaa" {
 		t.Errorf("got[0].ID = %q, want %q", got[0].ID, "bd-aaa")
 	}
-	if got[1].Status != "closed" {
-		t.Errorf("got[1].Status = %q, want %q", got[1].Status, "closed")
+	if got[0].Status != "open" {
+		t.Errorf("got[0].Status = %q, want %q", got[0].Status, "open")
 	}
 }
 
@@ -453,7 +453,7 @@ func TestBdStoreListEmpty(t *testing.T) {
 		out []byte
 		err error
 	}{
-		`bd list --json --limit 0 --include-infra`: {out: []byte(`[]`)},
+		`bd list --json --include-infra --limit 0`: {out: []byte(`[]`)},
 	})
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.ListOpen()
@@ -916,7 +916,7 @@ func TestBdStoreListByLabel(t *testing.T) {
 		out []byte
 		err error
 	}{
-		`bd list --json --label=order-run:digest --all --include-infra --limit 5`: {
+		`bd list --json --label=order-run:digest --include-infra --limit 5`: {
 			out: []byte(`[{"id":"bd-aaa","title":"digest wisp","status":"open","issue_type":"task","created_at":"2026-02-27T10:00:00Z","labels":["order-run:digest"]}]`),
 		},
 	})
@@ -941,7 +941,7 @@ func TestBdStoreListByLabelEmpty(t *testing.T) {
 		out []byte
 		err error
 	}{
-		`bd list --json --label=order-run:none --all --include-infra --limit 1`: {out: []byte(`[]`)},
+		`bd list --json --label=order-run:none --include-infra --limit 1`: {out: []byte(`[]`)},
 	})
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.ListByLabel("order-run:none", 1)
@@ -985,6 +985,25 @@ func TestBdStoreListByLabelZeroLimit(t *testing.T) {
 	if !strings.Contains(args, "--include-infra") {
 		t.Errorf("args = %q, want --include-infra", args)
 	}
+	if strings.Contains(args, "--all") {
+		t.Errorf("args = %q, did not want --all by default", args)
+	}
+}
+
+func TestBdStoreListByLabelIncludeClosedAddsAll(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByLabel("order-run:digest", 1, beads.IncludeClosed); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, want --all when IncludeClosed is set", args)
+	}
 }
 
 func TestBdStoreListByAssigneeIncludesInfra(t *testing.T) {
@@ -1025,6 +1044,25 @@ func TestBdStoreListByMetadataIncludesInfra(t *testing.T) {
 	}
 	if !strings.Contains(args, "--include-infra") {
 		t.Fatalf("args = %q, want --include-infra", args)
+	}
+	if strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, did not want --all by default", args)
+	}
+}
+
+func TestBdStoreListByMetadataIncludeClosedAddsAll(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByMetadata(map[string]string{"alias": "mayor"}, 0, beads.IncludeClosed); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, want --all when IncludeClosed is set", args)
 	}
 }
 

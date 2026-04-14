@@ -394,6 +394,37 @@ func TestValidateVars(t *testing.T) {
 	}
 }
 
+func TestCheckResidualVars(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "no placeholders", input: "Step A: implement auth", want: nil},
+		{name: "all resolved", input: "Implement auth for CLOUD-123", want: nil},
+		{name: "one unresolved", input: "[CLOUD-123] Implement: {{feature}}", want: []string{"feature"}},
+		{name: "multiple unresolved", input: "[{{epic}}] Review: {{feature}}", want: []string{"epic", "feature"}},
+		{name: "empty string", input: "", want: nil},
+		{name: "only placeholder", input: "{{title}}", want: []string{"title"}},
+		{name: "deduplicates repeated", input: "[{{epic}}] {{epic}} review", want: []string{"epic"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CheckResidualVars(tt.input)
+			if len(got) != len(tt.want) {
+				t.Errorf("CheckResidualVars(%q) = %v, want %v", tt.input, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("CheckResidualVars(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestApplyDefaults(t *testing.T) {
 	formula := &Formula{
 		Formula: "mol-defaults",
@@ -1356,6 +1387,76 @@ waits_for = "all-children"
 	// Test waits_for (another snake_case field)
 	if step3.WaitsFor != "all-children" {
 		t.Errorf("Steps[2].WaitsFor = %q, want 'all-children'", step3.WaitsFor)
+	}
+}
+
+func TestParseTOML_StepTags(t *testing.T) {
+	tomlData := `
+formula = "mol-tags-test"
+version = 1
+type = "workflow"
+
+[[steps]]
+id = "alpha"
+title = "Alpha step"
+tags = ["my-tag", "{{epic}}"]
+
+[[steps]]
+id = "beta"
+title = "Beta step"
+needs = ["alpha"]
+tags = ["my-tag", "review"]
+`
+	p := NewParser()
+	f, err := p.ParseTOML([]byte(tomlData))
+	if err != nil {
+		t.Fatalf("ParseTOML failed: %v", err)
+	}
+
+	if len(f.Steps) != 2 {
+		t.Fatalf("len(Steps) = %d, want 2", len(f.Steps))
+	}
+
+	alpha := f.Steps[0]
+	if len(alpha.Labels) != 2 {
+		t.Fatalf("Steps[0].Labels = %v, want [my-tag {{epic}}]", alpha.Labels)
+	}
+	if alpha.Labels[0] != "my-tag" || alpha.Labels[1] != "{{epic}}" {
+		t.Errorf("Steps[0].Labels = %v, want [my-tag {{epic}}]", alpha.Labels)
+	}
+
+	beta := f.Steps[1]
+	if len(beta.Labels) != 2 {
+		t.Fatalf("Steps[1].Labels = %v, want [my-tag review]", beta.Labels)
+	}
+	if beta.Labels[0] != "my-tag" || beta.Labels[1] != "review" {
+		t.Errorf("Steps[1].Labels = %v, want [my-tag review]", beta.Labels)
+	}
+}
+
+func TestExtractVariables_IncludesLabels(t *testing.T) {
+	f := &Formula{
+		Formula:     "mol-label-vars",
+		Description: "Test {{project}}",
+		Steps: []*Step{
+			{ID: "s1", Title: "Step", Labels: []string{"{{epic}}", "fixed"}},
+		},
+	}
+
+	vars := ExtractVariables(f)
+	found := make(map[string]bool)
+	for _, v := range vars {
+		found[v] = true
+	}
+
+	if !found["project"] {
+		t.Error("ExtractVariables missed 'project' from description")
+	}
+	if !found["epic"] {
+		t.Error("ExtractVariables missed 'epic' from step labels")
+	}
+	if found["fixed"] {
+		t.Error("ExtractVariables should not extract non-variable 'fixed'")
 	}
 }
 

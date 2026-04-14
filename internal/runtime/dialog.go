@@ -12,12 +12,14 @@ var (
 	dialogPollTimeout        = 8 * time.Second
 	startupDialogAcceptDelay = 500 * time.Millisecond
 	bypassDialogConfirmDelay = 200 * time.Millisecond
+	startupDialogPeekLines   = 120
 )
 
 // AcceptStartupDialogs dismisses startup dialogs that can block automated
 // sessions. Handles (in order):
 //  1. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
 //  2. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
+//  3. Claude custom API key confirmation — requires Up+Enter to select "Yes"
 //
 // The peek function should return the last N lines of the session's terminal output.
 // The sendKeys function should send bare tmux-style keystrokes (e.g., "Enter", "Down").
@@ -36,6 +38,12 @@ func AcceptStartupDialogs(
 	}
 	if err := acceptBypassPermissionsWarning(ctx, peek, sendKeys); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := acceptCustomAPIKeyDialog(ctx, peek, sendKeys); err != nil {
+		return fmt.Errorf("custom API key dialog: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -61,7 +69,7 @@ func acceptWorkspaceTrustDialog(
 			return err
 		}
 
-		content, err := peek(30)
+		content, err := peek(startupDialogPeekLines)
 		if err != nil {
 			return err
 		}
@@ -91,7 +99,8 @@ func acceptWorkspaceTrustDialog(
 func containsWorkspaceTrustDialog(content string) bool {
 	return strings.Contains(content, "trust this folder") ||
 		strings.Contains(content, "Quick safety check") ||
-		strings.Contains(content, "Do you trust the contents of this directory?")
+		strings.Contains(content, "Do you trust the contents of this directory?") ||
+		strings.Contains(content, "Do you trust the files in this folder?")
 }
 
 // acceptBypassPermissionsWarning dismisses the Claude Code bypass permissions
@@ -108,7 +117,7 @@ func acceptBypassPermissionsWarning(
 			return err
 		}
 
-		content, err := peek(30)
+		content, err := peek(startupDialogPeekLines)
 		if err != nil {
 			return err
 		}
@@ -130,6 +139,48 @@ func acceptBypassPermissionsWarning(
 	return nil
 }
 
+// acceptCustomAPIKeyDialog dismisses Claude's API-key confirmation prompt.
+// In headless CI, Claude detects the injected ANTHROPIC_API_KEY and asks if it
+// should use it. The menu defaults to "No (recommended)", so press Up then
+// Enter to choose "Yes" and proceed with the configured provider.
+func acceptCustomAPIKeyDialog(
+	ctx context.Context,
+	peek func(lines int) (string, error),
+	sendKeys func(keys ...string) error,
+) error {
+	deadline := time.Now().Add(dialogPollTimeout)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		content, err := peek(startupDialogPeekLines)
+		if err != nil {
+			return err
+		}
+
+		if containsCustomAPIKeyDialog(content) {
+			if err := sendKeys("Up"); err != nil {
+				return err
+			}
+			sleep(ctx, bypassDialogConfirmDelay)
+			return sendKeys("Enter")
+		}
+
+		if containsPromptIndicator(content) || containsRateLimitDialog(content) {
+			return nil
+		}
+
+		sleep(ctx, dialogPollInterval)
+	}
+	return nil
+}
+
+func containsCustomAPIKeyDialog(content string) bool {
+	return strings.Contains(content, "Detected a custom API key in your environment") ||
+		strings.Contains(content, "Do you want to use this API key?")
+}
+
 // dismissRateLimitDialog detects rate limit / usage limit dialogs (e.g.,
 // Gemini's "Usage limit reached") and selects "Stop" to let the session
 // exit cleanly. The reconciler treats the exit as a startup failure and
@@ -145,7 +196,7 @@ func dismissRateLimitDialog(
 			return err
 		}
 
-		content, err := peek(30)
+		content, err := peek(startupDialogPeekLines)
 		if err != nil {
 			return err
 		}

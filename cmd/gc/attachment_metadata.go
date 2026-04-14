@@ -49,7 +49,10 @@ func collectAttachedBeads(parent beads.Bead, store beads.Store, childQuerier Bea
 	addByID(parent.Metadata["workflow_id"])
 
 	if childQuerier != nil {
-		children, err := childQuerier.Children(parent.ID)
+		children, err := childQuerier.List(beads.ListQuery{
+			ParentID: parent.ID,
+			Sort:     beads.SortCreatedAsc,
+		})
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
