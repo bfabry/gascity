@@ -409,7 +409,9 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 				failed++
 				continue
 			}
-			_ = deps.Store.SetMetadata(child.ID, "molecule_id", cookResult.RootID)
+			if err := deps.Store.SetMetadata(child.ID, "molecule_id", cookResult.RootID); err != nil {
+				batchResult.warn(fmt.Sprintf("  setting molecule_id on %s: %v", child.ID, err))
+			}
 			batchResult.msg(
 				fmt.Sprintf("  Attached wisp %s → %s", cookResult.RootID, child.ID))
 		} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
@@ -426,7 +428,9 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 				failed++
 				continue
 			}
-			_ = deps.Store.SetMetadata(child.ID, "molecule_id", cookResult.RootID)
+			if err := deps.Store.SetMetadata(child.ID, "molecule_id", cookResult.RootID); err != nil {
+				batchResult.warn(fmt.Sprintf("  setting molecule_id on %s: %v", child.ID, err))
+			}
 			batchResult.msg(
 				fmt.Sprintf("  Attached wisp %s (default formula) → %s", cookResult.RootID, child.ID))
 		}

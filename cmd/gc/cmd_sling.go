@@ -16,9 +16,8 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/fsys"
-	"github.com/gastownhall/gascity/internal/molecule"
-	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -451,9 +450,6 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdo
 	return 0
 }
 
-// The original doSling and doSlingBatch function bodies have been moved
-// to internal/ops/sling_core.go. The remaining helpers below are delegated
-// to ops or kept locally for CLI-specific functionality.
 
 // buildSlingFormulaVars merges caller-provided vars with the runtime context
 // needed by common work formulas. Explicit --var entries always win.
@@ -632,43 +628,6 @@ func checkBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store b
 		fmt.Fprintln(w, o.Text) //nolint:errcheck
 	}
 	return err
-}
-
-func isGraphWorkflowAttachment(store beads.Store, rootID string) bool {
-	if store == nil || rootID == "" {
-		return false
-	}
-	b, err := store.Get(rootID)
-	if err != nil {
-		return false
-	}
-	return b.Metadata["gc.kind"] == "workflow" && b.Metadata["gc.formula_contract"] == "graph.v2"
-}
-
-func instantiateSlingFormula(ctx context.Context, formulaName string, searchPaths []string, opts molecule.Options, sourceBeadID, scopeKind, scopeRef string, a config.Agent, deps slingDeps) (*molecule.Result, error) {
-	slingTracef("instantiate start formula=%s source=%s agent=%s parent=%s", formulaName, sourceBeadID, a.QualifiedName(), opts.ParentID)
-	if opts.PriorityOverride == nil && sourceBeadID != "" {
-		opts.PriorityOverride = beadPriorityOverride(deps.Store, sourceBeadID)
-	}
-	compileStart := time.Now()
-	recipe, err := formula.Compile(ctx, formulaName, searchPaths, opts.Vars)
-	if err != nil {
-		slingTracef("instantiate compile-error formula=%s dur=%s err=%v", formulaName, time.Since(compileStart), err)
-		return nil, err
-	}
-	slingTracef("instantiate compiled formula=%s dur=%s steps=%d", formulaName, time.Since(compileStart), len(recipe.Steps))
-	if err := applyGraphRouting(recipe, &a, a.QualifiedName(), opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, deps.Store, deps.CityName, deps.Cfg); err != nil {
-		slingTracef("instantiate decorate-error formula=%s err=%v", formulaName, err)
-		return nil, err
-	}
-	instantiateStart := time.Now()
-	result, err := molecule.Instantiate(ctx, deps.Store, recipe, opts)
-	if err != nil {
-		slingTracef("instantiate molecule-error formula=%s dur=%s err=%v", formulaName, time.Since(instantiateStart), err)
-		return nil, err
-	}
-	slingTracef("instantiate done formula=%s dur=%s root=%s created=%d graph=%t", formulaName, time.Since(instantiateStart), result.RootID, result.Created, result.GraphWorkflow)
-	return result, nil
 }
 
 func graphWorkflowRouteVars(recipe *formula.Recipe, provided map[string]string) map[string]string {

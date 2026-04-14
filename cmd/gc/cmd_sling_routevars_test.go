@@ -11,6 +11,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/sling"
 )
 
 func TestDecorateGraphWorkflowRecipeSubstitutesRouteTargetsWithinRigContext(t *testing.T) {
@@ -171,7 +172,7 @@ type = "task"
 	}
 
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
-	result, err := instantiateSlingFormula(
+	result, err := sling.InstantiateSlingFormula(
 		context.Background(),
 		"wf-test",
 		[]string{formulaDir},
@@ -179,7 +180,7 @@ type = "task"
 		"", "", "", a, deps,
 	)
 	if err != nil {
-		t.Fatalf("instantiateSlingFormula: %v", err)
+		t.Fatalf("InstantiateSlingFormula: %v", err)
 	}
 	if result.RootID == "" {
 		t.Fatal("RootID is empty")
