@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/sling"
@@ -174,21 +173,8 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		Store:    store,
 		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
 		Runner:   s.slingRunner(),
-		ResolveAgent: func(cfg *config.City, name, rigContext string) (config.Agent, bool) {
-			return findAgent(cfg, name)
-		},
-		IsMultiSession: func(a *config.Agent) bool {
-			if a == nil {
-				return false
-			}
-			maxSess := a.EffectiveMaxActiveSessions()
-			return maxSess == nil || *maxSess != 1
-		},
-		LookupSessionName: apiLookupSessionName,
-		PokeController: func(_ string) error {
-			s.state.Poke()
-			return nil
-		},
+		Resolver: apiAgentResolver{},
+		Notify:   &apiNotifier{state: s.state},
 	}
 
 	// Call sling.DoSling directly -- returns structured result, no I/O.
@@ -280,8 +266,25 @@ func mergeEnvForSling(extra map[string]string) []string {
 	return merged
 }
 
-// apiLookupSessionName resolves a session name from the bead store.
-func apiLookupSessionName(store beads.Store, cityName, qualifiedName, sessionTemplate string) string {
-	return agent.SessionNameFor(cityName, qualifiedName, sessionTemplate)
+// apiAgentResolver implements sling.AgentResolver for the API context.
+// Uses exact qualified name matching (no ambient rig context).
+type apiAgentResolver struct{}
+
+func (apiAgentResolver) ResolveAgent(cfg *config.City, name, _ string) (config.Agent, bool) {
+	return findAgent(cfg, name)
 }
+
+// apiNotifier implements sling.Notifier for the API context.
+type apiNotifier struct {
+	state State
+}
+
+func (n *apiNotifier) PokeController(_ string) {
+	n.state.Poke()
+}
+
+func (n *apiNotifier) PokeControlDispatch(_ string) {
+	n.state.Poke()
+}
+
 

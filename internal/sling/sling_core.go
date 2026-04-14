@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -22,8 +23,8 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		result.warn(
 			fmt.Sprintf("warning: agent %q is suspended — bead routed but may not be picked up", a.QualifiedName()))
 	}
-	if deps.ScaleParams != nil && deps.IsMultiSession != nil && deps.IsMultiSession(&a) {
-		sp := deps.ScaleParams(&a)
+	if agentutil.IsMultiSessionAgent(&a) {
+		sp := agentutil.ScaleParamsFor(&a)
 		if sp.Max == 0 && !opts.Force {
 			result.warn(
 				fmt.Sprintf("warning: pool %q has max=0 — bead routed but no instances to claim it", a.QualifiedName()))
@@ -218,8 +219,8 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 	result.Method = method
 
 	// Poke controller for immediate reconciliation.
-	if !opts.SkipPoke && deps.PokeController != nil {
-		_ = deps.PokeController(deps.CityPath)
+	if !opts.SkipPoke && deps.Notify != nil {
+		deps.Notify.PokeController(deps.CityPath)
 	}
 
 	// Signal that nudge is needed (caller handles actual nudge).
@@ -250,11 +251,11 @@ func doStartGraphWorkflow(mResult *molecule.Result, sourceBeadID string, a confi
 		}
 	}
 	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
-	if deps.PokeController != nil {
-		_ = deps.PokeController(deps.CityPath)
+	if deps.Notify != nil {
+		deps.Notify.PokeController(deps.CityPath)
 	}
-	if deps.PokeControlDispatch != nil {
-		_ = deps.PokeControlDispatch(deps.CityPath)
+	if deps.Notify != nil {
+		deps.Notify.PokeControlDispatch(deps.CityPath)
 	}
 	return result, nil
 }

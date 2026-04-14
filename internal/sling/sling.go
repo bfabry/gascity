@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
@@ -51,8 +52,24 @@ type SlingOpts struct {
 	ScopeRef      string
 }
 
-// SlingDeps bundles infrastructure dependencies injected for testability.
-// No I/O fields -- domain functions return structured results.
+// AgentResolver resolves an agent name to a config.Agent.
+type AgentResolver interface {
+	ResolveAgent(cfg *config.City, name, rigContext string) (config.Agent, bool)
+}
+
+// BranchResolver resolves the default branch for a directory.
+type BranchResolver interface {
+	DefaultBranch(dir string) string
+}
+
+// Notifier sends wake notifications to the controller and control
+// dispatcher. Methods are best-effort.
+type Notifier interface {
+	PokeController(cityPath string)
+	PokeControlDispatch(cityPath string)
+}
+
+// SlingDeps bundles infrastructure dependencies for sling operations.
 type SlingDeps struct {
 	CityName string
 	CityPath string
@@ -62,14 +79,10 @@ type SlingDeps struct {
 	Store    beads.Store
 	StoreRef string
 
-	// Injected functions from cmd/gc that sling cannot import directly.
-	ResolveAgent        func(cfg *config.City, name, rigContext string) (config.Agent, bool)
-	IsMultiSession      func(a *config.Agent) bool
-	LookupSessionName   func(store beads.Store, cityName, qualifiedName, sessionTemplate string) string
-	ScaleParams         func(a *config.Agent) ScaleInfo
-	DefaultBranch       func(dir string) string
-	PokeController      func(cityPath string) error
-	PokeControlDispatch func(cityPath string) error
+	// Narrow interfaces (matches established internal package patterns).
+	Resolver AgentResolver  // agent name resolution
+	Branches BranchResolver // git default branch lookup (nil = skip)
+	Notify   Notifier       // controller/dispatcher wake (nil = skip)
 }
 
 // OutputKind tags a result output line as a message or warning.
@@ -406,8 +419,8 @@ func SlingFormulaTargetBranch(beadID string, deps SlingDeps, a config.Agent) str
 	if target := BeadMetadataTarget(deps.Store, beadID); target != "" {
 		return target
 	}
-	if deps.DefaultBranch != nil {
-		return deps.DefaultBranch(SlingFormulaRepoDir(beadID, deps, a))
+	if deps.Branches != nil {
+		return deps.Branches.DefaultBranch(SlingFormulaRepoDir(beadID, deps, a))
 	}
 	return ""
 }
@@ -448,13 +461,10 @@ func BuildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 
 // ResolveSlingEnv returns extra env vars for the sling command.
 func ResolveSlingEnv(a config.Agent, deps SlingDeps) map[string]string {
-	if deps.IsMultiSession != nil && deps.IsMultiSession(&a) {
+	if agentutil.IsMultiSessionAgent(&a) {
 		return nil
 	}
-	if deps.LookupSessionName == nil {
-		return nil
-	}
-	sn := deps.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), deps.Cfg.Workspace.SessionTemplate)
+	sn := agentutil.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), deps.Cfg.Workspace.SessionTemplate)
 	return map[string]string{"GC_SLING_TARGET": sn}
 }
 

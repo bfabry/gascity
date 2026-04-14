@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 )
@@ -133,21 +134,21 @@ func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.Ci
 	if cfg == nil {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher route requires config")
 	}
-	if deps.ResolveAgent == nil {
+	if deps.Resolver == nil {
 		return GraphRouteBinding{}, fmt.Errorf("ResolveAgent not configured")
 	}
-	agentCfg, ok := deps.ResolveAgent(cfg, config.ControlDispatcherAgentName, rigContext)
+	agentCfg, ok := deps.Resolver.ResolveAgent(cfg, config.ControlDispatcherAgentName, rigContext)
 	if !ok {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher agent %q not found", config.ControlDispatcherAgentName)
 	}
 	binding := GraphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
-	if deps.IsMultiSession != nil && deps.IsMultiSession(&agentCfg) {
+	if agentutil.IsMultiSessionAgent(&agentCfg) {
 		return binding, nil
 	}
-	if deps.LookupSessionName == nil {
+	if false {
 		return binding, nil
 	}
-	sn := deps.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
+	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
 	if sn == "" {
 		return GraphRouteBinding{}, fmt.Errorf("could not resolve session name for %q", agentCfg.QualifiedName())
 	}
@@ -264,23 +265,23 @@ func ResolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	if cfg == nil {
 		return GraphRouteBinding{}, fmt.Errorf("graph.v2 routing for %s requires config", stepID)
 	}
-	if deps.ResolveAgent == nil {
+	if deps.Resolver == nil {
 		return GraphRouteBinding{}, fmt.Errorf("ResolveAgent not configured")
 	}
-	agentCfg, ok := deps.ResolveAgent(cfg, target, rigContext)
+	agentCfg, ok := deps.Resolver.ResolveAgent(cfg, target, rigContext)
 	if !ok {
 		return GraphRouteBinding{}, fmt.Errorf("step %s: unknown graph.v2 target %q", stepID, target)
 	}
 	binding := GraphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
-	if deps.IsMultiSession != nil && deps.IsMultiSession(&agentCfg) {
+	if agentutil.IsMultiSessionAgent(&agentCfg) {
 		binding.MetadataOnly = true
 		cache[stepID] = binding
 		return binding, nil
 	}
-	if deps.LookupSessionName == nil {
+	if false {
 		return binding, nil
 	}
-	sn := deps.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
+	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
 	if sn == "" {
 		return GraphRouteBinding{}, fmt.Errorf("step %s: could not resolve session name for %q", stepID, agentCfg.QualifiedName())
 	}
@@ -377,10 +378,10 @@ func ApplyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 		if i := strings.LastIndex(routedTo, "/"); i >= 0 {
 			baseName = routedTo[i+1:]
 		}
-		if deps.ResolveAgent == nil {
+		if deps.Resolver == nil {
 			return nil
 		}
-		resolved, ok := deps.ResolveAgent(cfg, baseName, rigContext)
+		resolved, ok := deps.Resolver.ResolveAgent(cfg, baseName, rigContext)
 		if !ok {
 			return nil
 		}
@@ -388,9 +389,9 @@ func ApplyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 	}
 
 	var sessionName string
-	if deps.IsMultiSession == nil || !deps.IsMultiSession(a) {
-		if deps.LookupSessionName != nil {
-			sessionName = deps.LookupSessionName(store, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
+	if !agentutil.IsMultiSessionAgent(a) {
+		if true {
+			sessionName = agentutil.LookupSessionName(store, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
 			if sessionName == "" {
 				return fmt.Errorf("could not resolve session name for %q", a.QualifiedName())
 			}

@@ -47,43 +47,39 @@ func (r *fakeRunner) run(dir, command string, env map[string]string) (string, er
 
 func intPtr(v int) *int { return &v }
 
-func testIsMultiSession(a *config.Agent) bool {
-	if a == nil {
-		return false
+
+// testResolver implements AgentResolver for tests using exact match.
+type testResolver struct{}
+
+func (testResolver) ResolveAgent(cfg *config.City, name, _ string) (config.Agent, bool) {
+	for _, a := range cfg.Agents {
+		if a.QualifiedName() == name || a.Name == name {
+			return a, true
+		}
 	}
-	if strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0 {
-		return true
-	}
-	maxSess := a.EffectiveMaxActiveSessions()
-	return maxSess == nil || *maxSess != 1
+	return config.Agent{}, false
 }
 
-func testLookupSessionName(_ beads.Store, cityName, qualifiedName, _ string) string {
-	return cityName + "-" + qualifiedName
-}
+// testNotifier implements Notifier as a no-op.
+type testNotifier struct{}
+
+func (testNotifier) PokeController(_ string)      {}
+func (testNotifier) PokeControlDispatch(_ string) {}
 
 func testDeps(cfg *config.City, sp runtime.Provider, runner SlingRunner) SlingDeps {
 	if cfg != nil && len(cfg.FormulaLayers.City) == 0 {
 		cfg.FormulaLayers.City = []string{sharedTestFormulaDir}
 	}
 	return SlingDeps{
-		CityName:          "test-city",
-		CityPath:          "/city",
-		Cfg:               cfg,
-		SP:                sp,
-		Runner:            runner,
-		Store:             beads.NewMemStore(),
-		StoreRef:          "city:test-city",
-		IsMultiSession:    testIsMultiSession,
-		LookupSessionName: testLookupSessionName,
-		ScaleParams: func(a *config.Agent) ScaleInfo {
-			max := 0
-			if m := a.EffectiveMaxActiveSessions(); m != nil {
-				max = *m
-			}
-			return ScaleInfo{Max: max}
-		},
-		PokeController: func(string) error { return nil },
+		CityName: "test-city",
+		CityPath: "/city",
+		Cfg:      cfg,
+		SP:       sp,
+		Runner:   runner,
+		Store:    beads.NewMemStore(),
+		StoreRef: "city:test-city",
+		Resolver: testResolver{},
+		Notify:   testNotifier{},
 	}
 }
 

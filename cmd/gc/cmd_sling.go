@@ -354,25 +354,37 @@ func slingDirForBead(cfg *config.City, cityPath, beadID string) string {
 	return sling.SlingDirForBead(cfg, cityPath, beadID)
 }
 
-// populateSlingDepsCallbacks fills in the injected function fields that ops
-// needs but can't import directly from cmd/gc.
+// populateSlingDepsCallbacks fills in the interface fields on SlingDeps.
 func populateSlingDepsCallbacks(deps *slingDeps) {
-	deps.ResolveAgent = func(cfg *config.City, name, rigContext string) (config.Agent, bool) {
-		return resolveAgentIdentity(cfg, name, rigContext)
-	}
-	deps.IsMultiSession = func(a *config.Agent) bool {
-		return isMultiSessionCfgAgent(a)
-	}
-	deps.LookupSessionName = func(store beads.Store, cityName, qualifiedName, sessionTemplate string) string {
-		return lookupSessionNameOrLegacy(store, cityName, qualifiedName, sessionTemplate)
-	}
-	deps.ScaleParams = func(a *config.Agent) sling.ScaleInfo {
-		sp := scaleParamsFor(a)
-		return sling.ScaleInfo{Min: sp.Min, Max: sp.Max}
-	}
-	deps.DefaultBranch = defaultBranchFor
-	deps.PokeController = slingPokeController
-	deps.PokeControlDispatch = slingPokeControlDispatcher
+	deps.Resolver = cliAgentResolver{}
+	deps.Branches = cliBranchResolver{}
+	deps.Notify = &cliNotifier{}
+}
+
+// cliAgentResolver implements sling.AgentResolver using the CLI's
+// 3-step resolution with ambient rig context.
+type cliAgentResolver struct{}
+
+func (cliAgentResolver) ResolveAgent(cfg *config.City, name, rigContext string) (config.Agent, bool) {
+	return resolveAgentIdentity(cfg, name, rigContext)
+}
+
+// cliBranchResolver implements sling.BranchResolver using git.
+type cliBranchResolver struct{}
+
+func (cliBranchResolver) DefaultBranch(dir string) string {
+	return defaultBranchFor(dir)
+}
+
+// cliNotifier implements sling.Notifier using IPC.
+type cliNotifier struct{}
+
+func (cliNotifier) PokeController(cityPath string) {
+	_ = slingPokeController(cityPath)
+}
+
+func (cliNotifier) PokeControlDispatch(cityPath string) {
+	_ = slingPokeControlDispatcher(cityPath)
 }
 
 // printSlingResult writes a SlingResult to stdout/stderr.

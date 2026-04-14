@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/config"
 )
 
@@ -207,7 +208,7 @@ func CheckBeadState(q BeadQuerier, beadID string, a config.Agent, deps SlingDeps
 		}
 	}
 
-	isMulti := deps.IsMultiSession != nil && deps.IsMultiSession(&a)
+	isMulti := agentutil.IsMultiSessionAgent(&a)
 	if !isMulti {
 		if b.Assignee == target {
 			return BeadCheckResult{Idempotent: true}

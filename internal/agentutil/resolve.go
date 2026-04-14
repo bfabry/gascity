@@ -120,7 +120,7 @@ func findAgentByQualified(cfg *config.City, identity string) (config.Agent, bool
 // "rig/polecat-2" by matching against each pool agent.
 func resolvePoolInstanceQualified(cfg *config.City, input string) (config.Agent, bool) {
 	for _, a := range cfg.Agents {
-		if !isMultiSessionAgent(&a) {
+		if !IsMultiSessionAgent(&a) {
 			continue
 		}
 		prefix := a.QualifiedName() + "-"
@@ -145,7 +145,7 @@ func resolvePoolInstanceQualified(cfg *config.City, input string) (config.Agent,
 // matchPoolInstanceBare checks if a bare input matches a multi-session
 // agent's instance pattern (e.g., "polecat-2" matches "polecat").
 func matchPoolInstanceBare(a config.Agent, input string) (config.Agent, bool) {
-	if !isMultiSessionAgent(&a) {
+	if !IsMultiSessionAgent(&a) {
 		return config.Agent{}, false
 	}
 	prefix := a.Name + "-"
@@ -165,9 +165,9 @@ func matchPoolInstanceBare(a config.Agent, input string) (config.Agent, bool) {
 	return DeepCopyAgent(&a, input, a.Dir), true
 }
 
-// isMultiSessionAgent reports whether a config agent supports multiple
+// IsMultiSessionAgent reports whether a config agent supports multiple
 // concurrent sessions.
-func isMultiSessionAgent(a *config.Agent) bool {
+func IsMultiSessionAgent(a *config.Agent) bool {
 	if a == nil {
 		return false
 	}
