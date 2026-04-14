@@ -1205,7 +1205,7 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 		w("  This creates a wisp and returns its root bead ID.")
 		w("")
 
-		routeCmd := buildSlingCommand(a.EffectiveSlingQuery(), "<wisp-root>")
+		routeCmd := sling.BuildSlingCommand(a.EffectiveSlingQuery(), "<wisp-root>")
 		w("Route command (not executed):")
 		w("  " + routeCmd)
 		w("  The wisp root bead (not the formula name) is routed to the agent.")
@@ -1214,12 +1214,12 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 		// Work section (bead info).
 		printBeadInfo(w, querier, opts.BeadOrFormula)
 
-		// Cross-rig section — show when bead prefix doesn't match agent's rig.
+		// Cross-rig section.
 		printCrossRigSection(w, opts.BeadOrFormula, a, deps.Cfg)
 
-		// Idempotency section — show when bead is already routed to this target.
-		result := checkBeadState(querier, opts.BeadOrFormula, a)
-		if result.Idempotent {
+		// Idempotency section -- use preflight result instead of re-querying.
+		check := sling.CheckBeadState(querier, opts.BeadOrFormula, a, deps)
+		if check.Idempotent {
 			w("Idempotency:")
 			w("  Bead " + opts.BeadOrFormula + " is already routed to " + a.QualifiedName() + ".")
 			w("  Without --force, sling would skip routing (exit 0).")
@@ -1227,12 +1227,13 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 		}
 
 		// Attach formula section (--on or default).
+		// Dry-run does NOT auto-burn molecules (no mutations).
 		if opts.OnFormula != "" {
-			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, stderr); err != nil {
-				fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
+			// Read-only check: does the bead already have an attached molecule?
+			if label, id := sling.FindBlockingMolecule(querier, opts.BeadOrFormula, deps.Store); label != "" {
+				fmt.Fprintf(stderr, "gc sling: bead %s already has attached %s %s\n", opts.BeadOrFormula, label, id) //nolint:errcheck
 				return 1
 			}
-
 			w("Attach formula:")
 			w("  Formula: " + opts.OnFormula)
 			w("  --on attaches a wisp (structured work instructions) to an existing")
@@ -1247,11 +1248,10 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 			w("  Pre-check: " + opts.BeadOrFormula + " has no existing molecule/wisp children ✓")
 			w("")
 		} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
-			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, stderr); err != nil {
-				fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
+			if label, id := sling.FindBlockingMolecule(querier, opts.BeadOrFormula, deps.Store); label != "" {
+				fmt.Fprintf(stderr, "gc sling: bead %s already has attached %s %s\n", opts.BeadOrFormula, label, id) //nolint:errcheck
 				return 1
 			}
-
 			w("Default formula:")
 			w("  Formula: " + a.EffectiveDefaultSlingFormula())
 			w("  Target " + a.QualifiedName() + " has a default_sling_formula configured.")
@@ -1266,10 +1266,10 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 			w("")
 		}
 
-		routeCmd := buildSlingCommand(a.EffectiveSlingQuery(), opts.BeadOrFormula)
+		routeCmd := sling.BuildSlingCommand(a.EffectiveSlingQuery(), opts.BeadOrFormula)
 		w("Route command (not executed):")
 		w("  " + routeCmd)
-		if !isCustomSlingQuery(a) {
+		if !sling.IsCustomSlingQuery(a) {
 			if isMultiSessionCfgAgent(&a) {
 				w("  This labels the bead for pool \"" + a.QualifiedName() + "\".")
 			} else {
@@ -1319,11 +1319,10 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, stderr io.Writer,
 	// Children list.
 	w(fmt.Sprintf("  Children (%d total, %d open):", len(children), len(open)))
 	for _, c := range children {
-		clabel := formatBeadLabel(c.ID, c.Title)
+		clabel := sling.FormatBeadLabel(c.ID, c.Title)
 		if c.Status == "open" {
-			// Check idempotency for open children.
-			result := checkBeadState(querier, c.ID, a)
-			if result.Idempotent {
+			check := sling.CheckBeadState(querier, c.ID, a, deps)
+			if check.Idempotent {
 				w("    " + clabel + " (open) → already routed (skip)")
 			} else {
 				suffix := " → would route"
@@ -1359,7 +1358,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, stderr io.Writer,
 	// Route commands.
 	w("Route commands (not executed):")
 	for _, c := range open {
-		routeCmd := buildSlingCommand(a.EffectiveSlingQuery(), c.ID)
+		routeCmd := sling.BuildSlingCommand(a.EffectiveSlingQuery(), c.ID)
 		w("  " + routeCmd)
 	}
 	w("")

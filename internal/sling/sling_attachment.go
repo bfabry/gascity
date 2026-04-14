@@ -104,8 +104,41 @@ func IsMoleculeAttachment(b beads.Bead) bool {
 	return strings.EqualFold(strings.TrimSpace(b.Type), "molecule")
 }
 
+// FindBlockingMolecule checks if the bead has any open attached molecule
+// or wisp children. Returns the blocking attachment's label and ID, or
+// empty strings if none. Read-only -- does not auto-burn.
+func FindBlockingMolecule(q BeadQuerier, beadID string, store beads.Store) (label, id string) {
+	parent, ok := BeadFromGetters(beadID, q, store)
+	if !ok {
+		return "", ""
+	}
+	var childQuerier BeadChildQuerier
+	if cq, ok := q.(BeadChildQuerier); ok {
+		childQuerier = cq
+	} else if cq, ok := any(store).(BeadChildQuerier); ok {
+		childQuerier = cq
+	}
+	attachments, err := CollectAttachedBeads(parent, store, childQuerier)
+	if err != nil && len(attachments) == 0 {
+		return "", ""
+	}
+	for _, attached := range attachments {
+		if attached.Status != "closed" {
+			return AttachmentLabel(attached), attached.ID
+		}
+	}
+	return "", ""
+}
+
+// HasMoleculeChildren reports whether the bead has any open attached
+// molecule or wisp children. Read-only -- does not auto-burn.
+func HasMoleculeChildren(q BeadQuerier, beadID string, store beads.Store) bool {
+	label, _ := FindBlockingMolecule(q, beadID, store)
+	return label != ""
+}
+
 // CheckNoMoleculeChildren returns an error if the bead already has an attached
-// molecule or wisp child that is still open. Auto-burn messages go to result.Messages.
+// molecule or wisp child that is still open. Auto-burn messages go to result.AutoBurned.
 func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, result *SlingResult) error {
 	parent, ok := BeadFromGetters(beadID, q, store)
 	if !ok {
