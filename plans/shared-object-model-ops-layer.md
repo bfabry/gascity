@@ -1,55 +1,50 @@
 # Plan: Extract Shared Object Model
 
-## Status: Quality Pass In Progress
-
-Phases 1-5 extracted business logic into domain packages. The quality
-pass addresses five remaining issues with the domain API.
+## Status: Quality Pass Complete (Steps 1-4), Step 5 Remaining
 
 ## Completed Work
 
 ### Phases 1-5: Extraction (DONE)
 
-- `internal/sling/` -- work routing (DoSling, DoSlingBatch, formula
-  instantiation, graph routing, helpers)
+- `internal/sling/` -- work routing
 - `internal/convoy/` -- convoy CRUD with event emission
 - `internal/agentutil/` -- agent resolution, pool expansion
 - API handler calls domain directly (no subprocess)
 - Narrow interfaces (AgentResolver, BranchResolver, Notifier)
-- Zero I/O in domain packages
-- All tests pass, zero regressions
 
-### Quality Pass (IN PROGRESS)
+### Quality Pass
 
-#### Step 1: Eliminate OutputLine
+#### Step 1: Eliminate OutputLine (DONE)
 
-Replace `OutputLine` (user-facing text strings in domain) with
-structured data fields on `SlingResult`. The domain returns data;
-callers format display strings.
+Replaced `OutputLine` (user-facing text strings) with structured
+data fields on `SlingResult`: `AgentSuspended`, `PoolEmpty`,
+`AutoBurned`, `MetadataErrors`, `WispRootID`, `FormulaName`,
+`ContainerType`, `Children []SlingChildResult`, `IdempotentCt`.
 
-New fields: `AgentSuspended`, `PoolEmpty`, `CrossRigBlocked`,
-`WispRootID`, `AutoBurned []string`, `MetadataErrors []string`.
-Remove `Output []OutputLine`, `msg()`, `warn()` entirely.
+Domain returns pure data. CLI formats display strings in
+`printSlingResult`/`printBatchSlingResult`. API reads fields
+directly into JSON.
 
-#### Step 2: Decompose DoSling
+#### Step 2: Decompose DoSling (DONE)
 
-Split 237-line god function into focused dispatch functions:
+Split into focused functions: `DoSling` (20-line dispatcher) ->
 `preflight`, `slingFormula`, `slingOnFormula`,
 `slingDefaultFormula`, `slingPlainBead`, `finalize`.
 
-#### Step 3: Converge dispatch_runtime.go
+#### Step 3: Converge dispatch_runtime.go (DONE)
 
-Replace local `graphRouteBinding` / `applyGraphRouting` in
-`cmd/gc/dispatch_runtime.go` with imported `sling.GraphRouteBinding`
-/ `sling.ApplyGraphRouting`.
+Local graph routing duplicates replaced with thin delegations to
+sling package types (`GraphRouteBinding`, `ApplyGraphRouting`,
+etc.). ~80 lines of duplicated code eliminated.
 
-#### Step 4: Delete StartGraphWorkflow wrapper
+#### Step 4: Delete StartGraphWorkflow wrapper (DONE)
 
-Remove deprecated wrapper function.
+Removed deprecated wrapper.
 
-#### Step 5: Slim dry-run display
+#### Step 5: Slim dry-run display (REMAINING)
 
-Update `dryRunSingle`/`dryRunBatch` to format from `SlingResult`
-fields instead of re-querying beads.
+`dryRunSingle`/`dryRunBatch` still re-query beads. Could use
+`SlingResult` fields after Steps 1-2.
 
 ## Architecture
 
@@ -66,15 +61,20 @@ cmd/gc/cmd_*.go               internal/api/handler_*.go
             |
             v
    internal/{beads,config,formula,molecule,agent,events,...}
-   (persistence + runtime primitives)
 ```
 
-### Structural patterns
+### Domain API Design
 
-- Package doc comments on every package
-- Narrow interfaces for dependency injection
-- Context-only error messages (no CLI command names)
-- Structured result data (no user-facing text in domain)
-- Return (Result, error), no I/O
-- Tests alongside code
-- Strict downward-only dependency direction
+- **Structured data, no text**: Domain returns typed fields
+  (BeadID, Target, Method, AgentSuspended, AutoBurned, etc.).
+  Callers format display strings.
+- **Decomposed functions**: DoSling is a 20-line dispatcher.
+  Each dispatch path (formula, on-formula, default-formula,
+  plain-bead) is a focused function. Shared post-steps in
+  `finalize`.
+- **Narrow interfaces**: AgentResolver, BranchResolver, Notifier.
+  Direct imports for IsMultiSessionAgent, LookupSessionName,
+  ScaleParamsFor.
+- **Per-child results**: Batch operations return
+  `[]SlingChildResult` with per-child outcome data.
+- **Zero I/O, zero OutputLine, zero msg()/warn()** in domain.
