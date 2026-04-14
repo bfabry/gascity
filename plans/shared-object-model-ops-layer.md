@@ -2,53 +2,42 @@
 
 ## Status: Complete
 
-## Completed Work
+## What Was Done
 
-### Phases 1-5: Extraction (DONE)
+### Extraction (Phases 1-5)
 
-- `internal/sling/` -- work routing
+Extracted business logic from CLI (`cmd/gc/`) and API
+(`internal/api/`) into shared domain packages:
+
+- `internal/sling/` -- work routing (DoSling, DoSlingBatch)
 - `internal/convoy/` -- convoy CRUD with event emission
 - `internal/agentutil/` -- agent resolution, pool expansion
-- API handler calls domain directly (no subprocess)
-- Narrow interfaces (AgentResolver, BranchResolver, Notifier)
 
-### Quality Pass (DONE)
+The API handler calls `sling.DoSling` directly -- no more subprocess
+delegation. The CLI is a thin adapter that formats structured results.
 
-#### Step 1: Eliminate OutputLine (DONE)
+### Quality Pass
 
-Replaced `OutputLine` (user-facing text strings) with structured
-data fields on `SlingResult`: `AgentSuspended`, `PoolEmpty`,
-`AutoBurned`, `MetadataErrors`, `WispRootID`, `FormulaName`,
-`ContainerType`, `Children []SlingChildResult`, `IdempotentCt`.
+- **Structured data**: Domain returns typed fields (BeadID, Target,
+  AgentSuspended, AutoBurned, etc.). No OutputLine, no msg/warn,
+  no user-facing text in domain code.
+- **Decomposed DoSling**: 20-line dispatcher -> preflight,
+  slingFormula, slingOnFormula, slingDefaultFormula, slingPlainBead,
+  finalize.
+- **Converged dispatch_runtime.go**: Local graph routing duplicates
+  replaced with sling package types.
+- **Narrow interfaces**: AgentResolver, BranchResolver, Notifier.
+- **Read-only molecule check**: FindBlockingMolecule for dry-run
+  (no auto-burn during preview).
 
-Domain returns pure data. CLI formats display strings in
-`printSlingResult`/`printBatchSlingResult`. API reads fields
-directly into JSON.
+### Review Council Fixes
 
-#### Step 2: Decompose DoSling (DONE)
-
-Split into focused functions: `DoSling` (20-line dispatcher) ->
-`preflight`, `slingFormula`, `slingOnFormula`,
-`slingDefaultFormula`, `slingPlainBead`, `finalize`.
-
-#### Step 3: Converge dispatch_runtime.go (DONE)
-
-Local graph routing duplicates replaced with thin delegations to
-sling package types (`GraphRouteBinding`, `ApplyGraphRouting`,
-etc.). ~80 lines of duplicated code eliminated.
-
-#### Step 4: Delete StartGraphWorkflow wrapper (DONE)
-
-Removed deprecated wrapper.
-
-#### Step 5: Slim dry-run display (DONE)
-
-Dry-run functions now use domain functions directly
-(`sling.CheckBeadState`, `sling.BuildSlingCommand`,
-`sling.FindBlockingMolecule`) instead of local copies.
-
-Fixed a bug: dry-run was auto-burning molecules (mutating during
-preview). Now uses read-only `FindBlockingMolecule` check.
+- Deleted `if false` placeholder blocks
+- API surfaces MetadataErrors as `warnings` in JSON response
+- DoSling validates required deps (Cfg, Store, Runner) at entry
+- API wires BranchResolver for formula var population
+- preflight returns idiomatic `(SlingResult, error)`
+- Deleted dead "remove after tests" comment
 
 ## Architecture
 
@@ -67,20 +56,12 @@ cmd/gc/cmd_*.go               internal/api/handler_*.go
    internal/{beads,config,formula,molecule,agent,events,...}
 ```
 
-### Domain API Design
+### Key Design Decisions
 
-- **Structured data, no text**: Domain returns typed fields
-  (BeadID, Target, Method, AgentSuspended, AutoBurned, etc.).
-  Callers format display strings.
-- **Decomposed functions**: DoSling is a 20-line dispatcher.
-  Each dispatch path (formula, on-formula, default-formula,
-  plain-bead) is a focused function. Shared post-steps in
-  `finalize`.
-- **Narrow interfaces**: AgentResolver, BranchResolver, Notifier.
-  Direct imports for IsMultiSessionAgent, LookupSessionName,
-  ScaleParamsFor.
-- **Per-child results**: Batch operations return
-  `[]SlingChildResult` with per-child outcome data.
-- **Read-only checks**: `FindBlockingMolecule` for dry-run
-  molecule validation without auto-burn mutations.
-- **Zero I/O, zero OutputLine, zero msg()/warn()** in domain.
+- Structured data, not text strings, in domain layer
+- Per-domain dep structs (SlingDeps, ConvoyDeps), not monolithic
+- Narrow interfaces for DI (AgentResolver, BranchResolver, Notifier)
+- Required deps validated at entry (Cfg, Store, Runner)
+- preflight returns (Result, error) per Go convention
+- CLI type aliases for verbosity reduction (legitimate Go pattern)
+- Batch results as []SlingChildResult with per-child outcome data
