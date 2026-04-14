@@ -312,3 +312,21 @@ func TestDoSlingIdempotent(t *testing.T) {
 		t.Error("runner should not have been called")
 	}
 }
+
+func TestCheckBatchBurnOutputsWarn(t *testing.T) {
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-2", Type: "task", Status: "open"},
+		{ID: "MOL-1", Type: "molecule", Status: "open", ParentID: "BL-2"},
+	}, nil)
+	child := beads.Bead{ID: "BL-2", Status: "open", Assignee: ""}
+	var result SlingResult
+	// Pass store as both the store and querier (MemStore implements BeadChildQuerier)
+	err := CheckBatchNoMoleculeChildren(store, []beads.Bead{child}, store, &result)
+	t.Logf("err=%v output=%d", err, len(result.Output))
+	for _, o := range result.Output {
+		t.Logf("  kind=%d text=%q", o.Kind, o.Text)
+	}
+	if len(result.Output) == 0 {
+		t.Error("expected auto-burn output")
+	}
+}

@@ -1866,8 +1866,9 @@ func TestOnFormulaAutoBurnStaleMolecule(t *testing.T) {
 	}
 
 	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
-	// Seed store with MOL-1 so Close can find it by ID.
+	// Seed store with both BL-42 and MOL-1 so domain operations can find them.
 	deps.Store = beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-42", Type: "task", Status: "open"},
 		{ID: "MOL-1", Type: "molecule", Status: "open"},
 	}, nil)
 
@@ -2160,8 +2161,11 @@ func TestBatchAutoBurnStaleMolecules(t *testing.T) {
 	}
 
 	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
-	// Seed store with MOL-1 so Close can find it by ID.
+	// Seed store with convoy, children, and stale molecule.
 	deps.Store = beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "CVY-1", Type: "convoy", Status: "open"},
+		{ID: "BL-1", Type: "task", Status: "open", ParentID: "CVY-1"},
+		{ID: "BL-2", Type: "task", Status: "open", ParentID: "CVY-1"},
 		{ID: "MOL-1", Type: "molecule", Status: "open"},
 	}, nil)
 

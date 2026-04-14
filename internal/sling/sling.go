@@ -111,6 +111,7 @@ type SlingResult struct {
 	WorkflowID string       // non-empty for graph workflow launches
 	ConvoyID   string       // non-empty if auto-convoy was created
 	Idempotent bool         // true if bead was already routed (skipped)
+	DryRun     bool         // true if this was a dry-run (no mutations)
 	Output     []OutputLine // ordered messages and warnings (preserves interleaving)
 
 	// Batch fields (populated by DoSlingBatch).

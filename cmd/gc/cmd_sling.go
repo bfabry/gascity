@@ -399,7 +399,7 @@ func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	}
 }
 
-// doSling delegates to sling.DoSling and handles CLI I/O + nudge.
+// doSling delegates to sling.DoSling and handles CLI I/O + nudge + dry-run.
 func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
 	result, err := sling.DoSling(opts, deps, querier)
@@ -408,13 +408,17 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 		fmt.Fprintln(stderr, err) //nolint:errcheck
 		return 1
 	}
+	// Dry-run: display the CLI preview using the domain result.
+	if result.DryRun {
+		return dryRunSingle(opts, deps, querier, stdout, stderr)
+	}
 	if result.NudgeAgent != nil {
 		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
 	}
 	return 0
 }
 
-// doSlingBatch delegates to sling.DoSlingBatch and handles CLI I/O + nudge.
+// doSlingBatch delegates to sling.DoSlingBatch and handles CLI I/O + nudge + dry-run.
 func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
 	result, err := sling.DoSlingBatch(opts, deps, querier)
@@ -422,6 +426,24 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdo
 	if err != nil {
 		fmt.Fprintln(stderr, err) //nolint:errcheck
 		return 1
+	}
+	if result.DryRun {
+		// For batch dry-run, look up the container bead for display.
+		if querier != nil {
+			if b, getErr := querier.Get(opts.BeadOrFormula); getErr == nil {
+				children, _ := querier.List(beads.ListQuery{
+					ParentID: b.ID, IncludeClosed: true, Sort: beads.SortCreatedAsc,
+				})
+				var open []beads.Bead
+				for _, c := range children {
+					if c.Status == "open" {
+						open = append(open, c)
+					}
+				}
+				return dryRunBatch(opts, deps, stdout, stderr, b, children, open, querier)
+			}
+		}
+		return dryRunSingle(opts, deps, querier, stdout, stderr)
 	}
 	if result.NudgeAgent != nil {
 		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
@@ -591,73 +613,25 @@ func printCrossRigSection(w func(string), beadID string, a config.Agent, cfg *co
 	}
 }
 
-// checkNoMoleculeChildren returns an error if the bead already has an attached
-// molecule or wisp child that is still open. Closed molecules are skipped
-// (defense-in-depth). Open molecules on unassigned beads are auto-burned
-// (closed) to unblock re-dispatch after mid-sling failures.
+// checkNoMoleculeChildren delegates to sling.CheckNoMoleculeChildren,
+// bridging the io.Writer interface for CLI dry-run display.
 func checkNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w io.Writer) error {
-	parent, ok := beadFromGetters(beadID, q, store)
-	if !ok {
-		return nil
+	var result sling.SlingResult
+	err := sling.CheckNoMoleculeChildren(q, beadID, store, &result)
+	for _, o := range result.Output {
+		fmt.Fprintln(w, o.Text) //nolint:errcheck
 	}
-	parentUnassigned := strings.TrimSpace(parent.Assignee) == ""
-
-	var childQuerier BeadChildQuerier
-	if cq, ok := q.(BeadChildQuerier); ok {
-		childQuerier = cq
-	} else if cq, ok := any(store).(BeadChildQuerier); ok {
-		childQuerier = cq
-	}
-	attachments, err := collectAttachedBeads(parent, store, childQuerier)
-	if err != nil && len(attachments) == 0 {
-		return nil
-	}
-
-	for _, attached := range attachments {
-		if attached.Status == "closed" {
-			continue
-		}
-		if parentUnassigned && store != nil {
-			if burnErr := store.Close(attached.ID); burnErr == nil {
-				fmt.Fprintf(w, "Auto-burned stale %s %s on unassigned bead %s\n", attachmentLabel(attached), attached.ID, beadID) //nolint:errcheck // best-effort
-				continue
-			}
-		}
-		return fmt.Errorf("bead %s already has attached %s %s", beadID, attachmentLabel(attached), attached.ID)
-	}
-	return nil
+	return err
 }
 
-// checkBatchNoMoleculeChildren checks all open children for existing molecule
-// attachments before any wisps are created. Closed molecules are skipped.
-// Open molecules on unassigned beads are auto-burned to unblock re-dispatch.
-// Returns an error listing all problematic beads if any have live molecules.
+// checkBatchNoMoleculeChildren delegates to sling.CheckBatchNoMoleculeChildren.
 func checkBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store beads.Store, w io.Writer) error {
-	var problems []string
-	for _, child := range open {
-		attachments, err := collectAttachedBeads(child, store, q)
-		if err != nil && len(attachments) == 0 {
-			continue // best-effort per-child
-		}
-		childUnassigned := strings.TrimSpace(child.Assignee) == ""
-		for _, attached := range attachments {
-			if attached.Status == "closed" {
-				continue
-			}
-			if childUnassigned && store != nil {
-				if burnErr := store.Close(attached.ID); burnErr == nil {
-					fmt.Fprintf(w, "Auto-burned stale %s %s on unassigned bead %s\n", attachmentLabel(attached), attached.ID, child.ID) //nolint:errcheck // best-effort
-					continue
-				}
-			}
-			problems = append(problems, fmt.Sprintf("%s (has %s %s)", child.ID, attachmentLabel(attached), attached.ID))
-		}
+	var result sling.SlingResult
+	err := sling.CheckBatchNoMoleculeChildren(q, open, store, &result)
+	for _, o := range result.Output {
+		fmt.Fprintln(w, o.Text) //nolint:errcheck
 	}
-	if len(problems) > 0 {
-		return fmt.Errorf("cannot use --on: beads already have attached molecules: %s",
-			strings.Join(problems, ", "))
-	}
-	return nil
+	return err
 }
 
 func isGraphWorkflowAttachment(store beads.Store, rootID string) bool {
@@ -1004,106 +978,17 @@ func targetType(a *config.Agent) string {
 	return "agent"
 }
 
-// beadCheckResult captures the outcome of a pre-flight bead state check.
-type beadCheckResult struct {
-	Idempotent bool     // bead already routed to the same target
-	Warnings   []string // warnings about existing routing to different targets
-}
+// beadCheckResult is an alias for sling.BeadCheckResult.
+type beadCheckResult = sling.BeadCheckResult
 
-// checkBeadState checks whether a bead is already routed and returns a
-// structured result. Callers decide how to handle idempotency vs warnings.
-// Best-effort: nil querier or query failure → empty result (proceed silently).
+// checkBeadState delegates to sling.CheckBeadState.
 func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResult {
-	if q == nil {
-		return beadCheckResult{}
-	}
-	b, err := q.Get(beadID)
-	if err != nil {
-		return beadCheckResult{} // best-effort: can't query → skip check
-	}
-
-	// Custom sling_query: can't determine idempotency — fall through to
-	// generic warnings only.
-	if isCustomSlingQuery(a) {
-		var warnings []string
-		if b.Assignee != "" {
-			warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
-		}
-		if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
-			warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
-		}
-		for _, l := range b.Labels {
-			if strings.HasPrefix(l, "pool:") {
-				warnings = append(warnings, fmt.Sprintf("warning: bead %s already has pool label %q", beadID, l))
-			}
-		}
-		return beadCheckResult{Warnings: warnings}
-	}
-
-	target := a.QualifiedName()
-	if strings.TrimSpace(b.Metadata["gc.routed_to"]) == target {
-		// Only idempotent if the bead is unassigned or already assigned
-		// consistently with the target. Otherwise the bead would be
-		// invisible to the target's work_query (which requires --unassigned
-		// for pool work in tier 3).
-		if b.Assignee == "" || b.Assignee == target {
-			return beadCheckResult{Idempotent: true}
-		}
-		return beadCheckResult{
-			Warnings: []string{fmt.Sprintf("warning: bead %s routed to %q but assigned to %q", beadID, target, b.Assignee)},
-		}
-	}
-
-	// Fixed agent: check legacy assignee routing as a compatibility fallback.
-	if !isMultiSessionCfgAgent(&a) {
-		if b.Assignee == target {
-			return beadCheckResult{Idempotent: true}
-		}
-		var warnings []string
-		if b.Assignee != "" {
-			warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
-		}
-		if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
-			warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
-		}
-		for _, l := range b.Labels {
-			if strings.HasPrefix(l, "pool:") {
-				warnings = append(warnings, fmt.Sprintf("warning: bead %s already has pool label %q", beadID, l))
-			}
-		}
-		return beadCheckResult{Warnings: warnings}
-	}
-
-	// Multi-session targets: pool labels are a legacy fallback only when
-	// gc.routed_to is absent. If gc.routed_to is set (even to a different
-	// target), it is authoritative — a stale pool label must not short-circuit.
-	if strings.TrimSpace(b.Metadata["gc.routed_to"]) == "" {
-		poolLabel := "pool:" + target
-		for _, l := range b.Labels {
-			if l == poolLabel {
-				return beadCheckResult{Idempotent: true}
-			}
-		}
-	}
-	var warnings []string
-	if b.Assignee != "" {
-		warnings = append(warnings, fmt.Sprintf("warning: bead %s already assigned to %q", beadID, b.Assignee))
-	}
-	if routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"]); routedTo != "" {
-		warnings = append(warnings, fmt.Sprintf("warning: bead %s already routed to %q", beadID, routedTo))
-	}
-	for _, l := range b.Labels {
-		if strings.HasPrefix(l, "pool:") {
-			warnings = append(warnings, fmt.Sprintf("warning: bead %s already has pool label %q", beadID, l))
-		}
-	}
-	return beadCheckResult{Warnings: warnings}
+	// Build a minimal SlingDeps for the check (only needs IsMultiSession).
+	deps := sling.SlingDeps{}
+	return sling.CheckBeadState(q, beadID, a, deps)
 }
 
-// doSlingNudge sends a nudge to the target agent after routing.
-// For pools, nudges the first running instance. If the target is not
-// running, pokes the controller to trigger an immediate reconciler tick
-// so WakeWork can wake the session without waiting for the next patrol.
+// checkBeadStateOriginal is dead code — remove after tests are updated.
 func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 	sp runtime.Provider, store beads.Store, stdout, stderr io.Writer,
 ) {

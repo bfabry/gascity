@@ -43,6 +43,7 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		check := CheckBeadState(querier, opts.BeadOrFormula, a, deps)
 		if check.Idempotent {
 			result.Idempotent = true
+			result.DryRun = opts.DryRun
 			result.BeadID = opts.BeadOrFormula
 			result.Method = "bead"
 			result.msg(
@@ -52,6 +53,25 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		for _, w := range check.Warnings {
 			result.warn(w)
 		}
+	}
+
+	// Dry-run: return early with preview info, no mutations.
+	if opts.DryRun {
+		result.DryRun = true
+		result.BeadID = opts.BeadOrFormula
+		result.Method = "bead"
+		if opts.IsFormula {
+			result.Method = "formula"
+		} else if opts.OnFormula != "" {
+			result.Method = "on-formula"
+		}
+		// Include cross-rig info for preview.
+		if !opts.IsFormula {
+			if msg := CheckCrossRig(opts.BeadOrFormula, a, deps.Cfg); msg != "" {
+				result.warn(msg)
+			}
+		}
+		return result, nil
 	}
 
 	beadID := opts.BeadOrFormula
@@ -312,6 +332,24 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if msg := CheckCrossRig(b.ID, a, deps.Cfg); msg != "" {
 			return SlingResult{}, fmt.Errorf("%s", msg)
 		}
+	}
+
+	// Dry-run: return early with container preview info.
+	if opts.DryRun {
+		var batchResult SlingResult
+		batchResult.DryRun = true
+		batchResult.Target = a.QualifiedName()
+		batchResult.BeadID = b.ID
+		batchResult.Method = "batch"
+		batchResult.Total = len(children)
+		batchResult.Routed = len(open)
+		batchResult.Skipped = len(skipped)
+		if !opts.IsFormula {
+			if msg := CheckCrossRig(b.ID, a, deps.Cfg); msg != "" {
+				batchResult.warn(msg)
+			}
+		}
+		return batchResult, nil
 	}
 
 	// Pre-check molecule attachments.
