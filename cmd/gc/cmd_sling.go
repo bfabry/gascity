@@ -386,10 +386,9 @@ func (cliNotifier) PokeControlDispatch(cityPath string) {
 	_ = slingPokeControlDispatcher(cityPath)
 }
 
-// printSlingResult formats a SlingResult for CLI display.
-// Warnings go to stderr, messages go to stdout -- matching original behavior.
-func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
-	// Warnings (stderr).
+// printSlingWarnings prints only warnings from a SlingResult to stderr.
+// Called before error handling so warnings are visible even on failure.
+func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 	if result.AgentSuspended {
 		fmt.Fprintf(stderr, "warning: agent %q is suspended — bead routed but may not be picked up\n", result.Target) //nolint:errcheck
 	}
@@ -405,7 +404,11 @@ func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	for _, e := range result.MetadataErrors {
 		fmt.Fprintf(stderr, "gc sling: %s\n", e) //nolint:errcheck
 	}
+}
 
+// printSlingResult formats a SlingResult for CLI display.
+// Warnings go to stderr, messages go to stdout -- matching original behavior.
+func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	// Skip display messages for idempotent/dry-run (handled separately).
 	if result.Idempotent {
 		fmt.Fprintf(stdout, "Bead %s already routed to %s — skipping (idempotent)\n", result.BeadID, result.Target) //nolint:errcheck
@@ -526,6 +529,9 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 	// a different querier with pre-seeded beads.
 	_ = sl // Sling instance available for future direct use
 	result, err := sling.DoSling(opts, deps, querier)
+	// Always print warnings (suspended, pool-empty, bead warnings)
+	// even when the operation fails -- they provide context for the error.
+	printSlingWarnings(result, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err) //nolint:errcheck
 		return 1
@@ -565,6 +571,8 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdo
 			Nudge: opts.Nudge, Force: opts.Force, SkipPoke: opts.SkipPoke, DryRun: opts.DryRun,
 		}, querier)
 	}
+	// Print warnings before error check so they're visible on failure.
+	printSlingWarnings(result, stderr)
 	// Always print results when we have children (partial failures
 	// should still show per-child status).
 	if len(result.Children) > 0 {
