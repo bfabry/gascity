@@ -767,13 +767,13 @@ func decorateGraphWorkflowRecipe(recipe *formula.Recipe, routeVars map[string]st
 	if recipe == nil {
 		return fmt.Errorf("workflow recipe is nil")
 	}
-	defaultRoute := graphRouteBinding{qualifiedName: routedTo}
+	defaultRoute := graphRouteBinding{QualifiedName: routedTo}
 	if sessionName != "" {
-		defaultRoute.sessionName = sessionName
+		defaultRoute.SessionName = sessionName
 	} else {
-		defaultRoute.metadataOnly = true
+		defaultRoute.MetadataOnly = true
 	}
-	routingRigContext := graphRouteRigContext(defaultRoute.qualifiedName)
+	routingRigContext := graphRouteRigContext(defaultRoute.QualifiedName)
 	controlRoute, err := controlDispatcherBinding(store, cityName, cfg, routingRigContext)
 	if err != nil {
 		return err
@@ -860,11 +860,8 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 	return ""
 }
 
-type graphRouteBinding struct {
-	qualifiedName string
-	sessionName   string
-	metadataOnly  bool
-}
+// graphRouteBinding is an alias for sling.GraphRouteBinding.
+type graphRouteBinding = sling.GraphRouteBinding
 
 func resolveGraphStepBinding(stepID string, stepByID map[string]*formula.RecipeStep, stepAlias map[string]string, depsByStep map[string][]string, cache map[string]graphRouteBinding, resolving map[string]bool, fallback graphRouteBinding, rigContext string, store beads.Store, cityName string, cfg *config.City) (graphRouteBinding, error) {
 	return resolveGraphStepBindingWithVars(stepID, stepByID, stepAlias, depsByStep, cache, resolving, nil, fallback, rigContext, store, cityName, cfg)
@@ -975,9 +972,9 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	if !ok {
 		return graphRouteBinding{}, fmt.Errorf("step %s: unknown graph.v2 target %q", stepID, target)
 	}
-	binding := graphRouteBinding{qualifiedName: agentCfg.QualifiedName()}
+	binding := graphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
 	if isMultiSessionCfgAgent(&agentCfg) {
-		binding.metadataOnly = true
+		binding.MetadataOnly = true
 		cache[stepID] = binding
 		return binding, nil
 	}
@@ -985,7 +982,7 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	if sn == "" {
 		return graphRouteBinding{}, fmt.Errorf("step %s: could not resolve session name for %q", stepID, agentCfg.QualifiedName())
 	}
-	binding.sessionName = sn
+	binding.SessionName = sn
 	cache[stepID] = binding
 	return binding, nil
 }

@@ -11,7 +11,8 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 )
 
-const graphExecutionRouteMetaKey = "gc.execution_routed_to"
+// GraphExecutionRouteMetaKey is the metadata key for the execution route.
+const GraphExecutionRouteMetaKey = "gc.execution_routed_to"
 
 // GraphRouteBinding captures how a graph.v2 step is routed to an agent.
 type GraphRouteBinding struct {
@@ -101,14 +102,14 @@ func ApplyGraphRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding)
 func AssignGraphStepRoute(step *formula.RecipeStep, executionBinding GraphRouteBinding, controlBinding *GraphRouteBinding) {
 	if controlBinding != nil {
 		if executionBinding.QualifiedName != "" {
-			step.Metadata[graphExecutionRouteMetaKey] = executionBinding.QualifiedName
+			step.Metadata[GraphExecutionRouteMetaKey] = executionBinding.QualifiedName
 		} else {
-			delete(step.Metadata, graphExecutionRouteMetaKey)
+			delete(step.Metadata, GraphExecutionRouteMetaKey)
 		}
 		ApplyGraphRouteBinding(step, *controlBinding)
 		return
 	}
-	delete(step.Metadata, graphExecutionRouteMetaKey)
+	delete(step.Metadata, GraphExecutionRouteMetaKey)
 	ApplyGraphRouteBinding(step, executionBinding)
 }
 
@@ -117,7 +118,7 @@ func WorkflowExecutionRouteFromMeta(meta map[string]string) string {
 	if meta == nil {
 		return ""
 	}
-	if routedTo := strings.TrimSpace(meta[graphExecutionRouteMetaKey]); routedTo != "" {
+	if routedTo := strings.TrimSpace(meta[GraphExecutionRouteMetaKey]); routedTo != "" {
 		return routedTo
 	}
 	return strings.TrimSpace(meta["gc.routed_to"])
