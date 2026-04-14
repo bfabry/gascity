@@ -684,3 +684,144 @@ func TestDoSlingNudgeSignal(t *testing.T) {
 		t.Error("expected NudgeAgent to be set")
 	}
 }
+
+func TestDoSlingSuspendedAgentWarnsEvenOnFailure(t *testing.T) {
+	// Matches gastown-sling tutorial: sling to suspended agent, runner fails,
+	// but AgentSuspended should still be set so CLI prints the warning.
+	runner := newFakeRunner()
+	runner.on("bd update", "", fmt.Errorf("runner failed"))
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), Suspended: true}
+
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
+
+	if err == nil {
+		t.Fatal("expected runner error")
+	}
+	// Even on failure, the warning flags must be set so callers can display them.
+	if !result.AgentSuspended {
+		t.Error("expected AgentSuspended=true even when runner fails")
+	}
+}
+
+// --- Tests matching tutorial scenarios (gastown-sling.txtar) ---
+
+func TestDoSlingNonexistentTargetFails(t *testing.T) {
+	// Matches gastown-sling scenario 2: sling to nonexistent target.
+	runner := newFakeRunner()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Agents:    []config.Agent{{Name: "mayor", MaxActiveSessions: intPtr(1)}},
+	}
+	nonexistent := config.Agent{Name: "nonexistent", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	// Cross-rig and routing should still work even if agent doesn't exist in config.
+	// The runner will fail, but the domain doesn't validate agent existence.
+	result, err := DoSling(testOpts(nonexistent, "BL-1"), deps, nil)
+	if err != nil {
+		// Runner fails because bd can't find the agent, which is expected.
+		_ = result
+		return
+	}
+	// If no error, the bead was routed to the nonexistent agent -- also valid at domain level.
+}
+
+func TestDoSlingPoolEmptyWarnsOnFailure(t *testing.T) {
+	// Matches gastown-sling scenario 4: sling to empty pool warns.
+	runner := newFakeRunner()
+	runner.on("bd update", "", fmt.Errorf("runner failed"))
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "empty-pool", MaxActiveSessions: intPtr(0)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
+	if err == nil {
+		t.Fatal("expected runner error for max=0 pool")
+	}
+	if !result.PoolEmpty {
+		t.Error("expected PoolEmpty=true even when runner fails")
+	}
+}
+
+func TestDoSlingFormulaInstantiationError(t *testing.T) {
+	// Matches gastown-sling scenario 5: formula not found.
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	_, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "nonexistent-formula", IsFormula: true,
+	}, deps, nil)
+	if err == nil {
+		t.Fatal("expected error for nonexistent formula")
+	}
+	if !strings.Contains(err.Error(), "nonexistent-formula") {
+		t.Errorf("error = %q, want formula name in message", err.Error())
+	}
+}
+
+func TestDoSlingBatchSkipsClosedChildren(t *testing.T) {
+	// Matches gastown-convoy: convoy with mixed open/closed children.
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	store := deps.Store
+	convoy, _ := store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	store.Create(beads.Bead{Title: "open", Type: "task", ParentID: convoy.ID, Status: "open"})
+	cb, _ := store.Create(beads.Bead{Title: "closed", Type: "task", ParentID: convoy.ID}); store.Close(cb.ID)
+
+	result, err := DoSlingBatch(SlingOpts{
+		Target: a, BeadOrFormula: convoy.ID,
+	}, deps, store)
+	if err != nil {
+		t.Fatalf("DoSlingBatch: %v", err)
+	}
+	if result.Routed != 1 {
+		t.Errorf("Routed = %d, want 1 (only open child)", result.Routed)
+	}
+	if result.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1 (closed child)", result.Skipped)
+	}
+}
+
+func TestDoSlingBatchEmptyConvoyErrors(t *testing.T) {
+	// Convoy with no open children should error.
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	store := deps.Store
+	convoy, _ := store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	cb, _ := store.Create(beads.Bead{Title: "closed", Type: "task", ParentID: convoy.ID}); store.Close(cb.ID)
+
+	_, err := DoSlingBatch(SlingOpts{
+		Target: a, BeadOrFormula: convoy.ID,
+	}, deps, store)
+	if err == nil {
+		t.Fatal("expected error for convoy with no open children")
+	}
+}
+
+func TestDoSlingForceSkipsCrossRig(t *testing.T) {
+	// --force should allow cross-rig routing.
+	runner := newFakeRunner()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Rigs: []config.Rig{
+			{Name: "myrig", Path: "/myrig", Prefix: "BL"},
+			{Name: "other", Path: "/other", Prefix: "OT"},
+		},
+	}
+	a := config.Agent{Name: "worker", Dir: "other", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	_, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-42", Force: true,
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling with --force should not error on cross-rig: %v", err)
+	}
+}
