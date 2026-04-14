@@ -1,15 +1,13 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"net/http"
-	"sort"
-	"strings"
-
-	"context"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
@@ -168,7 +166,6 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 
 	// Build SlingDeps from api.State.
 	store := s.findSlingStore(body.Rig, agentCfg)
-	var stdout, stderr bytes.Buffer
 	deps := sling.SlingDeps{
 		CityName: s.state.CityName(),
 		CityPath: s.state.CityPath(),
@@ -177,9 +174,6 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		Store:    store,
 		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
 		Runner:   s.slingRunner(),
-		Stdout:   &stdout,
-		Stderr:   &stderr,
-		// Inject API-side resolution functions.
 		ResolveAgent: func(cfg *config.City, name, rigContext string) (config.Agent, bool) {
 			return findAgent(cfg, name)
 		},
@@ -197,16 +191,10 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		},
 	}
 
-	// Call sling.DoSling directly.
-	exitCode := sling.DoSling(slingOpts, deps, store)
-	if exitCode != 0 {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = strings.TrimSpace(stdout.String())
-		}
-		if message == "" {
-			message = fmt.Sprintf("sling failed with exit code %d", exitCode)
-		}
+	// Call sling.DoSling directly -- returns structured result, no I/O.
+	result, err := sling.DoSling(slingOpts, deps, store)
+	if err != nil {
+		message := err.Error()
 		return nil, http.StatusBadRequest, "invalid", message
 	}
 
@@ -222,15 +210,12 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 
 	resp.Formula = formulaName
 	resp.AttachedBeadID = attachedBeadID
-	workflowID := parseWorkflowIDFromSlingOutput(stdout.String())
-	if workflowID == "" {
-		workflowID = parseWorkflowIDFromSlingOutput(stderr.String())
+	// Use structured result fields directly -- no stdout parsing needed.
+	resp.WorkflowID = result.WorkflowID
+	resp.RootBeadID = result.BeadID
+	if resp.WorkflowID == "" && resp.RootBeadID == "" {
+		return nil, http.StatusInternalServerError, "internal", "sling did not produce a workflow or bead id"
 	}
-	if workflowID == "" {
-		return nil, http.StatusInternalServerError, "internal", "sling did not report a workflow id"
-	}
-	resp.WorkflowID = workflowID
-	resp.RootBeadID = workflowID
 	return resp, http.StatusCreated, "", ""
 }
 
@@ -300,21 +285,3 @@ func apiLookupSessionName(store beads.Store, cityName, qualifiedName, sessionTem
 	return agent.SessionNameFor(cityName, qualifiedName, sessionTemplate)
 }
 
-func parseWorkflowIDFromSlingOutput(output string) string {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		for _, prefix := range []string{"Started workflow ", "Attached workflow "} {
-			if rest, ok := strings.CutPrefix(line, prefix); ok {
-				workflowID, _, _ := strings.Cut(rest, " ")
-				return strings.TrimSpace(workflowID)
-			}
-		}
-		if rest, ok := strings.CutPrefix(line, "Slung formula "); ok {
-			if _, afterRoot, found := strings.Cut(rest, "(wisp root "); found {
-				workflowID, _, _ := strings.Cut(afterRoot, ")")
-				return strings.TrimSpace(workflowID)
-			}
-		}
-	}
-	return ""
-}

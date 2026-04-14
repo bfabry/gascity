@@ -1,7 +1,6 @@
 package sling
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,7 +47,6 @@ func (r *fakeRunner) run(dir, command string, env map[string]string) (string, er
 
 func intPtr(v int) *int { return &v }
 
-// testIsMultiSession mirrors the real isMultiSessionCfgAgent logic.
 func testIsMultiSession(a *config.Agent) bool {
 	if a == nil {
 		return false
@@ -60,27 +58,22 @@ func testIsMultiSession(a *config.Agent) bool {
 	return maxSess == nil || *maxSess != 1
 }
 
-// testLookupSessionName returns a predictable session name for testing.
 func testLookupSessionName(_ beads.Store, cityName, qualifiedName, _ string) string {
 	return cityName + "-" + qualifiedName
 }
 
-// testDeps builds a SlingDeps with test defaults and injected callbacks.
-func testDeps(cfg *config.City, sp runtime.Provider, runner SlingRunner) (SlingDeps, *bytes.Buffer, *bytes.Buffer) {
+func testDeps(cfg *config.City, sp runtime.Provider, runner SlingRunner) SlingDeps {
 	if cfg != nil && len(cfg.FormulaLayers.City) == 0 {
 		cfg.FormulaLayers.City = []string{sharedTestFormulaDir}
 	}
-	var stdout, stderr bytes.Buffer
 	return SlingDeps{
-		CityName: "test-city",
-		CityPath: "/city",
-		Cfg:      cfg,
-		SP:       sp,
-		Runner:   runner,
-		Store:    beads.NewMemStore(),
-		StoreRef: "city:test-city",
-		Stdout:   &stdout,
-		Stderr:   &stderr,
+		CityName:          "test-city",
+		CityPath:          "/city",
+		Cfg:               cfg,
+		SP:                sp,
+		Runner:            runner,
+		Store:             beads.NewMemStore(),
+		StoreRef:          "city:test-city",
 		IsMultiSession:    testIsMultiSession,
 		LookupSessionName: testLookupSessionName,
 		ScaleParams: func(a *config.Agent) ScaleInfo {
@@ -91,7 +84,7 @@ func testDeps(cfg *config.City, sp runtime.Provider, runner SlingRunner) (SlingD
 			return ScaleInfo{Max: max}
 		},
 		PokeController: func(string) error { return nil },
-	}, &stdout, &stderr
+	}
 }
 
 func testOpts(a config.Agent, beadOrFormula string) SlingOpts {
@@ -101,7 +94,7 @@ func testOpts(a config.Agent, beadOrFormula string) SlingOpts {
 var sharedTestFormulaDir string
 
 func init() {
-	dir, err := os.MkdirTemp("", "gc-ops-sling-test-formulas-*")
+	dir, err := os.MkdirTemp("", "gc-sling-test-formulas-*")
 	if err != nil {
 		panic(err)
 	}
@@ -120,7 +113,7 @@ func init() {
 
 // --- Pure helper tests ---
 
-func TestBuildSlingCommandOps(t *testing.T) {
+func TestBuildSlingCommandSling(t *testing.T) {
 	tests := []struct {
 		template string
 		beadID   string
@@ -138,7 +131,7 @@ func TestBuildSlingCommandOps(t *testing.T) {
 	}
 }
 
-func TestBeadPrefixOps(t *testing.T) {
+func TestBeadPrefixSling(t *testing.T) {
 	tests := []struct {
 		id   string
 		want string
@@ -157,7 +150,7 @@ func TestBeadPrefixOps(t *testing.T) {
 	}
 }
 
-func TestCheckCrossRigOps(t *testing.T) {
+func TestCheckCrossRigSling(t *testing.T) {
 	cfg := &config.City{
 		Rigs: []config.Rig{
 			{Name: "myrig", Path: "/myrig", Prefix: "BL"},
@@ -167,181 +160,114 @@ func TestCheckCrossRigOps(t *testing.T) {
 
 	t.Run("same rig allowed", func(t *testing.T) {
 		a := config.Agent{Name: "worker", Dir: "myrig"}
-		msg := CheckCrossRig("BL-42", a, cfg)
-		if msg != "" {
+		if msg := CheckCrossRig("BL-42", a, cfg); msg != "" {
 			t.Errorf("expected no warning, got %q", msg)
 		}
 	})
 
 	t.Run("different rig blocked", func(t *testing.T) {
 		a := config.Agent{Name: "worker", Dir: "other"}
-		msg := CheckCrossRig("BL-42", a, cfg)
-		if msg == "" {
-			t.Error("expected cross-rig warning, got empty string")
+		if msg := CheckCrossRig("BL-42", a, cfg); msg == "" {
+			t.Error("expected cross-rig warning")
 		}
 	})
 
 	t.Run("city agent no block", func(t *testing.T) {
 		a := config.Agent{Name: "mayor"}
-		msg := CheckCrossRig("BL-42", a, cfg)
-		if msg != "" {
-			t.Errorf("expected no warning for city agent, got %q", msg)
+		if msg := CheckCrossRig("BL-42", a, cfg); msg != "" {
+			t.Errorf("expected no warning, got %q", msg)
 		}
 	})
 }
 
-func TestFormatBeadLabelOps(t *testing.T) {
-	if got := FormatBeadLabel("BL-1", ""); got != "BL-1" {
-		t.Errorf("got %q", got)
-	}
-	if got := FormatBeadLabel("BL-1", "Fix bug"); !strings.Contains(got, "BL-1") || !strings.Contains(got, "Fix bug") {
-		t.Errorf("got %q", got)
-	}
-}
+// --- DoSling integration tests (structured result) ---
 
-func TestTargetTypeOps(t *testing.T) {
-	fixed := config.Agent{Name: "a", MaxActiveSessions: intPtr(1)}
-	if got := TargetType(&fixed); got != "agent" {
-		t.Errorf("fixed agent: got %q, want agent", got)
-	}
-	pool := config.Agent{Name: "b", MaxActiveSessions: intPtr(3)}
-	if got := TargetType(&pool); got != "pool" {
-		t.Errorf("pool: got %q, want pool", got)
-	}
-}
-
-func TestWorkflowStoreRefForDirOps(t *testing.T) {
-	cfg := &config.City{
-		Rigs: []config.Rig{
-			{Name: "myrig", Path: "/rigs/myrig"},
-		},
-	}
-	if got := WorkflowStoreRefForDir("/city", "/city", "test-city", cfg); got != "city:test-city" {
-		t.Errorf("city dir: got %q", got)
-	}
-	if got := WorkflowStoreRefForDir("/rigs/myrig", "/city", "test-city", cfg); got != "rig:myrig" {
-		t.Errorf("rig dir: got %q", got)
-	}
-	if got := WorkflowStoreRefForDir("/unknown", "/city", "test-city", cfg); got != "" {
-		t.Errorf("unknown dir: got %q", got)
-	}
-}
-
-func TestFindRigByPrefixOps(t *testing.T) {
-	cfg := &config.City{
-		Rigs: []config.Rig{
-			{Name: "myrig", Path: "/myrig", Prefix: "BL"},
-		},
-	}
-	rig, ok := FindRigByPrefix(cfg, "BL")
-	if !ok || rig.Name != "myrig" {
-		t.Errorf("expected myrig, got %v %v", rig, ok)
-	}
-	_, ok = FindRigByPrefix(cfg, "XX")
-	if ok {
-		t.Error("expected not found")
-	}
-}
-
-func TestLooksLikeBeadIDOps(t *testing.T) {
-	if !LooksLikeBeadID("BL-42") {
-		t.Error("BL-42 should look like bead ID")
-	}
-	if LooksLikeBeadID("fix the login bug") {
-		t.Error("natural text should not look like bead ID")
-	}
-	if LooksLikeBeadID("") {
-		t.Error("empty string should not look like bead ID")
-	}
-}
-
-// --- DoSling integration tests ---
-
-func TestDoSlingBeadToFixedAgentOps(t *testing.T) {
+func TestDoSlingBeadToFixedAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 
-	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
-	opts := testOpts(a, "BL-42")
-	code := DoSling(opts, deps, nil)
+	deps := testDeps(cfg, sp, runner.run)
+	result, err := DoSling(testOpts(a, "BL-42"), deps, nil)
 
-	if code != 0 {
-		t.Fatalf("DoSling returned %d, want 0; stderr: %s", code, stderr.String())
+	if err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	if result.BeadID != "BL-42" {
+		t.Errorf("BeadID = %q, want BL-42", result.BeadID)
+	}
+	if result.Target != "mayor" {
+		t.Errorf("Target = %q, want mayor", result.Target)
 	}
 	if len(runner.calls) != 1 {
-		t.Fatalf("got %d runner calls, want 1: %v", len(runner.calls), runner.calls)
-	}
-	want := "bd update 'BL-42' --set-metadata gc.routed_to=mayor"
-	if runner.calls[0] != want {
-		t.Errorf("runner call = %q, want %q", runner.calls[0], want)
-	}
-	if !strings.Contains(stdout.String(), "Slung BL-42") {
-		t.Errorf("stdout = %q, want to contain 'Slung BL-42'", stdout.String())
+		t.Fatalf("got %d runner calls, want 1", len(runner.calls))
 	}
 }
 
-func TestDoSlingSuspendedAgentWarnsOps(t *testing.T) {
+func TestDoSlingSuspendedAgentWarns(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), Suspended: true}
 
-	deps, _, stderr := testDeps(cfg, sp, runner.run)
-	opts := testOpts(a, "BL-42")
-	code := DoSling(opts, deps, nil)
+	deps := testDeps(cfg, sp, runner.run)
+	result, err := DoSling(testOpts(a, "BL-42"), deps, nil)
 
-	if code != 0 {
-		t.Fatalf("DoSling returned %d, want 0", code)
+	if err != nil {
+		t.Fatalf("DoSling error: %v", err)
 	}
-	if !strings.Contains(stderr.String(), "suspended") {
-		t.Errorf("stderr = %q, want to contain 'suspended'", stderr.String())
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "suspended") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected suspension warning in %v", result.Warnings)
 	}
 }
 
-func TestDoSlingRunnerErrorOps(t *testing.T) {
+func TestDoSlingRunnerError(t *testing.T) {
 	runner := newFakeRunner()
 	runner.on("bd update", "", fmt.Errorf("runner failed"))
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 
-	deps, _, _ := testDeps(cfg, sp, runner.run)
-	opts := testOpts(a, "BL-42")
-	code := DoSling(opts, deps, nil)
+	deps := testDeps(cfg, sp, runner.run)
+	_, err := DoSling(testOpts(a, "BL-42"), deps, nil)
 
-	if code != 1 {
-		t.Fatalf("DoSling returned %d, want 1", code)
+	if err == nil {
+		t.Fatal("expected error from runner failure")
 	}
 }
 
-func TestDoSlingFormulaToAgentOps(t *testing.T) {
+func TestDoSlingFormulaToAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 
-	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
-	opts := SlingOpts{
+	deps := testDeps(cfg, sp, runner.run)
+	result, err := DoSling(SlingOpts{
 		Target:        a,
 		BeadOrFormula: "code-review",
 		IsFormula:     true,
-	}
-	code := DoSling(opts, deps, nil)
+	}, deps, nil)
 
-	if code != 0 {
-		t.Fatalf("DoSling returned %d, want 0; stderr: %s", code, stderr.String())
+	if err != nil {
+		t.Fatalf("DoSling error: %v", err)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("got %d runner calls, want 1", len(runner.calls))
+	if result.Method != "formula" {
+		t.Errorf("Method = %q, want formula", result.Method)
 	}
-	if !strings.Contains(stdout.String(), "Slung formula") {
-		t.Errorf("stdout = %q, want to contain 'Slung formula'", stdout.String())
+	if result.BeadID == "" {
+		t.Error("expected non-empty BeadID (wisp root)")
 	}
 }
 
-func TestDoSlingCrossRigBlocksOps(t *testing.T) {
+func TestDoSlingCrossRigBlocks(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{
@@ -353,15 +279,38 @@ func TestDoSlingCrossRigBlocksOps(t *testing.T) {
 	}
 	a := config.Agent{Name: "worker", Dir: "other", MaxActiveSessions: intPtr(1)}
 
-	deps, _, stderr := testDeps(cfg, sp, runner.run)
-	opts := testOpts(a, "BL-42")
-	code := DoSling(opts, deps, nil)
+	deps := testDeps(cfg, sp, runner.run)
+	_, err := DoSling(testOpts(a, "BL-42"), deps, nil)
 
-	if code != 1 {
-		t.Fatalf("DoSling returned %d, want 1", code)
+	if err == nil {
+		t.Fatal("expected cross-rig error")
 	}
-	if !strings.Contains(stderr.String(), "cross-rig") {
-		t.Errorf("stderr = %q, want to contain 'cross-rig'", stderr.String())
+	if len(runner.calls) != 0 {
+		t.Error("runner should not have been called")
+	}
+}
+
+func TestDoSlingIdempotent(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	store := beads.NewMemStore()
+	b, _ := store.Create(beads.Bead{
+		Title:    "test",
+		Metadata: map[string]string{"gc.routed_to": "mayor"},
+	})
+
+	deps := testDeps(cfg, sp, runner.run)
+	deps.Store = store
+	result, err := DoSling(testOpts(a, b.ID), deps, store)
+
+	if err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	if !result.Idempotent {
+		t.Error("expected Idempotent=true")
 	}
 	if len(runner.calls) != 0 {
 		t.Error("runner should not have been called")

@@ -2,7 +2,6 @@ package sling
 
 import (
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -105,8 +104,8 @@ func IsMoleculeAttachment(b beads.Bead) bool {
 }
 
 // CheckNoMoleculeChildren returns an error if the bead already has an attached
-// molecule or wisp child that is still open.
-func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w io.Writer) error {
+// molecule or wisp child that is still open. Auto-burn messages go to result.Messages.
+func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, result *SlingResult) error {
 	parent, ok := BeadFromGetters(beadID, q, store)
 	if !ok {
 		return nil
@@ -130,7 +129,8 @@ func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w 
 		}
 		if parentUnassigned && store != nil {
 			if burnErr := store.Close(attached.ID); burnErr == nil {
-				fmt.Fprintf(w, "Auto-burned stale %s %s on unassigned bead %s\n", AttachmentLabel(attached), attached.ID, beadID) //nolint:errcheck // best-effort
+				result.Messages = append(result.Messages,
+					fmt.Sprintf("Auto-burned stale %s %s on unassigned bead %s", AttachmentLabel(attached), attached.ID, beadID))
 				continue
 			}
 		}
@@ -141,7 +141,7 @@ func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w 
 
 // CheckBatchNoMoleculeChildren checks all open children for existing molecule
 // attachments before any wisps are created.
-func CheckBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store beads.Store, w io.Writer) error {
+func CheckBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store beads.Store, result *SlingResult) error {
 	var problems []string
 	for _, child := range open {
 		attachments, err := CollectAttachedBeads(child, store, q)
@@ -155,7 +155,8 @@ func CheckBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store b
 			}
 			if childUnassigned && store != nil {
 				if burnErr := store.Close(attached.ID); burnErr == nil {
-					fmt.Fprintf(w, "Auto-burned stale %s %s on unassigned bead %s\n", AttachmentLabel(attached), attached.ID, child.ID) //nolint:errcheck // best-effort
+					result.Messages = append(result.Messages,
+						fmt.Sprintf("Auto-burned stale %s %s on unassigned bead %s", AttachmentLabel(attached), attached.ID, child.ID))
 					continue
 				}
 			}

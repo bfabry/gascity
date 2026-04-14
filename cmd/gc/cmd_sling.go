@@ -332,11 +332,9 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 		Runner:   runner,
 		Store:    store,
 		StoreRef: storeRef,
-		Stdout:   stdout,
-		Stderr:   stderr,
 	}
 
-	return doSlingBatch(opts, deps, store)
+	return doSlingBatch(opts, deps, store, stdout, stderr)
 }
 
 // findRigByPrefix returns the rig whose effective prefix matches (case-insensitive).
@@ -375,29 +373,46 @@ func populateSlingDepsCallbacks(deps *slingDeps) {
 	deps.DefaultBranch = defaultBranchFor
 	deps.PokeController = slingPokeController
 	deps.PokeControlDispatch = slingPokeControlDispatcher
-	deps.DoNudge = func(a *config.Agent, cityName, cityPath string, cfg *config.City, sp runtime.Provider, store beads.Store, stdout, stderr io.Writer) {
-		doSlingNudge(a, cityName, cityPath, cfg, sp, store, stdout, stderr)
+}
+
+// printSlingResult writes a SlingResult to stdout/stderr.
+func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
+	for _, w := range result.Warnings {
+		fmt.Fprintln(stderr, w) //nolint:errcheck
 	}
-	deps.DryRunSingle = func(o sling.SlingOpts, d sling.SlingDeps, q sling.BeadQuerier) int {
-		return dryRunSingle(o, d, q)
-	}
-	deps.DryRunBatch = func(o sling.SlingOpts, d sling.SlingDeps, q sling.BeadChildQuerier) int {
-		// dryRunBatch has extra params; we need the original bead data.
-		// For now, fall back to the original dryRunBatch via doSlingBatch.
-		return 0 // placeholder — dry-run stays in CLI for now
+	for _, m := range result.Messages {
+		fmt.Fprintln(stdout, m) //nolint:errcheck
 	}
 }
 
-// doSling delegates to sling.DoSling.
-func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
+// doSling delegates to sling.DoSling and handles CLI I/O + nudge.
+func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
-	return sling.DoSling(opts, deps, querier)
+	result, err := sling.DoSling(opts, deps, querier)
+	printSlingResult(result, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err) //nolint:errcheck
+		return 1
+	}
+	if result.NudgeAgent != nil {
+		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
+	}
+	return 0
 }
 
-// doSlingBatch delegates to sling.DoSlingBatch.
-func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int {
+// doSlingBatch delegates to sling.DoSlingBatch and handles CLI I/O + nudge.
+func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
-	return sling.DoSlingBatch(opts, deps, querier)
+	result, err := sling.DoSlingBatch(opts, deps, querier)
+	printSlingResult(result, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err) //nolint:errcheck
+		return 1
+	}
+	if result.NudgeAgent != nil {
+		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
+	}
+	return 0
 }
 
 // The original doSling and doSlingBatch function bodies have been moved
@@ -967,34 +982,6 @@ func promoteWorkflowLaunchBead(store beads.Store, beadID string) error {
 	return store.Update(beadID, beads.UpdateOpts{Status: &status})
 }
 
-func startGraphWorkflow(result *molecule.Result, sourceBeadID string, a config.Agent, method string, deps slingDeps) int {
-	rootID := result.RootID
-	slingTracef("workflow-start begin root=%s source=%s agent=%s method=%s", rootID, sourceBeadID, a.QualifiedName(), method)
-	statusStart := time.Now()
-	if err := promoteWorkflowLaunchBead(deps.Store, rootID); err != nil {
-		slingTracef("workflow-start root-status-error root=%s dur=%s err=%v", rootID, time.Since(statusStart), err)
-		fmt.Fprintf(deps.Stderr, "gc sling: setting workflow root %s in_progress: %v\n", rootID, err) //nolint:errcheck // best-effort
-		return 1
-	}
-	slingTracef("workflow-start root-status-done root=%s dur=%s", rootID, time.Since(statusStart))
-	if sourceBeadID != "" {
-		metaStart := time.Now()
-		if err := deps.Store.SetMetadata(sourceBeadID, "workflow_id", rootID); err != nil {
-			slingTracef("workflow-start metadata-error root=%s source=%s dur=%s err=%v", rootID, sourceBeadID, time.Since(metaStart), err)
-			fmt.Fprintf(deps.Stderr, "gc sling: setting workflow_id on %s: %v\n", sourceBeadID, err) //nolint:errcheck // best-effort
-			return 1
-		}
-		slingTracef("workflow-start metadata-done root=%s source=%s dur=%s", rootID, sourceBeadID, time.Since(metaStart))
-	}
-	pokeStart := time.Now()
-	_ = slingPokeControlDispatcher(deps.CityPath)
-	slingTracef("workflow-start poke-done root=%s dur=%s", rootID, time.Since(pokeStart))
-
-	telemetry.RecordSling(context.Background(), a.QualifiedName(), targetType(&a), method, nil)
-	slingTracef("workflow-start done root=%s", rootID)
-	return 0
-}
-
 // targetType returns "pool" or "agent" for telemetry attributes.
 func targetType(a *config.Agent) string {
 	if isMultiSessionCfgAgent(a) {
@@ -1217,9 +1204,9 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 
 // dryRunSingle prints a step-by-step preview of what gc sling would do for a
 // single bead (or formula) without executing any side effects.
-func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
+func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr io.Writer) int {
 	a := opts.Target
-	w := func(s string) { fmt.Fprintln(deps.Stdout, s) } //nolint:errcheck // best-effort
+	w := func(s string) { fmt.Fprintln(stdout, s) } //nolint:errcheck // best-effort
 
 	// Header.
 	header := "Dry run: gc sling " + a.QualifiedName() + " " + opts.BeadOrFormula
@@ -1274,8 +1261,8 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 
 		// Attach formula section (--on or default).
 		if opts.OnFormula != "" {
-			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, deps.Stderr); err != nil {
-				fmt.Fprintf(deps.Stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
+			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, stderr); err != nil {
+				fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
 				return 1
 			}
 
@@ -1293,8 +1280,8 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 			w("  Pre-check: " + opts.BeadOrFormula + " has no existing molecule/wisp children ✓")
 			w("")
 		} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
-			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, deps.Stderr); err != nil {
-				fmt.Fprintf(deps.Stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
+			if err := checkNoMoleculeChildren(querier, opts.BeadOrFormula, deps.Store, stderr); err != nil {
+				fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort
 				return 1
 			}
 
@@ -1336,11 +1323,11 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 
 // dryRunBatch prints a step-by-step preview of what gc sling would do for a
 // convoy without executing any side effects.
-func dryRunBatch(opts slingOpts, deps slingDeps,
+func dryRunBatch(opts slingOpts, deps slingDeps, stdout, stderr io.Writer,
 	b beads.Bead, children, open []beads.Bead, querier BeadQuerier,
 ) int {
 	a := opts.Target
-	w := func(s string) { fmt.Fprintln(deps.Stdout, s) } //nolint:errcheck // best-effort
+	w := func(s string) { fmt.Fprintln(stdout, s) } //nolint:errcheck // best-effort
 
 	// Header.
 	w("Dry run: gc sling " + a.QualifiedName() + " " + b.ID)

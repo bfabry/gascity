@@ -3,7 +3,6 @@ package sling
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
-	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
 // BeadQuerier can retrieve a single bead by ID.
@@ -50,29 +48,44 @@ type SlingOpts struct {
 }
 
 // SlingDeps bundles infrastructure dependencies injected for testability.
+// No I/O fields -- domain functions return structured results.
 type SlingDeps struct {
 	CityName string
-	CityPath string // city directory path; used to poke controller for wake
+	CityPath string
 	Cfg      *config.City
 	SP       runtime.Provider
 	Runner   SlingRunner
 	Store    beads.Store
 	StoreRef string
-	Stdout   io.Writer
-	Stderr   io.Writer
 
-	// Injected functions from cmd/gc that ops cannot import directly.
-	// These will be removed once their logic is also extracted to ops.
-	ResolveAgent      func(cfg *config.City, name, rigContext string) (config.Agent, bool)
-	IsMultiSession    func(a *config.Agent) bool
-	LookupSessionName func(store beads.Store, cityName, qualifiedName, sessionTemplate string) string
-	ScaleParams       func(a *config.Agent) ScaleInfo
-	DefaultBranch     func(dir string) string
-	PokeController    func(cityPath string) error
+	// Injected functions from cmd/gc that sling cannot import directly.
+	ResolveAgent        func(cfg *config.City, name, rigContext string) (config.Agent, bool)
+	IsMultiSession      func(a *config.Agent) bool
+	LookupSessionName   func(store beads.Store, cityName, qualifiedName, sessionTemplate string) string
+	ScaleParams         func(a *config.Agent) ScaleInfo
+	DefaultBranch       func(dir string) string
+	PokeController      func(cityPath string) error
 	PokeControlDispatch func(cityPath string) error
-	DoNudge           func(a *config.Agent, cityName, cityPath string, cfg *config.City, sp runtime.Provider, store beads.Store, stdout, stderr io.Writer)
-	DryRunSingle      func(opts SlingOpts, deps SlingDeps, querier BeadQuerier) int
-	DryRunBatch       func(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) int
+}
+
+// SlingResult holds the structured output of a sling operation.
+// Callers (CLI, API) format this for their respective surfaces.
+type SlingResult struct {
+	BeadID     string   // the routed bead ID (or wisp root for formula)
+	Target     string   // qualified agent name
+	Method     string   // "bead", "formula", "on-formula", "default-on-formula"
+	WorkflowID string   // non-empty for graph workflow launches
+	ConvoyID   string   // non-empty if auto-convoy was created
+	Idempotent bool     // true if bead was already routed (skipped)
+	Messages   []string // user-facing info (stdout in CLI)
+	Warnings   []string // user-facing warnings (stderr in CLI)
+
+	// Batch fields (populated by DoSlingBatch).
+	Routed     int
+	Failed     int
+	Skipped    int
+	Total      int
+	NudgeAgent *config.Agent // non-nil if caller should nudge
 }
 
 // ScaleInfo holds pool scaling parameters for an agent.
@@ -503,36 +516,11 @@ func PromoteWorkflowLaunchBead(store beads.Store, beadID string) error {
 	return store.Update(beadID, beads.UpdateOpts{Status: &status})
 }
 
-// StartGraphWorkflow performs post-instantiation setup for graph.v2 workflows:
-// promotes the root bead status, links source bead metadata, and pokes the
-// control dispatcher.
-func StartGraphWorkflow(result *molecule.Result, sourceBeadID string, a config.Agent, method string, deps SlingDeps) int {
-	rootID := result.RootID
-	SlingTracef("workflow-start begin root=%s source=%s agent=%s method=%s", rootID, sourceBeadID, a.QualifiedName(), method)
-	statusStart := time.Now()
-	if err := PromoteWorkflowLaunchBead(deps.Store, rootID); err != nil {
-		SlingTracef("workflow-start root-status-error root=%s dur=%s err=%v", rootID, time.Since(statusStart), err)
-		fmt.Fprintf(deps.Stderr, "gc sling: setting workflow root %s in_progress: %v\n", rootID, err) //nolint:errcheck // best-effort
-		return 1
-	}
-	SlingTracef("workflow-start root-status-done root=%s dur=%s", rootID, time.Since(statusStart))
-	if sourceBeadID != "" {
-		metaStart := time.Now()
-		if err := deps.Store.SetMetadata(sourceBeadID, "workflow_id", rootID); err != nil {
-			SlingTracef("workflow-start metadata-error root=%s source=%s dur=%s err=%v", rootID, sourceBeadID, time.Since(metaStart), err)
-			fmt.Fprintf(deps.Stderr, "gc sling: setting workflow_id on %s: %v\n", sourceBeadID, err) //nolint:errcheck // best-effort
-			return 1
-		}
-		SlingTracef("workflow-start metadata-done root=%s source=%s dur=%s", rootID, sourceBeadID, time.Since(metaStart))
-	}
-	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
-	if deps.PokeController != nil {
-		_ = deps.PokeController(deps.CityPath)
-	}
-	if deps.PokeControlDispatch != nil {
-		_ = deps.PokeControlDispatch(deps.CityPath)
-	}
-	return 0
+// StartGraphWorkflow is now inlined as doStartGraphWorkflow in sling_core.go.
+// This function is kept as a deprecated alias for any remaining callers.
+// Remove once all callers are updated.
+func StartGraphWorkflow(result *molecule.Result, sourceBeadID string, a config.Agent, method string, deps SlingDeps) (SlingResult, error) {
+	return doStartGraphWorkflow(result, sourceBeadID, a, method, deps)
 }
 
 // BeadCheckResult holds the result of pre-flight bead state checks.
