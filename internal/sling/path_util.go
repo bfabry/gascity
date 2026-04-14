@@ -1,25 +1,13 @@
 package sling
 
-import "path/filepath"
+import "github.com/gastownhall/gascity/internal/pathutil"
 
-// NormalizePathForCompare resolves symlinks and makes a path absolute
-// for reliable comparison.
+// NormalizePathForCompare delegates to pathutil.NormalizePathForCompare.
 func NormalizePathForCompare(path string) string {
-	if path == "" {
-		return ""
-	}
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	path = filepath.Clean(path)
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	return filepath.Clean(path)
+	return pathutil.NormalizePathForCompare(path)
 }
 
-// SamePath reports whether two paths refer to the same location after
-// symlink resolution and normalization.
+// SamePath delegates to pathutil.SamePath.
 func SamePath(a, b string) bool {
-	return NormalizePathForCompare(a) == NormalizePathForCompare(b)
+	return pathutil.SamePath(a, b)
 }

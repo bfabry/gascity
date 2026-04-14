@@ -4,15 +4,15 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gastownhall/gascity/internal/sling"
+	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
 func normalizePathForCompare(path string) string {
-	return sling.NormalizePathForCompare(path)
+	return pathutil.NormalizePathForCompare(path)
 }
 
 func samePath(a, b string) bool {
-	return sling.SamePath(a, b)
+	return pathutil.SamePath(a, b)
 }
 
 func pathWithinRoot(path, root string) bool {
