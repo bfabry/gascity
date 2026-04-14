@@ -2,43 +2,6 @@
 
 ## Status: Complete
 
-## What Was Done
-
-### Extraction (Phases 1-5)
-
-Extracted business logic from CLI (`cmd/gc/`) and API
-(`internal/api/`) into shared domain packages:
-
-- `internal/sling/` -- work routing (DoSling, DoSlingBatch)
-- `internal/convoy/` -- convoy CRUD with event emission
-- `internal/agentutil/` -- agent resolution, pool expansion
-
-The API handler calls `sling.DoSling` directly -- no more subprocess
-delegation. The CLI is a thin adapter that formats structured results.
-
-### Quality Pass
-
-- **Structured data**: Domain returns typed fields (BeadID, Target,
-  AgentSuspended, AutoBurned, etc.). No OutputLine, no msg/warn,
-  no user-facing text in domain code.
-- **Decomposed DoSling**: 20-line dispatcher -> preflight,
-  slingFormula, slingOnFormula, slingDefaultFormula, slingPlainBead,
-  finalize.
-- **Converged dispatch_runtime.go**: Local graph routing duplicates
-  replaced with sling package types.
-- **Narrow interfaces**: AgentResolver, BranchResolver, Notifier.
-- **Read-only molecule check**: FindBlockingMolecule for dry-run
-  (no auto-burn during preview).
-
-### Review Council Fixes
-
-- Deleted `if false` placeholder blocks
-- API surfaces MetadataErrors as `warnings` in JSON response
-- DoSling validates required deps (Cfg, Store, Runner) at entry
-- API wires BranchResolver for formula var population
-- preflight returns idiomatic `(SlingResult, error)`
-- Deleted dead "remove after tests" comment
-
 ## Architecture
 
 ```
@@ -50,18 +13,81 @@ cmd/gc/cmd_*.go               internal/api/handler_*.go
          \                            /
           v                          v
    internal/sling/        internal/convoy/
-   internal/agentutil/
+   internal/agentutil/    internal/graphroute/
+   internal/pathutil/
             |
             v
    internal/{beads,config,formula,molecule,agent,events,...}
 ```
 
-### Key Design Decisions
+## Domain Packages
 
-- Structured data, not text strings, in domain layer
-- Per-domain dep structs (SlingDeps, ConvoyDeps), not monolithic
-- Narrow interfaces for DI (AgentResolver, BranchResolver, Notifier)
-- Required deps validated at entry (Cfg, Store, Runner)
-- preflight returns (Result, error) per Go convention
-- CLI type aliases for verbosity reduction (legitimate Go pattern)
-- Batch results as []SlingChildResult with per-child outcome data
+### internal/sling/ -- work routing
+
+**Intent-based API** (new):
+```go
+s, _ := sling.New(deps)           // validate once
+s.RouteBead(ctx, beadID, target, opts)
+s.LaunchFormula(ctx, name, target, opts)
+s.AttachFormula(ctx, name, beadID, target, opts)
+s.ExpandConvoy(ctx, convoyID, target, opts, querier)
+```
+
+Each method takes exactly the params it needs via focused option
+structs (`RouteOpts`, `FormulaOpts`). No flag bag.
+
+**Typed routing** (new):
+```go
+type BeadRouter interface {
+    Route(ctx, RouteRequest) error
+}
+```
+Domain says "route this bead to this target." Implementation decides
+how (shell command, direct store, API call).
+
+**Legacy API** (preserved for backward compat):
+`DoSling(SlingOpts, SlingDeps, querier)` and `DoSlingBatch` still
+work. New methods delegate to them internally.
+
+### internal/graphroute/ -- graph decoration
+
+380 lines of graph.v2 routing extracted from sling. Owns step
+binding resolution, cycle detection, control-dispatcher routing.
+Own `Deps` interface (`AgentResolver` only).
+
+### internal/convoy/ -- convoy CRUD
+
+ConvoyCreate, ConvoyProgress, ConvoyAddItems, ConvoyClose with
+event emission via `events.Recorder`.
+
+### internal/agentutil/ -- agent resolution + pool expansion
+
+Options-driven `ResolveAgent`, `ExpandAgents`, `ScaleParamsFor`,
+`LookupSessionName`, `IsMultiSessionAgent`, `DeepCopyAgent`.
+
+### internal/pathutil/ -- path utilities
+
+`NormalizePathForCompare`, `SamePath`. Shared by 11+ CLI files.
+
+## Design Principles
+
+- **Intent-based API**: callers express intent, not flags
+- **Typed routing**: domain describes what, implementation decides how
+- **Structured data**: domain returns typed fields, callers format
+- **Narrow interfaces**: AgentResolver, BranchResolver, Notifier,
+  BeadRouter
+- **Deps validated at construction**: New() checks required fields
+- **No I/O in domain**: zero fmt.Fprintf, zero io.Writer
+- **Graph routing separated**: own package, own tests, own deps
+- **Backward compat**: old DoSling/DoSlingBatch preserved during
+  caller migration
+
+## Remaining Migration (Steps 4-5)
+
+Callers (CLI, API) still use the old DoSling/SlingOpts API.
+Migration to the intent-based API is incremental:
+
+- CLI: `cmdSling` maps flags to `s.RouteBead`/`s.LaunchFormula`/etc.
+- API: `handleSling` maps request body to the right method
+- After all callers migrate: delete DoSling, DoSlingBatch, SlingOpts,
+  SlingRunner, preflight, and the dispatch functions
