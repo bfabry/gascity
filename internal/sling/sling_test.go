@@ -1,6 +1,7 @@
 package sling
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -355,4 +356,76 @@ func TestDoSlingValidatesRequiredDeps(t *testing.T) {
 			t.Errorf("expected Runner validation error, got %v", err)
 		}
 	})
+}
+
+// --- Intent-based API tests ---
+
+func TestNewSlingValidates(t *testing.T) {
+	_, err := New(SlingDeps{})
+	if err == nil {
+		t.Error("expected validation error for empty deps")
+	}
+}
+
+func TestNewSlingValid(t *testing.T) {
+	deps := testDeps(&config.City{Workspace: config.Workspace{Name: "test"}}, runtime.NewFake(), newFakeRunner().run)
+	s, err := New(deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil Sling")
+	}
+}
+
+func TestSlingRouteBead(t *testing.T) {
+	runner := newFakeRunner()
+	deps := testDeps(&config.City{Workspace: config.Workspace{Name: "test"}}, runtime.NewFake(), runner.run)
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.RouteBead(context.Background(), "BL-42", a, RouteOpts{})
+	if err != nil {
+		t.Fatalf("RouteBead: %v", err)
+	}
+	if result.BeadID != "BL-42" {
+		t.Errorf("BeadID = %q, want BL-42", result.BeadID)
+	}
+	if result.Target != "mayor" {
+		t.Errorf("Target = %q, want mayor", result.Target)
+	}
+	if result.Method != "bead" {
+		t.Errorf("Method = %q, want bead", result.Method)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("got %d runner calls, want 1", len(runner.calls))
+	}
+}
+
+func TestSlingLaunchFormula(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.LaunchFormula(context.Background(), "code-review", a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("LaunchFormula: %v", err)
+	}
+	if result.Method != "formula" {
+		t.Errorf("Method = %q, want formula", result.Method)
+	}
+	if result.FormulaName != "code-review" {
+		t.Errorf("FormulaName = %q, want code-review", result.FormulaName)
+	}
+	if result.BeadID == "" {
+		t.Error("expected non-empty BeadID")
+	}
 }

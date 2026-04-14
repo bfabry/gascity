@@ -130,6 +130,103 @@ type SlingChildResult struct {
 	FormulaName string // formula used
 }
 
+// Sling provides intent-based work routing operations. Construct via New.
+type Sling struct {
+	deps SlingDeps
+}
+
+// New creates a Sling instance after validating required deps.
+func New(deps SlingDeps) (*Sling, error) {
+	if err := validateDeps(deps); err != nil {
+		return nil, err
+	}
+	return &Sling{deps: deps}, nil
+}
+
+// RouteOpts holds options for plain bead routing.
+type RouteOpts struct {
+	Merge    string // "", "direct", "mr", "local"
+	NoConvoy bool
+	Owned    bool
+	Nudge    bool
+	Force    bool
+	SkipPoke bool
+}
+
+// FormulaOpts holds options for formula-based operations.
+type FormulaOpts struct {
+	Title     string
+	Vars      []string
+	Merge     string
+	Nudge     bool
+	Force     bool
+	SkipPoke  bool
+	ScopeKind string
+	ScopeRef  string
+}
+
+// RouteBead routes a plain bead to an agent.
+func (s *Sling) RouteBead(ctx context.Context, beadID string, target config.Agent, opts RouteOpts) (SlingResult, error) {
+	return DoSling(SlingOpts{
+		Target:        target,
+		BeadOrFormula: beadID,
+		Merge:         opts.Merge,
+		NoConvoy:      opts.NoConvoy,
+		Owned:         opts.Owned,
+		Nudge:         opts.Nudge,
+		Force:         opts.Force,
+		SkipPoke:      opts.SkipPoke,
+	}, s.deps, nil)
+}
+
+// LaunchFormula instantiates a formula and routes the resulting wisp.
+func (s *Sling) LaunchFormula(ctx context.Context, formulaName string, target config.Agent, opts FormulaOpts) (SlingResult, error) {
+	return DoSling(SlingOpts{
+		Target:        target,
+		BeadOrFormula: formulaName,
+		IsFormula:     true,
+		Title:         opts.Title,
+		Vars:          opts.Vars,
+		Merge:         opts.Merge,
+		Nudge:         opts.Nudge,
+		Force:         opts.Force,
+		SkipPoke:      opts.SkipPoke,
+		ScopeKind:     opts.ScopeKind,
+		ScopeRef:      opts.ScopeRef,
+	}, s.deps, nil)
+}
+
+// AttachFormula attaches a formula wisp to an existing bead and routes the bead.
+func (s *Sling) AttachFormula(ctx context.Context, formulaName, beadID string, target config.Agent, opts FormulaOpts) (SlingResult, error) {
+	return DoSling(SlingOpts{
+		Target:        target,
+		BeadOrFormula: beadID,
+		OnFormula:     formulaName,
+		Title:         opts.Title,
+		Vars:          opts.Vars,
+		Merge:         opts.Merge,
+		Nudge:         opts.Nudge,
+		Force:         opts.Force,
+		SkipPoke:      opts.SkipPoke,
+		ScopeKind:     opts.ScopeKind,
+		ScopeRef:      opts.ScopeRef,
+	}, s.deps, nil)
+}
+
+// ExpandConvoy expands a convoy and routes each open child.
+func (s *Sling) ExpandConvoy(ctx context.Context, convoyID string, target config.Agent, opts RouteOpts, querier BeadChildQuerier) (SlingResult, error) {
+	return DoSlingBatch(SlingOpts{
+		Target:        target,
+		BeadOrFormula: convoyID,
+		Merge:         opts.Merge,
+		NoConvoy:      opts.NoConvoy,
+		Owned:         opts.Owned,
+		Nudge:         opts.Nudge,
+		Force:         opts.Force,
+		SkipPoke:      opts.SkipPoke,
+	}, s.deps, querier)
+}
+
 // ScaleInfo holds pool scaling parameters for an agent.
 type ScaleInfo struct {
 	Min int
