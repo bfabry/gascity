@@ -1,6 +1,6 @@
 # Plan: Extract Shared Object Model
 
-## Status: Quality Pass Complete (Steps 1-4), Step 5 Remaining
+## Status: Complete
 
 ## Completed Work
 
@@ -12,7 +12,7 @@
 - API handler calls domain directly (no subprocess)
 - Narrow interfaces (AgentResolver, BranchResolver, Notifier)
 
-### Quality Pass
+### Quality Pass (DONE)
 
 #### Step 1: Eliminate OutputLine (DONE)
 
@@ -41,10 +41,14 @@ etc.). ~80 lines of duplicated code eliminated.
 
 Removed deprecated wrapper.
 
-#### Step 5: Slim dry-run display (REMAINING)
+#### Step 5: Slim dry-run display (DONE)
 
-`dryRunSingle`/`dryRunBatch` still re-query beads. Could use
-`SlingResult` fields after Steps 1-2.
+Dry-run functions now use domain functions directly
+(`sling.CheckBeadState`, `sling.BuildSlingCommand`,
+`sling.FindBlockingMolecule`) instead of local copies.
+
+Fixed a bug: dry-run was auto-burning molecules (mutating during
+preview). Now uses read-only `FindBlockingMolecule` check.
 
 ## Architecture
 
@@ -77,4 +81,6 @@ cmd/gc/cmd_*.go               internal/api/handler_*.go
   ScaleParamsFor.
 - **Per-child results**: Batch operations return
   `[]SlingChildResult` with per-child outcome data.
+- **Read-only checks**: `FindBlockingMolecule` for dry-run
+  molecule validation without auto-burn mutations.
 - **Zero I/O, zero OutputLine, zero msg()/warn()** in domain.
