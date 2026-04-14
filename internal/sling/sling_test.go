@@ -468,3 +468,219 @@ func TestSlingRouteBeadWithTypedRouter(t *testing.T) {
 		t.Errorf("Target = %q, want mayor", router.routed[0].Target)
 	}
 }
+
+// --- Missing coverage tests ---
+
+func TestSlingAttachFormula(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	// Create the bead in the store so attachment can find it.
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	if result.Method != "on-formula" {
+		t.Errorf("Method = %q, want on-formula", result.Method)
+	}
+	if result.WispRootID == "" {
+		t.Error("expected non-empty WispRootID")
+	}
+	if result.FormulaName != "code-review" {
+		t.Errorf("FormulaName = %q, want code-review", result.FormulaName)
+	}
+}
+
+func TestSlingExpandConvoy(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	store := deps.Store
+	convoy, _ := store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	store.Create(beads.Bead{Title: "task1", Type: "task", ParentID: convoy.ID, Status: "open"})
+	store.Create(beads.Bead{Title: "task2", Type: "task", ParentID: convoy.ID, Status: "open"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.ExpandConvoy(context.Background(), convoy.ID, a, RouteOpts{}, store)
+	if err != nil {
+		t.Fatalf("ExpandConvoy: %v", err)
+	}
+	if result.Routed != 2 {
+		t.Errorf("Routed = %d, want 2", result.Routed)
+	}
+	if result.Total != 2 {
+		t.Errorf("Total = %d, want 2", result.Total)
+	}
+	if len(result.Children) != 2 {
+		t.Fatalf("Children = %d, want 2", len(result.Children))
+	}
+}
+
+func TestDoSlingPoolEmptyWarns(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "pool", MaxActiveSessions: intPtr(0)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if !result.PoolEmpty {
+		t.Error("expected PoolEmpty=true for max=0")
+	}
+}
+
+func TestFinalizeAutoConvoy(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: b.ID,
+	}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.ConvoyID == "" {
+		t.Error("expected auto-convoy creation")
+	}
+	// Verify convoy bead exists in store.
+	if _, err := deps.Store.Get(result.ConvoyID); err != nil {
+		t.Errorf("convoy %s not found in store: %v", result.ConvoyID, err)
+	}
+}
+
+func TestFinalizeNoConvoyWhenSuppressed(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1", NoConvoy: true,
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.ConvoyID != "" {
+		t.Errorf("expected no convoy, got %q", result.ConvoyID)
+	}
+}
+
+func TestDoSlingBatchPartialFailure(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	store := deps.Store
+	convoy, _ := store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	store.Create(beads.Bead{Title: "t1", Type: "task", ParentID: convoy.ID, Status: "open"})
+	b2, _ := store.Create(beads.Bead{Title: "t2", Type: "task", ParentID: convoy.ID, Status: "open"})
+	store.Create(beads.Bead{Title: "t3", Type: "task", ParentID: convoy.ID, Status: "open"})
+	// Fail the runner for the second child's actual bead ID.
+	runner.on(b2.ID, "", fmt.Errorf("runner failed"))
+
+	result, err := DoSlingBatch(SlingOpts{
+		Target: a, BeadOrFormula: convoy.ID,
+	}, deps, store)
+	// Partial failure returns error but result has per-child data.
+	if err == nil {
+		t.Fatal("expected error for partial failure")
+	}
+	if result.Routed != 2 {
+		t.Errorf("Routed = %d, want 2", result.Routed)
+	}
+	if result.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", result.Failed)
+	}
+	// Find the failed child.
+	for _, c := range result.Children {
+		if c.BeadID == b2.ID && !c.Failed {
+			t.Errorf("expected child %s to be failed", b2.ID)
+		}
+	}
+}
+
+func TestFindBlockingMolecule(t *testing.T) {
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-1", Type: "task", Status: "open"},
+		{ID: "MOL-1", Type: "molecule", Status: "open", ParentID: "BL-1"},
+	}, nil)
+	label, id := FindBlockingMolecule(store, "BL-1", store)
+	if label != "molecule" {
+		t.Errorf("label = %q, want molecule", label)
+	}
+	if id != "MOL-1" {
+		t.Errorf("id = %q, want MOL-1", id)
+	}
+}
+
+func TestFindBlockingMoleculeNone(t *testing.T) {
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-1", Type: "task", Status: "open"},
+	}, nil)
+	label, id := FindBlockingMolecule(store, "BL-1", store)
+	if label != "" || id != "" {
+		t.Errorf("expected no blocking molecule, got %q %q", label, id)
+	}
+}
+
+func TestHasMoleculeChildren(t *testing.T) {
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-1", Type: "task", Status: "open"},
+		{ID: "MOL-1", Type: "molecule", Status: "open", ParentID: "BL-1"},
+	}, nil)
+	if !HasMoleculeChildren(store, "BL-1", store) {
+		t.Error("expected true")
+	}
+}
+
+func TestDoSlingDryRun(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1", DryRun: true,
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if !result.DryRun {
+		t.Error("expected DryRun=true")
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("runner should not be called during dry-run, got %d calls", len(runner.calls))
+	}
+}
+
+func TestDoSlingNudgeSignal(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "BL-1", Nudge: true,
+	}, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.NudgeAgent == nil {
+		t.Error("expected NudgeAgent to be set")
+	}
+}
