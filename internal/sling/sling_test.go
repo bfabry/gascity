@@ -324,3 +324,35 @@ func TestCheckBatchBurnOutputsWarn(t *testing.T) {
 		t.Errorf("AutoBurned[0] = %q, want MOL-1", result.AutoBurned[0])
 	}
 }
+
+func TestDoSlingValidatesRequiredDeps(t *testing.T) {
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	opts := testOpts(a, "BL-42")
+
+	t.Run("nil Cfg", func(t *testing.T) {
+		deps := testDeps(nil, nil, nil)
+		deps.Cfg = nil
+		_, err := DoSling(opts, deps, nil)
+		if err == nil || !strings.Contains(err.Error(), "Cfg") {
+			t.Errorf("expected Cfg validation error, got %v", err)
+		}
+	})
+
+	t.Run("nil Store", func(t *testing.T) {
+		deps := testDeps(&config.City{}, nil, nil)
+		deps.Store = nil
+		_, err := DoSling(opts, deps, nil)
+		if err == nil || !strings.Contains(err.Error(), "Store") {
+			t.Errorf("expected Store validation error, got %v", err)
+		}
+	})
+
+	t.Run("nil Runner", func(t *testing.T) {
+		deps := testDeps(&config.City{}, nil, nil)
+		deps.Runner = nil
+		_, err := DoSling(opts, deps, nil)
+		if err == nil || !strings.Contains(err.Error(), "Runner") {
+			t.Errorf("expected Runner validation error, got %v", err)
+		}
+	})
+}

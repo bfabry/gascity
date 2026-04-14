@@ -1056,7 +1056,6 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 	return sling.CheckBeadState(q, beadID, a, deps)
 }
 
-// checkBeadStateOriginal is dead code — remove after tests are updated.
 func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 	sp runtime.Provider, store beads.Store, stdout, stderr io.Writer,
 ) {

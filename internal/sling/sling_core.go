@@ -11,16 +11,33 @@ import (
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
+// validateDeps checks that required SlingDeps fields are non-nil.
+func validateDeps(deps SlingDeps) error {
+	if deps.Cfg == nil {
+		return fmt.Errorf("sling: Cfg is required")
+	}
+	if deps.Store == nil {
+		return fmt.Errorf("sling: Store is required")
+	}
+	if deps.Runner == nil {
+		return fmt.Errorf("sling: Runner is required")
+	}
+	return nil
+}
+
 // DoSling is the core logic for routing work to an agent.
 // Returns structured data -- callers format display strings.
 func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, error) {
+	if err := validateDeps(deps); err != nil {
+		return SlingResult{}, err
+	}
 	a := opts.Target
-	result := preflight(opts, deps, querier)
+	result, preErr := preflight(opts, deps, querier)
+	if preErr != nil {
+		return result, preErr
+	}
 	if result.DryRun || result.Idempotent {
 		return result, nil
-	}
-	if err := result.err; err != nil {
-		return result, err
 	}
 
 	beadID := opts.BeadOrFormula
@@ -39,7 +56,7 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 
 // preflight performs warnings, idempotency check, dry-run short-circuit,
 // and cross-rig guard. Returns a partially populated result.
-func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) SlingResult {
+func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, error) {
 	a := opts.Target
 	var result SlingResult
 	result.Target = a.QualifiedName()
@@ -57,8 +74,7 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) SlingResult 
 	// Cross-rig guard.
 	if !opts.IsFormula && !opts.Force && !opts.DryRun {
 		if msg := CheckCrossRig(opts.BeadOrFormula, a, deps.Cfg); msg != "" {
-			result.err = fmt.Errorf("%s", msg)
-			return result
+			return result, fmt.Errorf("%s", msg)
 		}
 	}
 
@@ -70,7 +86,7 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) SlingResult 
 			result.DryRun = opts.DryRun
 			result.BeadID = opts.BeadOrFormula
 			result.Method = "bead"
-			return result
+			return result, nil
 		}
 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
 	}
@@ -85,14 +101,14 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) SlingResult 
 		} else if opts.OnFormula != "" {
 			result.Method = "on-formula"
 		}
-		return result
+		return result, nil
 	}
 
 	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" && (opts.NoFormula || a.EffectiveDefaultSlingFormula() == "") {
-		result.err = fmt.Errorf("--scope-kind/--scope-ref require a formula-backed workflow launch")
+		return result, fmt.Errorf("--scope-kind/--scope-ref require a formula-backed workflow launch")
 	}
 
-	return result
+	return result, nil
 }
 
 // slingFormula handles the --formula dispatch path.

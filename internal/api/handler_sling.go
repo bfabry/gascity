@@ -28,14 +28,15 @@ type slingBody struct {
 }
 
 type slingResponse struct {
-	Status         string `json:"status"`
-	Target         string `json:"target"`
-	Formula        string `json:"formula,omitempty"`
-	Bead           string `json:"bead,omitempty"`
-	WorkflowID     string `json:"workflow_id,omitempty"`
-	RootBeadID     string `json:"root_bead_id,omitempty"`
-	AttachedBeadID string `json:"attached_bead_id,omitempty"`
-	Mode           string `json:"mode,omitempty"`
+	Status         string   `json:"status"`
+	Target         string   `json:"target"`
+	Formula        string   `json:"formula,omitempty"`
+	Bead           string   `json:"bead,omitempty"`
+	WorkflowID     string   `json:"workflow_id,omitempty"`
+	RootBeadID     string   `json:"root_bead_id,omitempty"`
+	AttachedBeadID string   `json:"attached_bead_id,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
@@ -174,6 +175,7 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
 		Runner:   s.slingRunner(),
 		Resolver: apiAgentResolver{},
+		Branches: apiBranchResolver{cityPath: s.state.CityPath()},
 		Notify:   &apiNotifier{state: s.state},
 	}
 
@@ -185,10 +187,11 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 	}
 
 	resp := &slingResponse{
-		Status: "slung",
-		Target: body.Target,
-		Bead:   body.Bead,
-		Mode:   mode,
+		Status:   "slung",
+		Target:   body.Target,
+		Bead:     body.Bead,
+		Mode:     mode,
+		Warnings: result.MetadataErrors,
 	}
 	if !workflowLaunch {
 		return resp, http.StatusOK, "", ""
@@ -272,6 +275,26 @@ type apiAgentResolver struct{}
 
 func (apiAgentResolver) ResolveAgent(cfg *config.City, name, _ string) (config.Agent, bool) {
 	return findAgent(cfg, name)
+}
+
+// apiBranchResolver implements sling.BranchResolver for the API context.
+// Uses the same git resolution as the CLI.
+type apiBranchResolver struct {
+	cityPath string
+}
+
+func (r apiBranchResolver) DefaultBranch(dir string) string {
+	if dir == "" {
+		dir = r.cityPath
+	}
+	// Best-effort: read git's origin/HEAD ref for the default branch.
+	// Falls back to empty string if git is unavailable.
+	out, err := exec.CommandContext(context.Background(), "git", "-C", dir,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/"))
 }
 
 // apiNotifier implements sling.Notifier for the API context.

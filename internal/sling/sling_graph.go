@@ -146,9 +146,6 @@ func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.Ci
 	if agentutil.IsMultiSessionAgent(&agentCfg) {
 		return binding, nil
 	}
-	if false {
-		return binding, nil
-	}
 	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
 	if sn == "" {
 		return GraphRouteBinding{}, fmt.Errorf("could not resolve session name for %q", agentCfg.QualifiedName())
@@ -277,9 +274,6 @@ func ResolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	if agentutil.IsMultiSessionAgent(&agentCfg) {
 		binding.MetadataOnly = true
 		cache[stepID] = binding
-		return binding, nil
-	}
-	if false {
 		return binding, nil
 	}
 	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
