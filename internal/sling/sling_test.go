@@ -213,14 +213,8 @@ func TestDoSlingSuspendedAgentWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DoSling error: %v", err)
 	}
-	found := false
-	for _, w := range result.Warnings() {
-		if strings.Contains(w, "suspended") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected suspension warning in %v", result.Warnings())
+	if !result.AgentSuspended {
+		t.Error("expected AgentSuspended=true")
 	}
 }
 
@@ -322,11 +316,11 @@ func TestCheckBatchBurnOutputsWarn(t *testing.T) {
 	var result SlingResult
 	// Pass store as both the store and querier (MemStore implements BeadChildQuerier)
 	err := CheckBatchNoMoleculeChildren(store, []beads.Bead{child}, store, &result)
-	t.Logf("err=%v output=%d", err, len(result.Output))
-	for _, o := range result.Output {
-		t.Logf("  kind=%d text=%q", o.Kind, o.Text)
+	t.Logf("err=%v autoburned=%d", err, len(result.AutoBurned))
+	if len(result.AutoBurned) == 0 {
+		t.Error("expected auto-burn")
 	}
-	if len(result.Output) == 0 {
-		t.Error("expected auto-burn output")
+	if result.AutoBurned[0] != "MOL-1" {
+		t.Errorf("AutoBurned[0] = %q, want MOL-1", result.AutoBurned[0])
 	}
 }

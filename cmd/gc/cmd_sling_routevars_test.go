@@ -169,6 +169,8 @@ type = "task"
 		Cfg:      cfg,
 		Store:    store,
 		StoreRef: "city:test-city",
+		Resolver: cliAgentResolver{},
+		Notify:   cliNotifier{},
 	}
 
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}

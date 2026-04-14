@@ -386,27 +386,133 @@ func (cliNotifier) PokeControlDispatch(cityPath string) {
 	_ = slingPokeControlDispatcher(cityPath)
 }
 
-// printSlingResult writes a SlingResult to stdout/stderr.
+// printSlingResult formats a SlingResult for CLI display.
+// Warnings go to stderr, messages go to stdout -- matching original behavior.
 func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
-	for _, o := range result.Output {
-		switch o.Kind {
-		case sling.OutputMessage:
-			fmt.Fprintln(stdout, o.Text) //nolint:errcheck
-		case sling.OutputWarning:
-			fmt.Fprintln(stderr, o.Text) //nolint:errcheck
+	// Warnings (stderr).
+	if result.AgentSuspended {
+		fmt.Fprintf(stderr, "warning: agent %q is suspended — bead routed but may not be picked up\n", result.Target) //nolint:errcheck
+	}
+	if result.PoolEmpty {
+		fmt.Fprintf(stderr, "warning: pool %q has max=0 — bead routed but no instances to claim it\n", result.Target) //nolint:errcheck
+	}
+	for _, w := range result.BeadWarnings {
+		fmt.Fprintln(stderr, w) //nolint:errcheck
+	}
+	for _, id := range result.AutoBurned {
+		fmt.Fprintf(stderr, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
+	}
+	for _, e := range result.MetadataErrors {
+		fmt.Fprintf(stderr, "gc sling: %s\n", e) //nolint:errcheck
+	}
+
+	// Skip display messages for idempotent/dry-run (handled separately).
+	if result.Idempotent {
+		fmt.Fprintf(stdout, "Bead %s already routed to %s — skipping (idempotent)\n", result.BeadID, result.Target) //nolint:errcheck
+		return
+	}
+	if result.DryRun {
+		return // dry-run display handled by dryRunSingle/dryRunBatch
+	}
+
+	// Messages (stdout).
+	if result.ConvoyID != "" {
+		fmt.Fprintf(stdout, "Auto-convoy %s\n", result.ConvoyID) //nolint:errcheck
+	}
+	if result.WispRootID != "" && result.WorkflowID == "" {
+		if result.FormulaName != "" {
+			fmt.Fprintf(stdout, "Attached wisp %s (formula %q) to %s\n", result.WispRootID, result.FormulaName, result.BeadID) //nolint:errcheck
+		} else {
+			fmt.Fprintf(stdout, "Attached wisp %s to %s\n", result.WispRootID, result.BeadID) //nolint:errcheck
 		}
 	}
+	if result.WorkflowID != "" {
+		switch result.Method {
+		case "on-formula", "default-on-formula":
+			fmt.Fprintf(stdout, "Attached workflow %s (formula %q) to %s\n", result.WorkflowID, result.FormulaName, result.BeadID) //nolint:errcheck
+		default:
+			fmt.Fprintf(stdout, "Started workflow %s (formula %q) → %s\n", result.WorkflowID, result.FormulaName, result.Target) //nolint:errcheck
+		}
+		return
+	}
+
+	// Standard sling confirmation.
+	switch result.Method {
+	case "formula":
+		fmt.Fprintf(stdout, "Slung formula %q (wisp root %s) → %s\n", result.FormulaName, result.BeadID, result.Target) //nolint:errcheck
+	case "on-formula":
+		fmt.Fprintf(stdout, "Slung %s (with formula %q) → %s\n", result.BeadID, result.FormulaName, result.Target) //nolint:errcheck
+	case "default-on-formula":
+		fmt.Fprintf(stdout, "Slung %s (with default formula %q) → %s\n", result.BeadID, result.FormulaName, result.Target) //nolint:errcheck
+	default:
+		fmt.Fprintf(stdout, "Slung %s → %s\n", result.BeadID, result.Target) //nolint:errcheck
+	}
+}
+
+// printBatchSlingResult formats a batch SlingResult for CLI display.
+func printBatchSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
+	// Warnings.
+	for _, w := range result.BeadWarnings {
+		fmt.Fprintln(stderr, w) //nolint:errcheck
+	}
+	for _, id := range result.AutoBurned {
+		fmt.Fprintf(stderr, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
+	}
+	for _, e := range result.MetadataErrors {
+		fmt.Fprintf(stderr, "gc sling: %s\n", e) //nolint:errcheck
+	}
+
+	if result.DryRun {
+		return
+	}
+
+	// Container expansion header.
+	ctype := result.ContainerType
+	if ctype == "" {
+		ctype = "container"
+	}
+	fmt.Fprintf(stdout, "Expanding %s %s (%d children, %d open)\n", ctype, result.BeadID, result.Total, result.Total-result.Skipped) //nolint:errcheck
+
+	// Per-child results.
+	for _, child := range result.Children {
+		switch {
+		case child.Skipped:
+			if child.Status != "" {
+				fmt.Fprintf(stdout, "  Skipped %s (status: %s)\n", child.BeadID, child.Status) //nolint:errcheck
+			} else {
+				fmt.Fprintf(stdout, "  Skipped %s — already routed to %s\n", child.BeadID, result.Target) //nolint:errcheck
+			}
+		case child.Failed:
+			fmt.Fprintf(stderr, "  Failed %s: %s\n", child.BeadID, child.FailReason) //nolint:errcheck
+		case child.Routed:
+			if child.WispRootID != "" {
+				label := "formula"
+				if result.Method == "batch-default-on" {
+					label = "default formula"
+				}
+				fmt.Fprintf(stdout, "  Attached wisp %s (%s %q) → %s\n", child.WispRootID, label, child.FormulaName, child.BeadID) //nolint:errcheck
+			}
+			fmt.Fprintf(stdout, "  Slung %s → %s\n", child.BeadID, result.Target) //nolint:errcheck
+		}
+	}
+
+	// Summary.
+	summary := fmt.Sprintf("Slung %d/%d children of %s → %s", result.Routed, result.Total, result.BeadID, result.Target)
+	if result.IdempotentCt > 0 {
+		summary += fmt.Sprintf(" (%d already routed)", result.IdempotentCt)
+	}
+	fmt.Fprintln(stdout, summary) //nolint:errcheck
 }
 
 // doSling delegates to sling.DoSling and handles CLI I/O + nudge + dry-run.
 func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
 	result, err := sling.DoSling(opts, deps, querier)
-	printSlingResult(result, stdout, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err) //nolint:errcheck
 		return 1
 	}
+	printSlingResult(result, stdout, stderr)
 	// Dry-run: display the CLI preview using the domain result.
 	if result.DryRun {
 		return dryRunSingle(opts, deps, querier, stdout, stderr)
@@ -421,7 +527,13 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
 	result, err := sling.DoSlingBatch(opts, deps, querier)
-	printSlingResult(result, stdout, stderr)
+	// Always print results when we have children (partial failures
+	// should still show per-child status).
+	if len(result.Children) > 0 {
+		printBatchSlingResult(result, stdout, stderr)
+	} else if err == nil {
+		printSlingResult(result, stdout, stderr)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err) //nolint:errcheck
 		return 1
@@ -610,12 +722,12 @@ func printCrossRigSection(w func(string), beadID string, a config.Agent, cfg *co
 }
 
 // checkNoMoleculeChildren delegates to sling.CheckNoMoleculeChildren,
-// bridging the io.Writer interface for CLI dry-run display.
+// printing auto-burn messages to the writer.
 func checkNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w io.Writer) error {
 	var result sling.SlingResult
 	err := sling.CheckNoMoleculeChildren(q, beadID, store, &result)
-	for _, o := range result.Output {
-		fmt.Fprintln(w, o.Text) //nolint:errcheck
+	for _, id := range result.AutoBurned {
+		fmt.Fprintf(w, "Auto-burned stale molecule %s on unassigned bead %s\n", id, beadID) //nolint:errcheck
 	}
 	return err
 }
@@ -624,8 +736,8 @@ func checkNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, w 
 func checkBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store beads.Store, w io.Writer) error {
 	var result sling.SlingResult
 	err := sling.CheckBatchNoMoleculeChildren(q, open, store, &result)
-	for _, o := range result.Output {
-		fmt.Fprintln(w, o.Text) //nolint:errcheck
+	for _, id := range result.AutoBurned {
+		fmt.Fprintf(w, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
 	}
 	return err
 }

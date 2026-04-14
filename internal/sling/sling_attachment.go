@@ -130,8 +130,7 @@ func CheckNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, re
 		}
 		if parentUnassigned && store != nil {
 			if burnErr := store.Close(attached.ID); burnErr == nil {
-				result.warn(
-					fmt.Sprintf("Auto-burned stale %s %s on unassigned bead %s", AttachmentLabel(attached), attached.ID, beadID))
+				result.AutoBurned = append(result.AutoBurned, attached.ID)
 				continue
 			}
 		}
@@ -156,8 +155,7 @@ func CheckBatchNoMoleculeChildren(q BeadChildQuerier, open []beads.Bead, store b
 			}
 			if childUnassigned && store != nil {
 				if burnErr := store.Close(attached.ID); burnErr == nil {
-					result.warn(
-						fmt.Sprintf("Auto-burned stale %s %s on unassigned bead %s", AttachmentLabel(attached), attached.ID, child.ID))
+					result.AutoBurned = append(result.AutoBurned, attached.ID)
 					continue
 				}
 			}

@@ -85,73 +85,49 @@ type SlingDeps struct {
 	Notify   Notifier       // controller/dispatcher wake (nil = skip)
 }
 
-// OutputKind tags a result output line as a message or warning.
-type OutputKind int
-
-const (
-	// OutputMessage is user-facing info (stdout in CLI).
-	OutputMessage OutputKind = iota
-	// OutputWarning is user-facing warning (stderr in CLI).
-	OutputWarning
-)
-
-// OutputLine is a single line of output from a sling operation,
-// preserving the interleaved order of messages and warnings.
-type OutputLine struct {
-	Kind OutputKind
-	Text string
-}
-
 // SlingResult holds the structured output of a sling operation.
-// Callers (CLI, API) format this for their respective surfaces.
+// Contains only data fields -- callers format display strings.
 type SlingResult struct {
-	BeadID     string       // the routed bead ID (or wisp root for formula)
-	Target     string       // qualified agent name
-	Method     string       // "bead", "formula", "on-formula", "default-on-formula"
-	WorkflowID string       // non-empty for graph workflow launches
-	ConvoyID   string       // non-empty if auto-convoy was created
-	Idempotent bool         // true if bead was already routed (skipped)
-	DryRun     bool         // true if this was a dry-run (no mutations)
-	Output     []OutputLine // ordered messages and warnings (preserves interleaving)
+	BeadID     string // the routed bead ID (or wisp root for formula)
+	Target     string // qualified agent name
+	Method     string // "bead", "formula", "on-formula", "default-on-formula"
+	WorkflowID string // non-empty for graph workflow launches
+	ConvoyID   string // non-empty if auto-convoy was created
+	WispRootID  string // non-empty for on-formula/default-formula attachment
+	FormulaName string // formula used (for display)
+	Idempotent bool   // true if bead was already routed (skipped)
+	DryRun     bool   // true if this was a dry-run (no mutations)
+
+	// Structured warnings (callers decide how to display).
+	AgentSuspended bool     // target agent is suspended
+	PoolEmpty      bool     // pool max=0
+	AutoBurned     []string // IDs of auto-burned stale molecules
+	MetadataErrors []string // non-fatal metadata write failures
+	BeadWarnings   []string // pre-flight bead state warnings
 
 	// Batch fields (populated by DoSlingBatch).
-	Routed     int
-	Failed     int
-	Skipped    int
-	Total      int
-	NudgeAgent *config.Agent // non-nil if caller should nudge
+	ContainerType string       // "convoy", "epic", etc. (batch only)
+	Routed        int
+	Failed        int
+	Skipped       int // total skipped (idempotent + non-open)
+	IdempotentCt  int // how many were skipped due to idempotency
+	Total         int
+	NudgeAgent    *config.Agent // non-nil if caller should nudge
+
+	// Per-child results for batch operations.
+	Children []SlingChildResult
 }
 
-// Messages returns all message-kind output lines.
-func (r SlingResult) Messages() []string {
-	var msgs []string
-	for _, o := range r.Output {
-		if o.Kind == OutputMessage {
-			msgs = append(msgs, o.Text)
-		}
-	}
-	return msgs
-}
-
-// Warnings returns all warning-kind output lines.
-func (r SlingResult) Warnings() []string {
-	var warns []string
-	for _, o := range r.Output {
-		if o.Kind == OutputWarning {
-			warns = append(warns, o.Text)
-		}
-	}
-	return warns
-}
-
-// msg appends a message to the result output.
-func (r *SlingResult) msg(text string) {
-	r.Output = append(r.Output, OutputLine{Kind: OutputMessage, Text: text})
-}
-
-// warn appends a warning to the result output.
-func (r *SlingResult) warn(text string) {
-	r.Output = append(r.Output, OutputLine{Kind: OutputWarning, Text: text})
+// SlingChildResult holds the outcome for a single child in batch sling.
+type SlingChildResult struct {
+	BeadID     string
+	Status     string // bead status (for skipped non-open children)
+	Routed     bool
+	Skipped    bool // idempotent or non-open
+	Failed     bool
+	FailReason string
+	WispRootID  string // if formula attached
+	FormulaName string // formula used
 }
 
 // ScaleInfo holds pool scaling parameters for an agent.
@@ -579,12 +555,6 @@ func PromoteWorkflowLaunchBead(store beads.Store, beadID string) error {
 	return store.Update(beadID, beads.UpdateOpts{Status: &status})
 }
 
-// StartGraphWorkflow is now inlined as doStartGraphWorkflow in sling_core.go.
-// This function is kept as a deprecated alias for any remaining callers.
-// Remove once all callers are updated.
-func StartGraphWorkflow(result *molecule.Result, sourceBeadID string, a config.Agent, method string, deps SlingDeps) (SlingResult, error) {
-	return doStartGraphWorkflow(result, sourceBeadID, a, method, deps)
-}
 
 // BeadCheckResult holds the result of pre-flight bead state checks.
 type BeadCheckResult struct {
