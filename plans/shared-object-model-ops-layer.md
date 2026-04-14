@@ -1,6 +1,6 @@
 # Plan: Extract Shared Object Model
 
-## Status: Phases 1-4 Complete
+## Status: Phases 1-4 Complete, Conformance Pass In Progress
 
 The shared domain layer is implemented across three packages with
 natural names. The generic `internal/ops/` package was eliminated in
@@ -9,59 +9,52 @@ favor of domain-specific packages.
 ## What Was Done
 
 ### Phase 1: Sling (`internal/sling/`) -- DONE
-
-Extracted ~1400 lines of sling business logic from `cmd/gc/cmd_sling.go`.
-The API handler (`internal/api/handler_sling.go`) now calls
-`sling.DoSling` directly -- the subprocess delegation anti-pattern
-(API shelling out to `gc sling`) is eliminated.
-
-**Package:** `internal/sling/`
-- `sling.go` -- Types (SlingDeps, SlingOpts, SlingRunner), ~30 helper
-  functions, formula instantiation, workflow launch
-- `sling_core.go` -- DoSling and DoSlingBatch core routing
-- `sling_graph.go` -- Graph.v2 workflow routing and decoration
-- `sling_attachment.go` -- Molecule/workflow attachment checks,
-  CheckBeadState
-- `path_util.go` -- Path normalization helpers
-- `sling_test.go` -- 22 tests
-
 ### Phase 2: Convoy (`internal/convoy/`) -- DONE
-
-Extracted convoy create, progress, add-items, and close operations.
-Fixed a bug where the API silently dropped lifecycle events
-(ConvoyCreated, ConvoyClosed). The ops functions emit events via
-the injected Recorder.
-
-**Package:** `internal/convoy/`
-- `convoy.go` -- ConvoyCreate, ConvoyProgress, ConvoyAddItems,
-  ConvoyClose with event emission
-- `convoy_fields.go` -- ConvoyFields metadata type and helpers
-- Tests: 12 tests
-
 ### Phase 3: Agent Resolution (`internal/agentutil/`) -- DONE
-
-Unified agent resolution with options-driven behavior serving three
-modes via ResolveOpts:
-- CLI dispatch: UseAmbientRig=true, AllowPoolMembers=true
-- API sling dispatch: AllowPoolMembers=true (no ambient rig)
-- API session creation: TemplateOnly=true
-
-**Package:** `internal/agentutil/`
-- `resolve.go` -- ResolveAgent, DeepCopyAgent, pool instance matching
-- `resolve_test.go` -- 8 tests
-
 ### Phase 4: Pool Expansion (`internal/agentutil/`) -- DONE
+### I/O Removal -- DONE
 
-Extracted shared pool expansion for enumerating agents including pool
-instances.
+Domain functions return structured results (SlingResult, etc.) with
+Messages and Warnings fields. Zero io.Writer, zero fmt.Fprintf in
+domain packages. CLI adapter prints results; API adapter reads
+struct fields directly into JSON.
 
-**Package:** `internal/agentutil/` (same package as agent resolution)
-- `pool.go` -- ExpandAgents, PoolInstanceName
-- `pool_test.go` -- 6 tests
+### Conformance Pass -- IN PROGRESS
+
+After comparing new packages against existing internal packages,
+four structural mismatches were identified:
+
+**1. Package doc comments** -- `sling` and `agentutil` are missing
+package doc comments. `convoy` has a stale one ("Package ops").
+Existing packages all have proper doc comments.
+Fix: Add correct package doc comments to all three packages.
+
+**2. Dependency injection style** -- Existing packages use narrow
+interfaces (e.g., `convergence.Store`, `convergence.EventEmitter`).
+Our `SlingDeps` uses raw function callbacks (`ResolveAgent func(...)`,
+`IsMultiSession func(...)`, etc.). This is a structural mismatch.
+Fix: Replace func fields with narrow interfaces where the callback
+has a clear single-method contract. Keep func fields only where the
+callback is truly ad-hoc (e.g., `PokeController`).
+
+**3. Error message prefixes** -- Existing packages use context-only
+prefixes (`"reading root bead metadata: %w"`). Our sling errors
+include the CLI command name (`"gc sling: instantiating formula..."`).
+Domain packages shouldn't know they're called from `gc sling`.
+Fix: Remove "gc sling:" prefix from all domain-package errors.
+Use context-only messages like `"instantiating formula %q: %w"`.
+
+**4. Output ordering** -- Original CLI interleaved warnings and
+messages per-operation. The new code batches all warnings first via
+`printSlingResult`. For batch operations with per-child warnings,
+this changes what the user sees.
+Fix: Replace separate Warnings/Messages slices with a single
+ordered Output slice that preserves interleaving, with each entry
+tagged as message or warning.
 
 ## Architecture
 
-### Package layout (natural names, not generic containers)
+### Package layout
 
 ```
 cmd/gc/cmd_*.go               internal/api/handler_*.go
@@ -79,46 +72,17 @@ cmd/gc/cmd_*.go               internal/api/handler_*.go
    (persistence + runtime primitives)
 ```
 
-- Domain packages never import `internal/api` or `cmd/gc`
-- Each domain has its natural name, not a generic container
-- Callers import domain packages, never the reverse
+### Structural patterns (must match existing packages)
 
-### Key design decisions
-
-- **Per-domain dependency structs** (SlingDeps, ConvoyDeps) instead of
-  one monolithic Deps. Each contains only what that domain needs.
-- **Lazy store resolution** via function fields rather than eagerly
-  populated maps (preserves CLI performance).
-- **Events via existing interface**: `events.Provider` embeds
-  `events.Recorder`. No new method on `api.State` was needed.
-- **Injected callbacks** for cmd/gc-specific functions that domain
-  packages can't import directly (resolveAgentIdentity, etc.).
-- **I/O stays in callers**: Domain functions still accept `io.Writer`
-  for now. Structured results (Warnings/Messages fields) are the
-  next improvement.
-
-### Why not `internal/ops/`?
-
-The original plan used a generic `internal/ops/` package. During
-implementation we realized these are domain concepts with natural
-names (sling, convoy, agent), not "operations." A generic container
-obscures what's inside and invites becoming a god package. Each
-domain gets its own package.
-
-`internal/agentutil/` (not `internal/agent/`) is used because the
-existing `internal/agent/` package is imported by `internal/config/`,
-which would create an import cycle.
+- **Package doc comments** on every package
+- **Narrow interfaces** for dependency injection, not raw func fields
+- **Context-only error messages** -- no CLI command names in errors
+- **Ordered output** preserving interleaving of warnings and messages
+- **Return structured results** -- (ResultType, error), no I/O
+- **Tests alongside code** in *_test.go files
+- **Error wrapping** with %w and context prefix
 
 ## What Remains (Phase 5+)
 
-All remaining business logic migrates to domain packages when touched:
-- Agent suspend/resume (needs config-editor abstraction)
-- Session lifecycle orchestration (beyond `session.Manager`)
-- Mail orchestration, city lifecycle, order/formula operations
-- Single-consumer operations (convoy autoclose/land, etc.)
-
+All remaining business logic migrates to domain packages when touched.
 New business logic goes to domain packages by default.
-
-CLAUDE.md's "no premature abstraction" refers to Go `interface` types,
-not code organization. Moving concrete functions to the correct layer
-is restructuring, not abstracting.
