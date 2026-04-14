@@ -272,6 +272,18 @@ func TestBuildResumeCommandUsesResolvedProviderCommand(t *testing.T) {
 				Env: map[string]string{
 					"GC_HOME": "/tmp/gc-accept-home",
 				},
+				OptionsSchema: []config.ProviderOption{
+					{
+						Key:     "permission_mode",
+						Label:   "Permission Mode",
+						Type:    "select",
+						Default: "unrestricted",
+						Choices: []config.OptionChoice{
+							{Value: "ask", Label: "Ask"},
+							{Value: "unrestricted", Label: "Unrestricted", FlagArgs: []string{"--no-approval"}},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -284,7 +296,7 @@ func TestBuildResumeCommandUsesResolvedProviderCommand(t *testing.T) {
 	}
 
 	cmd, hints := buildResumeCommand(cfg, info, "")
-	if got, want := cmd, "aimux run gemini -- --approval-mode yolo"; got != want {
+	if got, want := cmd, "aimux run gemini -- --approval-mode yolo --no-approval"; got != want {
 		t.Fatalf("resume command = %q, want %q", got, want)
 	}
 	if got, want := hints.WorkDir, "/tmp/workdir"; got != want {
@@ -615,6 +627,60 @@ func onlySessionBead(t *testing.T, cityDir string) beads.Bead {
 		t.Fatalf("session beads = %d, want 1", len(all))
 	}
 	return all[0]
+}
+
+func TestCmdSessionNewStoresProviderDefaultArgs(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.gc): %v", err)
+	}
+	data := []byte(`[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[providers.testprov]
+command = "true"
+path_check = "true"
+
+[[providers.testprov.options_schema]]
+key = "permission_mode"
+label = "Permission Mode"
+type = "select"
+default = "unrestricted"
+
+  [[providers.testprov.options_schema.choices]]
+  value = "ask"
+  label = "Ask"
+
+  [[providers.testprov.options_schema.choices]]
+  value = "unrestricted"
+  label = "Unrestricted"
+  flag_args = ["--default-flag", "value with space"]
+
+[[agent]]
+name = "worker"
+provider = "testprov"
+`)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionNew([]string{"worker"}, "", "", "", true, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionNew = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	b := onlySessionBead(t, cityDir)
+	if got, want := b.Metadata["command"], "true --default-flag 'value with space'"; got != want {
+		t.Fatalf("stored command = %q, want %q", got, want)
+	}
 }
 
 // --- Auto-title tests for issue #500 ---

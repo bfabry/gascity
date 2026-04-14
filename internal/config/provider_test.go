@@ -111,6 +111,12 @@ func TestBuiltinProvidersCodex(t *testing.T) {
 	if p.EmitsPermissionWarning {
 		t.Error("EmitsPermissionWarning = true, want false")
 	}
+	if p.ResumeFlag != "resume" {
+		t.Errorf("ResumeFlag = %q, want resume", p.ResumeFlag)
+	}
+	if p.ResumeStyle != "subcommand" {
+		t.Errorf("ResumeStyle = %q, want subcommand", p.ResumeStyle)
+	}
 }
 
 func TestBuiltinProvidersGemini(t *testing.T) {
@@ -254,6 +260,44 @@ func TestCommandStringWithArgs(t *testing.T) {
 	want := "claude --dangerously-skip-permissions"
 	if got := rp.CommandString(); got != want {
 		t.Errorf("CommandString() = %q, want %q", got, want)
+	}
+}
+
+func TestCommandStringWithDefaultArgs(t *testing.T) {
+	rp := &ResolvedProvider{
+		Command: "codex",
+		OptionsSchema: []ProviderOption{
+			{
+				Key:     "permission_mode",
+				Label:   "Permission Mode",
+				Type:    "select",
+				Default: "unrestricted",
+				Choices: []OptionChoice{
+					{Value: "ask", Label: "Ask"},
+					{Value: "unrestricted", Label: "Unrestricted", FlagArgs: []string{"--bypass"}},
+				},
+			},
+			{
+				Key:     "effort",
+				Label:   "Effort",
+				Type:    "select",
+				Default: "xhigh",
+				Choices: []OptionChoice{
+					{Value: "xhigh", Label: "Extra High", FlagArgs: []string{"-c", "model_reasoning_effort=xhigh"}},
+				},
+			},
+		},
+		EffectiveDefaults: map[string]string{
+			"permission_mode": "unrestricted",
+			"effort":          "xhigh",
+		},
+	}
+	want := "codex --bypass -c model_reasoning_effort=xhigh"
+	if got := rp.CommandStringWithDefaultArgs(); got != want {
+		t.Errorf("CommandStringWithDefaultArgs() = %q, want %q", got, want)
+	}
+	if got := rp.CommandString(); got != "codex" {
+		t.Errorf("CommandString() = %q, want bare command", got)
 	}
 }
 

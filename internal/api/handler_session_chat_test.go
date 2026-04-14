@@ -53,6 +53,18 @@ func TestBuildSessionResumeUsesResolvedProviderCommand(t *testing.T) {
 				Env: map[string]string{
 					"GC_HOME": "/tmp/gc-accept-home",
 				},
+				OptionsSchema: []config.ProviderOption{
+					{
+						Key:     "permission_mode",
+						Label:   "Permission Mode",
+						Type:    "select",
+						Default: "unrestricted",
+						Choices: []config.OptionChoice{
+							{Value: "ask", Label: "Ask"},
+							{Value: "unrestricted", Label: "Unrestricted", FlagArgs: []string{"--no-approval"}},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -67,7 +79,7 @@ func TestBuildSessionResumeUsesResolvedProviderCommand(t *testing.T) {
 	}
 
 	cmd, hints := srv.buildSessionResume(info)
-	if got, want := cmd, "aimux run gemini -- --approval-mode yolo"; got != want {
+	if got, want := cmd, "aimux run gemini -- --approval-mode yolo --no-approval"; got != want {
 		t.Fatalf("resume command = %q, want %q", got, want)
 	}
 	if got, want := hints.WorkDir, "/tmp/workdir"; got != want {

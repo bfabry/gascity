@@ -95,6 +95,18 @@ func (tp TemplateParams) DisplayName() string {
 	return tp.TemplateName
 }
 
+// buildProviderCommand builds the full provider command string including
+// schema-derived default args and city-local settings flags.
+func buildProviderCommand(resolved *config.ResolvedProvider, cityPath string) string {
+	command := resolved.CommandStringWithDefaultArgs()
+	if strings.TrimSpace(cityPath) != "" {
+		if sa := settingsArgs(cityPath, resolved.Name); sa != "" {
+			command = command + " " + sa
+		}
+	}
+	return command
+}
+
 // resolveTemplate computes all session parameters from a config.Agent without
 // side effects. This is a pure extraction of steps 1-13 and 15-16 from
 // buildOneAgent. The only side effect excluded is ACP route registration
@@ -128,14 +140,8 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 5: Build copy_files and command with settings args + schema defaults.
 	var copyFiles []runtime.CopyEntry
-	command := resolved.CommandString()
-	// Append schema-derived default args (e.g., --dangerously-skip-permissions
-	// from EffectiveDefaults["permission_mode"] = "unrestricted").
-	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
-		command = command + " " + shellquote.Join(defaultArgs)
-	}
+	command := buildProviderCommand(resolved, p.cityPath)
 	if sa := settingsArgs(p.cityPath, resolved.Name); sa != "" {
-		command = command + " " + sa
 		settingsFile, relDst := claudeSettingsSource(p.cityPath)
 		if settingsFile != "" {
 			copyFiles = append(copyFiles, runtime.CopyEntry{

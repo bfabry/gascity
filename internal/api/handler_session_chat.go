@@ -144,7 +144,7 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config) 
 			return cmd, runtime.Config{WorkDir: workDir}
 		}
 		resolvedInfo := info
-		resolvedInfo.Command = resolved.CommandString()
+		resolvedInfo.Command = resolved.CommandStringWithDefaultArgs()
 		resolvedInfo.Provider = resolved.Name
 		resolvedInfo.ResumeFlag = resolved.ResumeFlag
 		resolvedInfo.ResumeStyle = resolved.ResumeStyle

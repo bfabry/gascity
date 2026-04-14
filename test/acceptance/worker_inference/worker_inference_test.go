@@ -35,6 +35,7 @@ var (
 	agentsRunningPattern  = regexp.MustCompile(`(?m)^\s*(\d+)/(\d+)\s+agents running\b`)
 	createdBeadPattern    = regexp.MustCompile(`(?m)^Created (\S+)\b`)
 	createdSessionPattern = regexp.MustCompile(`(?m)^Session (\S+) created\b`)
+	codexThreadIDPattern  = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 )
 
 const (
@@ -306,6 +307,21 @@ func TestWorkerInferenceContinuationSmoke(t *testing.T) {
 		reporter.Record(liveFailureResult(profileID, workertest.RequirementInferenceContinuation, err.Error(), beforeEvidence))
 		t.FailNow()
 	}
+	sessionKeySource := ""
+	if strings.TrimSpace(run.SessionKey) == "" && strings.TrimSpace(beforeSnapshot.ProviderSessionID) != "" {
+		resumeSessionKey := providerResumeSessionKey(liveSetup.Provider, beforeSnapshot.ProviderSessionID)
+		if err := persistLiveSessionKey(run.CityDir, run.SessionID, resumeSessionKey); err != nil {
+			evidence := mergeEvidence(beforeEvidence, map[string]string{
+				"city_dir":            run.CityDir,
+				"session_bead_id":     run.SessionID,
+				"provider_session_id": beforeSnapshot.ProviderSessionID,
+				"resume_session_key":  resumeSessionKey,
+			})
+			reporter.Record(liveFailureResult(profileID, workertest.RequirementInferenceContinuation, fmt.Sprintf("persisting discovered provider session id: %v", err), evidence))
+			t.FailNow()
+		}
+		sessionKeySource = "provider_transcript"
+	}
 
 	restartEvidence := map[string]string{
 		"city_dir":            run.CityDir,
@@ -319,6 +335,10 @@ func TestWorkerInferenceContinuationSmoke(t *testing.T) {
 		"first_logical_conv":  beforeSnapshot.LogicalConversationID,
 		"first_provider_sess": beforeSnapshot.ProviderSessionID,
 		"anchor_text":         anchorText,
+	}
+	if sessionKeySource != "" {
+		restartEvidence["session_key_source"] = sessionKeySource
+		restartEvidence["persisted_resume_session_key"] = providerResumeSessionKey(liveSetup.Provider, beforeSnapshot.ProviderSessionID)
 	}
 
 	stopOut, startOut, err := restartLiveCity(run.CityDir, run.SessionName)
@@ -688,6 +708,43 @@ func openLiveCityStore(cityDir string) (beads.Store, error) {
 		return store, nil
 	default:
 		return beads.NewBdStore(cityDir, beads.ExecCommandRunnerWithEnv(liveBeadStoreEnv(cityDir))), nil
+	}
+}
+
+func persistLiveSessionKey(cityDir, sessionID, sessionKey string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionID == "" || sessionKey == "" {
+		return nil
+	}
+	store, err := openLiveCityStore(cityDir)
+	if err != nil {
+		return err
+	}
+	return store.SetMetadata(sessionID, "session_key", sessionKey)
+}
+
+func providerResumeSessionKey(provider, providerSessionID string) string {
+	providerSessionID = strings.TrimSpace(providerSessionID)
+	if providerSessionID == "" {
+		return ""
+	}
+	if strings.Contains(strings.ToLower(provider), "codex") {
+		matches := codexThreadIDPattern.FindAllString(providerSessionID, -1)
+		if len(matches) > 0 {
+			return matches[len(matches)-1]
+		}
+	}
+	return providerSessionID
+}
+
+func TestProviderResumeSessionKey(t *testing.T) {
+	const codexID = "rollout-2026-04-14T09-54-20-019d8afb-efe8-7280-abf9-5901fd92e0cd"
+	if got, want := providerResumeSessionKey("codex/tmux-cli", codexID), "019d8afb-efe8-7280-abf9-5901fd92e0cd"; got != want {
+		t.Fatalf("providerResumeSessionKey(codex) = %q, want %q", got, want)
+	}
+	if got := providerResumeSessionKey("claude/tmux-cli", codexID); got != codexID {
+		t.Fatalf("providerResumeSessionKey(claude) = %q, want original", got)
 	}
 }
 

@@ -157,6 +157,18 @@ func (rp *ResolvedProvider) CommandString() string {
 	return rp.Command + " " + shellquote.Join(rp.Args)
 }
 
+// CommandStringWithDefaultArgs returns the provider command plus schema-derived
+// default CLI args. Use this for persisted or runtime start commands; keep
+// CommandString for callers that need the provider's raw command/args only.
+func (rp *ResolvedProvider) CommandStringWithDefaultArgs() string {
+	command := rp.CommandString()
+	defaultArgs := rp.ResolveDefaultArgs()
+	if len(defaultArgs) == 0 {
+		return command
+	}
+	return command + " " + shellquote.Join(defaultArgs)
+}
+
 // TitleModelFlagArgs resolves the TitleModel key against the "model"
 // OptionsSchema entry. Returns the CLI flag args for the title model,
 // or nil if TitleModel is empty or not found in the schema.
@@ -303,6 +315,8 @@ func BuiltinProviders() map[string]ProviderSpec {
 			SupportsHooks:    true,
 			NeedsNudgePoller: true,
 			InstructionsFile: "AGENTS.md",
+			ResumeFlag:       "resume",
+			ResumeStyle:      "subcommand",
 			PrintArgs:        []string{"exec"},
 			TitleModel:       "o4-mini",
 			PermissionModes: map[string]string{
