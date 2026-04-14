@@ -98,6 +98,9 @@ type SlingResult struct {
 	Idempotent bool   // true if bead was already routed (skipped)
 	DryRun     bool   // true if this was a dry-run (no mutations)
 
+	// Internal error from preflight (unexported, used by DoSling dispatch).
+	err error
+
 	// Structured warnings (callers decide how to display).
 	AgentSuspended bool     // target agent is suspended
 	PoolEmpty      bool     // pool max=0

@@ -15,10 +15,35 @@ import (
 // Returns structured data -- callers format display strings.
 func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, error) {
 	a := opts.Target
+	result := preflight(opts, deps, querier)
+	if result.DryRun || result.Idempotent {
+		return result, nil
+	}
+	if err := result.err; err != nil {
+		return result, err
+	}
+
+	beadID := opts.BeadOrFormula
+
+	switch {
+	case opts.IsFormula:
+		return slingFormula(opts, deps, beadID)
+	case opts.OnFormula != "":
+		return slingOnFormula(opts, deps, querier, beadID, result)
+	case !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "":
+		return slingDefaultFormula(opts, deps, querier, beadID, result)
+	default:
+		return slingPlainBead(opts, deps, beadID, result)
+	}
+}
+
+// preflight performs warnings, idempotency check, dry-run short-circuit,
+// and cross-rig guard. Returns a partially populated result.
+func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) SlingResult {
+	a := opts.Target
 	var result SlingResult
 	result.Target = a.QualifiedName()
 
-	// Structured warnings (callers decide display).
 	if a.Suspended && !opts.Force {
 		result.AgentSuspended = true
 	}
@@ -32,7 +57,8 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 	// Cross-rig guard.
 	if !opts.IsFormula && !opts.Force && !opts.DryRun {
 		if msg := CheckCrossRig(opts.BeadOrFormula, a, deps.Cfg); msg != "" {
-			return result, fmt.Errorf("%s", msg)
+			result.err = fmt.Errorf("%s", msg)
+			return result
 		}
 	}
 
@@ -44,12 +70,12 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 			result.DryRun = opts.DryRun
 			result.BeadID = opts.BeadOrFormula
 			result.Method = "bead"
-			return result, nil
+			return result
 		}
 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
 	}
 
-	// Dry-run: return early with preview info, no mutations.
+	// Dry-run: return early with preview info.
 	if opts.DryRun {
 		result.DryRun = true
 		result.BeadID = opts.BeadOrFormula
@@ -59,96 +85,112 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		} else if opts.OnFormula != "" {
 			result.Method = "on-formula"
 		}
-		return result, nil
+		return result
 	}
-
-	beadID := opts.BeadOrFormula
-	method := "bead"
 
 	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" && (opts.NoFormula || a.EffectiveDefaultSlingFormula() == "") {
-		return result, fmt.Errorf("--scope-kind/--scope-ref require a formula-backed workflow launch")
+		result.err = fmt.Errorf("--scope-kind/--scope-ref require a formula-backed workflow launch")
 	}
 
-	// If --formula, instantiate wisp and use the root bead ID.
-	if opts.IsFormula {
-		method = "formula"
-		formulaVars := BuildSlingFormulaVars(opts.BeadOrFormula, "", opts.Vars, a, deps)
-		mResult, err := InstantiateSlingFormula(context.Background(), opts.BeadOrFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
-			Title: opts.Title,
-			Vars:  formulaVars,
-		}, "", opts.ScopeKind, opts.ScopeRef, a, deps)
-		if err != nil {
-			return result, fmt.Errorf("instantiating formula %q: %w", opts.BeadOrFormula, err)
-		}
-		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, mResult.RootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult, "", a, method, deps)
-			wfResult.FormulaName = opts.BeadOrFormula
-			return wfResult, wfErr
-		}
-		beadID = mResult.RootID
-		result.FormulaName = opts.BeadOrFormula
-	}
+	return result
+}
 
-	// If --on, attach a wisp to the bead and route the original bead.
-	if opts.OnFormula != "" {
-		method = "on-formula"
-		if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
-			return result, fmt.Errorf("%w", err)
-		}
-		formulaVars := BuildSlingFormulaVars(opts.OnFormula, beadID, opts.Vars, a, deps)
-		mResult, err := InstantiateSlingFormula(context.Background(), opts.OnFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
-			Title:            opts.Title,
-			Vars:             formulaVars,
-			PriorityOverride: BeadPriorityOverride(querier, beadID),
-		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
-		if err != nil {
-			return result, fmt.Errorf("instantiating formula %q on %s: %w", opts.OnFormula, beadID, err)
-		}
-		wispRootID := mResult.RootID
-		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult, beadID, a, method, deps)
-			wfResult.FormulaName = opts.OnFormula
-			return wfResult, wfErr
-		}
-		if err := deps.Store.SetMetadata(beadID, "molecule_id", wispRootID); err != nil {
-			result.MetadataErrors = append(result.MetadataErrors,
-				fmt.Sprintf("setting molecule_id on %s: %v", beadID, err))
-		}
-		result.WispRootID = wispRootID
-		result.FormulaName = opts.OnFormula
+// slingFormula handles the --formula dispatch path.
+func slingFormula(opts SlingOpts, deps SlingDeps, beadID string) (SlingResult, error) {
+	a := opts.Target
+	method := "formula"
+	formulaVars := BuildSlingFormulaVars(opts.BeadOrFormula, "", opts.Vars, a, deps)
+	mResult, err := InstantiateSlingFormula(context.Background(), opts.BeadOrFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		Title: opts.Title,
+		Vars:  formulaVars,
+	}, "", opts.ScopeKind, opts.ScopeRef, a, deps)
+	if err != nil {
+		return SlingResult{Target: a.QualifiedName()}, fmt.Errorf("instantiating formula %q: %w", opts.BeadOrFormula, err)
 	}
-
-	// Apply default formula if target has one and no explicit formula/--no-formula.
-	if opts.OnFormula == "" && !opts.IsFormula && !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
-		method = "default-on-formula"
-		if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
-			return result, fmt.Errorf("%w", err)
-		}
-		defaultVars := BuildSlingFormulaVars(a.EffectiveDefaultSlingFormula(), beadID, opts.Vars, a, deps)
-		mResult, err := InstantiateSlingFormula(context.Background(), a.EffectiveDefaultSlingFormula(), SlingFormulaSearchPaths(deps, a), molecule.Options{
-			Title:            opts.Title,
-			Vars:             defaultVars,
-			PriorityOverride: BeadPriorityOverride(querier, beadID),
-		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
-		if err != nil {
-			return result, fmt.Errorf("instantiating default formula %q on %s: %w",
-				a.EffectiveDefaultSlingFormula(), beadID, err)
-		}
-		wispRootID := mResult.RootID
-		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult, beadID, a, method, deps)
-			wfResult.FormulaName = a.EffectiveDefaultSlingFormula()
-			return wfResult, wfErr
-		}
-		if err := deps.Store.SetMetadata(beadID, "molecule_id", wispRootID); err != nil {
-			result.MetadataErrors = append(result.MetadataErrors,
-				fmt.Sprintf("setting molecule_id on %s: %v", beadID, err))
-		}
-		result.WispRootID = wispRootID
-		result.FormulaName = a.EffectiveDefaultSlingFormula()
+	if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, mResult.RootID) {
+		wfResult, wfErr := doStartGraphWorkflow(mResult, "", a, method, deps)
+		wfResult.FormulaName = opts.BeadOrFormula
+		return wfResult, wfErr
 	}
+	beadID = mResult.RootID
+	result := SlingResult{Target: a.QualifiedName(), FormulaName: opts.BeadOrFormula}
+	return finalize(opts, deps, beadID, method, result)
+}
 
-	// Build and execute sling command.
+// slingOnFormula handles the --on formula attachment path.
+func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
+	a := opts.Target
+	method := "on-formula"
+	if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
+		return result, fmt.Errorf("%w", err)
+	}
+	formulaVars := BuildSlingFormulaVars(opts.OnFormula, beadID, opts.Vars, a, deps)
+	mResult, err := InstantiateSlingFormula(context.Background(), opts.OnFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		Title:            opts.Title,
+		Vars:             formulaVars,
+		PriorityOverride: BeadPriorityOverride(querier, beadID),
+	}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
+	if err != nil {
+		return result, fmt.Errorf("instantiating formula %q on %s: %w", opts.OnFormula, beadID, err)
+	}
+	wispRootID := mResult.RootID
+	if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
+		wfResult, wfErr := doStartGraphWorkflow(mResult, beadID, a, method, deps)
+		wfResult.FormulaName = opts.OnFormula
+		return wfResult, wfErr
+	}
+	if err := deps.Store.SetMetadata(beadID, "molecule_id", wispRootID); err != nil {
+		result.MetadataErrors = append(result.MetadataErrors,
+			fmt.Sprintf("setting molecule_id on %s: %v", beadID, err))
+	}
+	result.WispRootID = wispRootID
+	result.FormulaName = opts.OnFormula
+	return finalize(opts, deps, beadID, method, result)
+}
+
+// slingDefaultFormula handles the default formula attachment path.
+func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
+	a := opts.Target
+	method := "default-on-formula"
+	defaultFormula := a.EffectiveDefaultSlingFormula()
+	if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
+		return result, fmt.Errorf("%w", err)
+	}
+	defaultVars := BuildSlingFormulaVars(defaultFormula, beadID, opts.Vars, a, deps)
+	mResult, err := InstantiateSlingFormula(context.Background(), defaultFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		Title:            opts.Title,
+		Vars:             defaultVars,
+		PriorityOverride: BeadPriorityOverride(querier, beadID),
+	}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
+	if err != nil {
+		return result, fmt.Errorf("instantiating default formula %q on %s: %w", defaultFormula, beadID, err)
+	}
+	wispRootID := mResult.RootID
+	if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
+		wfResult, wfErr := doStartGraphWorkflow(mResult, beadID, a, method, deps)
+		wfResult.FormulaName = defaultFormula
+		return wfResult, wfErr
+	}
+	if err := deps.Store.SetMetadata(beadID, "molecule_id", wispRootID); err != nil {
+		result.MetadataErrors = append(result.MetadataErrors,
+			fmt.Sprintf("setting molecule_id on %s: %v", beadID, err))
+	}
+	result.WispRootID = wispRootID
+	result.FormulaName = defaultFormula
+	return finalize(opts, deps, beadID, method, result)
+}
+
+// slingPlainBead handles plain bead routing (no formula).
+func slingPlainBead(opts SlingOpts, deps SlingDeps, beadID string, result SlingResult) (SlingResult, error) {
+	return finalize(opts, deps, beadID, "bead", result)
+}
+
+// finalize executes the sling command, records telemetry, sets merge
+// metadata, creates auto-convoy, pokes the controller, and signals nudge.
+func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result SlingResult) (SlingResult, error) {
+	a := opts.Target
+
+	// Execute sling command.
 	slingEnv := ResolveSlingEnv(a, deps)
 	slingCmd := BuildSlingCommand(a.EffectiveSlingQuery(), beadID)
 	rigDir := SlingDirForBead(deps.Cfg, deps.CityPath, beadID)
@@ -156,7 +198,6 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, err)
 		return result, fmt.Errorf("%w", err)
 	}
-
 	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
 
 	// Merge strategy metadata.
@@ -195,12 +236,12 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 	result.BeadID = beadID
 	result.Method = method
 
-	// Poke controller for immediate reconciliation.
+	// Poke controller.
 	if !opts.SkipPoke && deps.Notify != nil {
 		deps.Notify.PokeController(deps.CityPath)
 	}
 
-	// Signal that nudge is needed (caller handles actual nudge).
+	// Signal nudge.
 	if opts.Nudge {
 		result.NudgeAgent = &a
 	}
