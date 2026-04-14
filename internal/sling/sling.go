@@ -166,6 +166,7 @@ type RouteOpts struct {
 	Owned    bool
 	Nudge    bool
 	Force    bool
+	DryRun   bool
 	SkipPoke bool
 }
 
@@ -176,6 +177,7 @@ type FormulaOpts struct {
 	Merge     string
 	Nudge     bool
 	Force     bool
+	DryRun    bool
 	SkipPoke  bool
 	ScopeKind string
 	ScopeRef  string
@@ -192,7 +194,8 @@ func (s *Sling) RouteBead(ctx context.Context, beadID string, target config.Agen
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
-	}, s.deps, nil)
+		DryRun:        opts.DryRun,
+	}, s.deps, s.deps.Store)
 }
 
 // LaunchFormula instantiates a formula and routes the resulting wisp.
@@ -207,9 +210,10 @@ func (s *Sling) LaunchFormula(ctx context.Context, formulaName string, target co
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
+		DryRun:        opts.DryRun,
 		ScopeKind:     opts.ScopeKind,
 		ScopeRef:      opts.ScopeRef,
-	}, s.deps, nil)
+	}, s.deps, s.deps.Store)
 }
 
 // AttachFormula attaches a formula wisp to an existing bead and routes the bead.
@@ -224,9 +228,10 @@ func (s *Sling) AttachFormula(ctx context.Context, formulaName, beadID string, t
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
+		DryRun:        opts.DryRun,
 		ScopeKind:     opts.ScopeKind,
 		ScopeRef:      opts.ScopeRef,
-	}, s.deps, nil)
+	}, s.deps, s.deps.Store)
 }
 
 // ExpandConvoy expands a convoy and routes each open child.
@@ -240,6 +245,7 @@ func (s *Sling) ExpandConvoy(ctx context.Context, convoyID string, target config
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
+		DryRun:        opts.DryRun,
 	}, s.deps, querier)
 }
 

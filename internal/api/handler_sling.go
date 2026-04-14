@@ -99,7 +99,7 @@ func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, status, code, message := s.execSlingDirect(body, agentCfg)
+	resp, status, code, message := s.execSlingDirect(r.Context(), body, agentCfg)
 	if code != "" {
 		writeError(w, status, code, message)
 		return
@@ -107,17 +107,28 @@ func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
-// execSlingDirect calls sling.DoSling directly instead of shelling out.
-func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingResponse, int, string, string) {
+// execSlingDirect calls the intent-based Sling API directly.
+func (s *Server) execSlingDirect(ctx context.Context, body slingBody, agentCfg config.Agent) (*slingResponse, int, string, string) {
 	formulaName := strings.TrimSpace(body.Formula)
 	attachedBeadID := strings.TrimSpace(body.AttachedBeadID)
-	mode := "direct"
-	workflowLaunch := false
 
-	// Build SlingOpts from request body.
-	slingOpts := sling.SlingOpts{
-		Target:   agentCfg,
-		SkipPoke: false,
+	// Build deps and construct Sling instance.
+	store := s.findSlingStore(body.Rig, agentCfg)
+	deps := sling.SlingDeps{
+		CityName: s.state.CityName(),
+		CityPath: s.state.CityPath(),
+		Cfg:      s.state.Config(),
+		SP:       s.state.SessionProvider(),
+		Store:    store,
+		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
+		Runner:   s.slingRunner(),
+		Resolver: apiAgentResolver{},
+		Branches: apiBranchResolver{cityPath: s.state.CityPath()},
+		Notify:   &apiNotifier{state: s.state},
+	}
+	sl, err := sling.New(deps)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "internal", err.Error()
 	}
 
 	// Build vars slice from map (sorted for determinism).
@@ -132,19 +143,30 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 			varSlice = append(varSlice, k+"="+body.Vars[k])
 		}
 	}
-	slingOpts.Vars = varSlice
+
+	formulaOpts := sling.FormulaOpts{
+		Title:     strings.TrimSpace(body.Title),
+		Vars:      varSlice,
+		ScopeKind: body.ScopeKind,
+		ScopeRef:  body.ScopeRef,
+	}
+
+	// Dispatch to the right intent-based method.
+	var result sling.SlingResult
+	mode := "direct"
+	workflowLaunch := false
 
 	switch {
 	case attachedBeadID != "":
 		mode = "attached"
 		workflowLaunch = true
-		slingOpts.BeadOrFormula = attachedBeadID
-		slingOpts.OnFormula = formulaName
+		result, err = sl.AttachFormula(ctx, formulaName, attachedBeadID, agentCfg, formulaOpts)
+
 	case formulaName != "":
 		mode = "standalone"
 		workflowLaunch = true
-		slingOpts.BeadOrFormula = formulaName
-		slingOpts.IsFormula = true
+		result, err = sl.LaunchFormula(ctx, formulaName, agentCfg, formulaOpts)
+
 	case strings.TrimSpace(body.Bead) != "" &&
 		agentCfg.EffectiveDefaultSlingFormula() != "" &&
 		(len(body.Vars) > 0 || body.Title != "" || body.ScopeKind != "" || body.ScopeRef != ""):
@@ -152,38 +174,15 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		workflowLaunch = true
 		attachedBeadID = strings.TrimSpace(body.Bead)
 		formulaName = agentCfg.EffectiveDefaultSlingFormula()
-		slingOpts.BeadOrFormula = attachedBeadID
-		// Default formula is applied automatically by DoSling when no --on/--formula.
+		// Default formula: route the bead and let the domain apply the default.
+		result, err = sl.RouteBead(ctx, attachedBeadID, agentCfg, sling.RouteOpts{})
+
 	default:
-		slingOpts.BeadOrFormula = body.Bead
+		result, err = sl.RouteBead(ctx, body.Bead, agentCfg, sling.RouteOpts{})
 	}
 
-	if workflowLaunch {
-		slingOpts.Title = strings.TrimSpace(body.Title)
-		slingOpts.ScopeKind = body.ScopeKind
-		slingOpts.ScopeRef = body.ScopeRef
-	}
-
-	// Build SlingDeps from api.State.
-	store := s.findSlingStore(body.Rig, agentCfg)
-	deps := sling.SlingDeps{
-		CityName: s.state.CityName(),
-		CityPath: s.state.CityPath(),
-		Cfg:      s.state.Config(),
-		SP:       s.state.SessionProvider(),
-		Store:    store,
-		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
-		Runner:   s.slingRunner(),
-		Resolver: apiAgentResolver{},
-		Branches: apiBranchResolver{cityPath: s.state.CityPath()},
-		Notify:   &apiNotifier{state: s.state},
-	}
-
-	// Call sling.DoSling directly -- returns structured result, no I/O.
-	result, err := sling.DoSling(slingOpts, deps, store)
 	if err != nil {
-		message := err.Error()
-		return nil, http.StatusBadRequest, "invalid", message
+		return nil, http.StatusBadRequest, "invalid", err.Error()
 	}
 
 	resp := &slingResponse{

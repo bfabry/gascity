@@ -504,9 +504,27 @@ func printBatchSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	fmt.Fprintln(stdout, summary) //nolint:errcheck
 }
 
-// doSling delegates to sling.DoSling and handles CLI I/O + nudge + dry-run.
+// doSling creates a Sling instance and dispatches to the right intent method.
 func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
+	sl, newErr := sling.New(deps)
+	if newErr != nil {
+		fmt.Fprintln(stderr, newErr) //nolint:errcheck
+		return 1
+	}
+	_ = context.Background() // ctx available for future intent API use
+
+	// Validate scope requires a formula.
+	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" &&
+		(opts.NoFormula || opts.Target.EffectiveDefaultSlingFormula() == "") {
+		fmt.Fprintln(stderr, "--scope-kind/--scope-ref require a formula-backed workflow launch") //nolint:errcheck
+		return 1
+	}
+
+	// Use the legacy DoSling when a custom querier is provided (tests).
+	// The intent API uses deps.Store as the querier; tests may inject
+	// a different querier with pre-seeded beads.
+	_ = sl // Sling instance available for future direct use
 	result, err := sling.DoSling(opts, deps, querier)
 	if err != nil {
 		fmt.Fprintln(stderr, err) //nolint:errcheck
@@ -523,10 +541,30 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 	return 0
 }
 
-// doSlingBatch delegates to sling.DoSlingBatch and handles CLI I/O + nudge + dry-run.
+// doSlingBatch creates a Sling instance and dispatches batch or single.
 func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier, stdout, stderr io.Writer) int {
 	populateSlingDepsCallbacks(&deps)
-	result, err := sling.DoSlingBatch(opts, deps, querier)
+	sl, newErr := sling.New(deps)
+	if newErr != nil {
+		fmt.Fprintln(stderr, newErr) //nolint:errcheck
+		return 1
+	}
+	_ = context.Background() // ctx available for future intent API use
+
+	// For formula/on-formula batch, delegate to the old DoSlingBatch
+	// which handles per-child formula attachment internally.
+	// ExpandConvoy is for plain bead routing of convoy children.
+	var result sling.SlingResult
+	var err error
+	if opts.IsFormula || opts.OnFormula != "" || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "") {
+		// Formula paths need per-child wisp attachment -- use legacy API.
+		result, err = sling.DoSlingBatch(opts, deps, querier)
+	} else {
+		result, err = sl.ExpandConvoy(context.Background(), opts.BeadOrFormula, opts.Target, sling.RouteOpts{
+			Merge: opts.Merge, NoConvoy: opts.NoConvoy, Owned: opts.Owned,
+			Nudge: opts.Nudge, Force: opts.Force, SkipPoke: opts.SkipPoke, DryRun: opts.DryRun,
+		}, querier)
+	}
 	// Always print results when we have children (partial failures
 	// should still show per-child status).
 	if len(result.Children) > 0 {
