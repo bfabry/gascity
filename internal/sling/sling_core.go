@@ -206,13 +206,26 @@ func slingPlainBead(opts SlingOpts, deps SlingDeps, beadID string, result SlingR
 func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result SlingResult) (SlingResult, error) {
 	a := opts.Target
 
-	// Execute sling command.
+	// Execute routing -- prefer typed Router, fall back to shell Runner.
 	slingEnv := ResolveSlingEnv(a, deps)
-	slingCmd := BuildSlingCommand(a.EffectiveSlingQuery(), beadID)
 	rigDir := SlingDirForBead(deps.Cfg, deps.CityPath, beadID)
-	if _, err := deps.Runner(rigDir, slingCmd, slingEnv); err != nil {
-		telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, err)
-		return result, fmt.Errorf("%w", err)
+	if deps.Router != nil {
+		req := RouteRequest{
+			BeadID:  beadID,
+			Target:  a.QualifiedName(),
+			WorkDir: rigDir,
+			Env:     slingEnv,
+		}
+		if err := deps.Router.Route(context.Background(), req); err != nil {
+			telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, err)
+			return result, fmt.Errorf("%w", err)
+		}
+	} else {
+		slingCmd := BuildSlingCommand(a.EffectiveSlingQuery(), beadID)
+		if _, err := deps.Runner(rigDir, slingCmd, slingEnv); err != nil {
+			telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, err)
+			return result, fmt.Errorf("%w", err)
+		}
 	}
 	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
 

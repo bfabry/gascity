@@ -69,6 +69,21 @@ type Notifier interface {
 	PokeControlDispatch(cityPath string)
 }
 
+// BeadRouter routes a bead to an agent using typed structured data.
+// Replaces the shell-string SlingRunner for callers using the intent API.
+type BeadRouter interface {
+	Route(ctx context.Context, req RouteRequest) error
+}
+
+// RouteRequest describes a bead routing operation in typed terms.
+type RouteRequest struct {
+	BeadID   string
+	Target   string            // qualified agent name
+	Metadata map[string]string // gc.routed_to, pool label, etc.
+	WorkDir  string            // rig directory for command execution
+	Env      map[string]string // extra env vars (GC_SLING_TARGET, etc.)
+}
+
 // SlingDeps bundles infrastructure dependencies for sling operations.
 type SlingDeps struct {
 	CityName string
@@ -83,6 +98,7 @@ type SlingDeps struct {
 	Resolver AgentResolver  // agent name resolution
 	Branches BranchResolver // git default branch lookup (nil = skip)
 	Notify   Notifier       // controller/dispatcher wake (nil = skip)
+	Router   BeadRouter     // typed bead routing (nil = use Runner)
 }
 
 // SlingResult holds the structured output of a sling operation.

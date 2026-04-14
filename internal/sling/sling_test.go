@@ -429,3 +429,42 @@ func TestSlingLaunchFormula(t *testing.T) {
 		t.Error("expected non-empty BeadID")
 	}
 }
+
+// --- Typed router tests ---
+
+type fakeBeadRouter struct {
+	routed []RouteRequest
+}
+
+func (r *fakeBeadRouter) Route(_ context.Context, req RouteRequest) error {
+	r.routed = append(r.routed, req)
+	return nil
+}
+
+func TestSlingRouteBeadWithTypedRouter(t *testing.T) {
+	router := &fakeBeadRouter{}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.Router = router
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	_, err = s.RouteBead(context.Background(), "BL-42", a, RouteOpts{})
+	if err != nil {
+		t.Fatalf("RouteBead: %v", err)
+	}
+
+	if len(router.routed) != 1 {
+		t.Fatalf("got %d route calls, want 1", len(router.routed))
+	}
+	if router.routed[0].BeadID != "BL-42" {
+		t.Errorf("BeadID = %q, want BL-42", router.routed[0].BeadID)
+	}
+	if router.routed[0].Target != "mayor" {
+		t.Errorf("Target = %q, want mayor", router.routed[0].Target)
+	}
+}
