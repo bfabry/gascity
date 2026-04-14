@@ -1,7 +1,7 @@
 // Package ops implements shared domain operations for Gas City.
 // Both the CLI (cmd/gc) and the HTTP API (internal/api) depend on this
 // package as thin adapters. ops never imports internal/api or cmd/gc.
-package ops
+package convoy
 
 import (
 	"github.com/gastownhall/gascity/internal/beads"

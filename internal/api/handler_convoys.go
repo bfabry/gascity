@@ -6,7 +6,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
-	"github.com/gastownhall/gascity/internal/ops"
+	"github.com/gastownhall/gascity/internal/convoy"
 )
 
 func (s *Server) handleConvoyList(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +149,7 @@ func (s *Server) handleConvoyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deps := s.convoyDeps()
-	result, err := ops.ConvoyCreate(deps, store, ops.ConvoyCreateInput{
+	result, err := convoy.ConvoyCreate(deps, store, convoy.ConvoyCreateInput{
 		Title: body.Title,
 		Items: body.Items,
 	})
@@ -270,7 +270,7 @@ func (s *Server) handleConvoyCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deps := s.convoyDeps()
-	progress, err := ops.ConvoyProgress(deps, store, id)
+	progress, err := convoy.ConvoyProgress(deps, store, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -328,22 +328,22 @@ func (s *Server) handleConvoyClose(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deps := s.convoyDeps()
-	if err := ops.ConvoyClose(deps, store, id); err != nil {
+	if err := convoy.ConvoyClose(deps, store, id); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }
 
-// convoyDeps builds ops.ConvoyDeps from the server's state.
-func (s *Server) convoyDeps() ops.ConvoyDeps {
+// convoyDeps builds convoy.ConvoyDeps from the server's state.
+func (s *Server) convoyDeps() convoy.ConvoyDeps {
 	stores := s.state.BeadStores()
 	ep := s.state.EventProvider()
 	var rec events.Recorder
 	if ep != nil {
 		rec = ep // events.Provider embeds events.Recorder
 	}
-	return ops.ConvoyDeps{
+	return convoy.ConvoyDeps{
 		Cfg: s.state.Config(),
 		GetStore: func(rig string) (beads.Store, error) {
 			if st := s.state.BeadStore(rig); st != nil {

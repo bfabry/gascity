@@ -15,7 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
-	"github.com/gastownhall/gascity/internal/ops"
+	"github.com/gastownhall/gascity/internal/sling"
 )
 
 type slingBody struct {
@@ -109,7 +109,7 @@ func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
-// execSlingDirect calls ops.DoSling directly instead of shelling out.
+// execSlingDirect calls sling.DoSling directly instead of shelling out.
 func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingResponse, int, string, string) {
 	formulaName := strings.TrimSpace(body.Formula)
 	attachedBeadID := strings.TrimSpace(body.AttachedBeadID)
@@ -117,7 +117,7 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 	workflowLaunch := false
 
 	// Build SlingOpts from request body.
-	slingOpts := ops.SlingOpts{
+	slingOpts := sling.SlingOpts{
 		Target:   agentCfg,
 		SkipPoke: false,
 	}
@@ -169,7 +169,7 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 	// Build SlingDeps from api.State.
 	store := s.findSlingStore(body.Rig, agentCfg)
 	var stdout, stderr bytes.Buffer
-	deps := ops.SlingDeps{
+	deps := sling.SlingDeps{
 		CityName: s.state.CityName(),
 		CityPath: s.state.CityPath(),
 		Cfg:      s.state.Config(),
@@ -197,8 +197,8 @@ func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingR
 		},
 	}
 
-	// Call ops.DoSling directly.
-	exitCode := ops.DoSling(slingOpts, deps, store)
+	// Call sling.DoSling directly.
+	exitCode := sling.DoSling(slingOpts, deps, store)
 	if exitCode != 0 {
 		message := strings.TrimSpace(stderr.String())
 		if message == "" {
@@ -262,7 +262,7 @@ func (s *Server) slingStoreRef(rig string, agentCfg config.Agent) string {
 
 // slingRunner returns the SlingRunner for the API context.
 // Uses SlingRunnerFunc if set (for tests), otherwise a real shell runner.
-func (s *Server) slingRunner() ops.SlingRunner {
+func (s *Server) slingRunner() sling.SlingRunner {
 	if s.SlingRunnerFunc != nil {
 		return s.SlingRunnerFunc
 	}

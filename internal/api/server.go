@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
-	"github.com/gastownhall/gascity/internal/ops"
+	"github.com/gastownhall/gascity/internal/sling"
 )
 
 // Server is the GC API HTTP server. It serves /v0/* endpoints and /health.
@@ -43,7 +43,7 @@ type Server struct {
 
 	// SlingRunnerFunc can be overridden in tests. When nil, uses a real
 	// shell runner. Set this to inject a fake runner for unit tests.
-	SlingRunnerFunc ops.SlingRunner
+	SlingRunnerFunc sling.SlingRunner
 }
 
 type lookPathEntry struct {

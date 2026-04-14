@@ -17,7 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/molecule"
-	"github.com/gastownhall/gascity/internal/ops"
+	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -27,11 +27,11 @@ import (
 // slingStdin returns the reader for --stdin input. Extracted for testability.
 var slingStdin = func() io.Reader { return os.Stdin }
 
-// BeadQuerier is an alias for ops.BeadQuerier.
-type BeadQuerier = ops.BeadQuerier
+// BeadQuerier is an alias for sling.BeadQuerier.
+type BeadQuerier = sling.BeadQuerier
 
-// BeadChildQuerier is an alias for ops.BeadChildQuerier.
-type BeadChildQuerier = ops.BeadChildQuerier
+// BeadChildQuerier is an alias for sling.BeadChildQuerier.
+type BeadChildQuerier = sling.BeadChildQuerier
 
 func newSlingCmd(stdout, stderr io.Writer) *cobra.Command {
 	var formula bool
@@ -126,22 +126,22 @@ Examples:
 	return cmd
 }
 
-// slingOpts is an alias for ops.SlingOpts.
-type slingOpts = ops.SlingOpts
+// slingOpts is an alias for sling.SlingOpts.
+type slingOpts = sling.SlingOpts
 
 var (
 	slingPokeController        = pokeController
 	slingPokeControlDispatcher = pokeControlDispatch
 )
 
-// slingDeps is an alias for ops.SlingDeps.
-type slingDeps = ops.SlingDeps
+// slingDeps is an alias for sling.SlingDeps.
+type slingDeps = sling.SlingDeps
 
-// SlingRunner is an alias for ops.SlingRunner.
-type SlingRunner = ops.SlingRunner
+// SlingRunner is an alias for sling.SlingRunner.
+type SlingRunner = sling.SlingRunner
 
 func slingTracef(format string, args ...any) {
-	ops.SlingTracef(format, args...)
+	sling.SlingTracef(format, args...)
 }
 
 // shellSlingRunner runs a command via sh -c and returns stdout.
@@ -341,19 +341,19 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 
 // findRigByPrefix returns the rig whose effective prefix matches (case-insensitive).
 func findRigByPrefix(cfg *config.City, prefix string) (config.Rig, bool) {
-	return ops.FindRigByPrefix(cfg, prefix)
+	return sling.FindRigByPrefix(cfg, prefix)
 }
 
 func rigDirForBead(cfg *config.City, beadID string) string {
-	return ops.RigDirForBead(cfg, beadID)
+	return sling.RigDirForBead(cfg, beadID)
 }
 
 func rigDirForAgent(cfg *config.City, a config.Agent) string {
-	return ops.RigDirForAgent(cfg, a)
+	return sling.RigDirForAgent(cfg, a)
 }
 
 func slingDirForBead(cfg *config.City, cityPath, beadID string) string {
-	return ops.SlingDirForBead(cfg, cityPath, beadID)
+	return sling.SlingDirForBead(cfg, cityPath, beadID)
 }
 
 // populateSlingDepsCallbacks fills in the injected function fields that ops
@@ -368,9 +368,9 @@ func populateSlingDepsCallbacks(deps *slingDeps) {
 	deps.LookupSessionName = func(store beads.Store, cityName, qualifiedName, sessionTemplate string) string {
 		return lookupSessionNameOrLegacy(store, cityName, qualifiedName, sessionTemplate)
 	}
-	deps.ScaleParams = func(a *config.Agent) ops.ScaleInfo {
+	deps.ScaleParams = func(a *config.Agent) sling.ScaleInfo {
 		sp := scaleParamsFor(a)
-		return ops.ScaleInfo{Min: sp.Min, Max: sp.Max}
+		return sling.ScaleInfo{Min: sp.Min, Max: sp.Max}
 	}
 	deps.DefaultBranch = defaultBranchFor
 	deps.PokeController = slingPokeController
@@ -378,26 +378,26 @@ func populateSlingDepsCallbacks(deps *slingDeps) {
 	deps.DoNudge = func(a *config.Agent, cityName, cityPath string, cfg *config.City, sp runtime.Provider, store beads.Store, stdout, stderr io.Writer) {
 		doSlingNudge(a, cityName, cityPath, cfg, sp, store, stdout, stderr)
 	}
-	deps.DryRunSingle = func(o ops.SlingOpts, d ops.SlingDeps, q ops.BeadQuerier) int {
+	deps.DryRunSingle = func(o sling.SlingOpts, d sling.SlingDeps, q sling.BeadQuerier) int {
 		return dryRunSingle(o, d, q)
 	}
-	deps.DryRunBatch = func(o ops.SlingOpts, d ops.SlingDeps, q ops.BeadChildQuerier) int {
+	deps.DryRunBatch = func(o sling.SlingOpts, d sling.SlingDeps, q sling.BeadChildQuerier) int {
 		// dryRunBatch has extra params; we need the original bead data.
 		// For now, fall back to the original dryRunBatch via doSlingBatch.
 		return 0 // placeholder — dry-run stays in CLI for now
 	}
 }
 
-// doSling delegates to ops.DoSling.
+// doSling delegates to sling.DoSling.
 func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 	populateSlingDepsCallbacks(&deps)
-	return ops.DoSling(opts, deps, querier)
+	return sling.DoSling(opts, deps, querier)
 }
 
-// doSlingBatch delegates to ops.DoSlingBatch.
+// doSlingBatch delegates to sling.DoSlingBatch.
 func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int {
 	populateSlingDepsCallbacks(&deps)
-	return ops.DoSlingBatch(opts, deps, querier)
+	return sling.DoSlingBatch(opts, deps, querier)
 }
 
 // The original doSling and doSlingBatch function bodies have been moved

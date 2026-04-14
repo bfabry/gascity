@@ -2,23 +2,20 @@ package main
 
 import (
 	"github.com/gastownhall/gascity/internal/beads"
-	"github.com/gastownhall/gascity/internal/ops"
+	"github.com/gastownhall/gascity/internal/convoy"
 )
 
-// ConvoyFields is an alias for the shared ops type.
-type ConvoyFields = ops.ConvoyFields
+// ConvoyFields is an alias for the shared convoy type.
+type ConvoyFields = convoy.ConvoyFields
 
-// applyConvoyFields delegates to ops.ApplyConvoyFields.
 func applyConvoyFields(b *beads.Bead, fields ConvoyFields) {
-	ops.ApplyConvoyFields(b, fields)
+	convoy.ApplyConvoyFields(b, fields)
 }
 
-// setConvoyFields delegates to ops.SetConvoyFields.
 func setConvoyFields(store beads.Store, id string, fields ConvoyFields) error {
-	return ops.SetConvoyFields(store, id, fields)
+	return convoy.SetConvoyFields(store, id, fields)
 }
 
-// getConvoyFields delegates to ops.GetConvoyFields.
 func getConvoyFields(b beads.Bead) ConvoyFields {
-	return ops.GetConvoyFields(b)
+	return convoy.GetConvoyFields(b)
 }

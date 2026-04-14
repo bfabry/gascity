@@ -1,10 +1,12 @@
-package ops
+package agentutil
 
 import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
 )
+
+func intPtr(v int) *int { return &v }
 
 func TestResolveAgentLiteralQualified(t *testing.T) {
 	cfg := &config.City{
