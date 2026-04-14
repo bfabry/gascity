@@ -2,13 +2,20 @@ package api
 
 import (
 	"bytes"
-	"context"
+	"fmt"
 	"net/http"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
+
+	"context"
+	"os"
+	"os/exec"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/ops"
 )
 
 type slingBody struct {
@@ -33,10 +40,6 @@ type slingResponse struct {
 	AttachedBeadID string `json:"attached_bead_id,omitempty"`
 	Mode           string `json:"mode,omitempty"`
 }
-
-// slingCommandRunner is the function that executes gc sling as a subprocess.
-// Replaceable in tests.
-var slingCommandRunner = runSlingCommand
 
 func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 	var body slingBody
@@ -98,7 +101,7 @@ func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, status, code, message := s.execSling(r.Context(), body, agentCfg.EffectiveDefaultSlingFormula())
+	resp, status, code, message := s.execSlingDirect(body, agentCfg)
 	if code != "" {
 		writeError(w, status, code, message)
 		return
@@ -106,72 +109,103 @@ func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
-// execSling builds gc sling CLI args from the request body and shells out.
-// Both plain-bead and workflow-backed launches use the same subprocess entry
-// point so the HTTP API stays aligned with `gc sling`.
-func (s *Server) execSling(
-	ctx context.Context,
-	body slingBody,
-	defaultFormula string,
-) (*slingResponse, int, string, string) {
-	args := []string{"--city", s.state.CityPath(), "sling", body.Target}
-
+// execSlingDirect calls ops.DoSling directly instead of shelling out.
+func (s *Server) execSlingDirect(body slingBody, agentCfg config.Agent) (*slingResponse, int, string, string) {
 	formulaName := strings.TrimSpace(body.Formula)
 	attachedBeadID := strings.TrimSpace(body.AttachedBeadID)
 	mode := "direct"
 	workflowLaunch := false
 
+	// Build SlingOpts from request body.
+	slingOpts := ops.SlingOpts{
+		Target:   agentCfg,
+		SkipPoke: false,
+	}
+
+	// Build vars slice from map (sorted for determinism).
+	var varSlice []string
+	if len(body.Vars) > 0 {
+		keys := make([]string, 0, len(body.Vars))
+		for k := range body.Vars {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			varSlice = append(varSlice, k+"="+body.Vars[k])
+		}
+	}
+	slingOpts.Vars = varSlice
+
 	switch {
 	case attachedBeadID != "":
 		mode = "attached"
 		workflowLaunch = true
-		args = append(args, attachedBeadID, "--on", formulaName)
+		slingOpts.BeadOrFormula = attachedBeadID
+		slingOpts.OnFormula = formulaName
 	case formulaName != "":
 		mode = "standalone"
 		workflowLaunch = true
-		args = append(args, formulaName, "--formula")
+		slingOpts.BeadOrFormula = formulaName
+		slingOpts.IsFormula = true
 	case strings.TrimSpace(body.Bead) != "" &&
-		defaultFormula != "" &&
+		agentCfg.EffectiveDefaultSlingFormula() != "" &&
 		(len(body.Vars) > 0 || body.Title != "" || body.ScopeKind != "" || body.ScopeRef != ""):
 		mode = "attached"
 		workflowLaunch = true
 		attachedBeadID = strings.TrimSpace(body.Bead)
-		formulaName = strings.TrimSpace(defaultFormula)
-		args = append(args, attachedBeadID)
+		formulaName = agentCfg.EffectiveDefaultSlingFormula()
+		slingOpts.BeadOrFormula = attachedBeadID
+		// Default formula is applied automatically by DoSling when no --on/--formula.
 	default:
-		args = append(args, body.Bead)
+		slingOpts.BeadOrFormula = body.Bead
 	}
 
 	if workflowLaunch {
-		if title := strings.TrimSpace(body.Title); title != "" {
-			args = append(args, "--title", title)
-		}
-		if scopeKind := strings.TrimSpace(body.ScopeKind); scopeKind != "" {
-			args = append(args, "--scope-kind", scopeKind)
-		}
-		if scopeRef := strings.TrimSpace(body.ScopeRef); scopeRef != "" {
-			args = append(args, "--scope-ref", scopeRef)
-		}
-		if len(body.Vars) > 0 {
-			keys := make([]string, 0, len(body.Vars))
-			for key := range body.Vars {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				args = append(args, "--var", key+"="+body.Vars[key])
-			}
-		}
+		slingOpts.Title = strings.TrimSpace(body.Title)
+		slingOpts.ScopeKind = body.ScopeKind
+		slingOpts.ScopeRef = body.ScopeRef
 	}
 
-	stdout, stderr, err := slingCommandRunner(ctx, s.state.CityPath(), args)
-	if err != nil {
-		message := strings.TrimSpace(stderr)
+	// Build SlingDeps from api.State.
+	store := s.findSlingStore(body.Rig, agentCfg)
+	var stdout, stderr bytes.Buffer
+	deps := ops.SlingDeps{
+		CityName: s.state.CityName(),
+		CityPath: s.state.CityPath(),
+		Cfg:      s.state.Config(),
+		SP:       s.state.SessionProvider(),
+		Store:    store,
+		StoreRef: s.slingStoreRef(body.Rig, agentCfg),
+		Runner:   s.slingRunner(),
+		Stdout:   &stdout,
+		Stderr:   &stderr,
+		// Inject API-side resolution functions.
+		ResolveAgent: func(cfg *config.City, name, rigContext string) (config.Agent, bool) {
+			return findAgent(cfg, name)
+		},
+		IsMultiSession: func(a *config.Agent) bool {
+			if a == nil {
+				return false
+			}
+			maxSess := a.EffectiveMaxActiveSessions()
+			return maxSess == nil || *maxSess != 1
+		},
+		LookupSessionName: apiLookupSessionName,
+		PokeController: func(_ string) error {
+			s.state.Poke()
+			return nil
+		},
+	}
+
+	// Call ops.DoSling directly.
+	exitCode := ops.DoSling(slingOpts, deps, store)
+	if exitCode != 0 {
+		message := strings.TrimSpace(stderr.String())
 		if message == "" {
-			message = strings.TrimSpace(stdout)
+			message = strings.TrimSpace(stdout.String())
 		}
 		if message == "" {
-			message = err.Error()
+			message = fmt.Sprintf("sling failed with exit code %d", exitCode)
 		}
 		return nil, http.StatusBadRequest, "invalid", message
 	}
@@ -188,37 +222,82 @@ func (s *Server) execSling(
 
 	resp.Formula = formulaName
 	resp.AttachedBeadID = attachedBeadID
-	workflowID := parseWorkflowIDFromSlingOutput(stdout)
+	workflowID := parseWorkflowIDFromSlingOutput(stdout.String())
 	if workflowID == "" {
-		workflowID = parseWorkflowIDFromSlingOutput(stderr)
+		workflowID = parseWorkflowIDFromSlingOutput(stderr.String())
 	}
 	if workflowID == "" {
-		return nil, http.StatusInternalServerError, "internal", "gc sling did not report a workflow id"
+		return nil, http.StatusInternalServerError, "internal", "sling did not report a workflow id"
 	}
 	resp.WorkflowID = workflowID
 	resp.RootBeadID = workflowID
 	return resp, http.StatusCreated, "", ""
 }
 
-func runSlingCommand(ctx context.Context, cityPath string, args []string) (string, string, error) {
-	gcBin, err := os.Executable()
-	if err != nil {
-		return "", "", err
+// findSlingStore returns the bead store for sling operations.
+func (s *Server) findSlingStore(rig string, agentCfg config.Agent) beads.Store {
+	if rig != "" {
+		if store := s.state.BeadStore(rig); store != nil {
+			return store
+		}
 	}
+	if agentCfg.Dir != "" {
+		if store := s.state.BeadStore(agentCfg.Dir); store != nil {
+			return store
+		}
+	}
+	return s.state.CityBeadStore()
+}
 
-	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+// slingStoreRef returns a store ref string for the sling context.
+func (s *Server) slingStoreRef(rig string, agentCfg config.Agent) string {
+	if rig != "" {
+		return "rig:" + rig
+	}
+	if agentCfg.Dir != "" {
+		return "rig:" + agentCfg.Dir
+	}
+	return "city:" + s.state.CityName()
+}
 
-	cmd := exec.CommandContext(cmdCtx, gcBin, args...)
-	cmd.Dir = cityPath
+// slingRunner returns the SlingRunner for the API context.
+// Uses SlingRunnerFunc if set (for tests), otherwise a real shell runner.
+func (s *Server) slingRunner() ops.SlingRunner {
+	if s.SlingRunnerFunc != nil {
+		return s.SlingRunnerFunc
+	}
+	return func(dir, command string, env map[string]string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		if dir != "" {
+			cmd.Dir = dir
+		}
+		if len(env) > 0 {
+			cmd.Env = mergeEnvForSling(env)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return string(out), fmt.Errorf("running %q: %w", command, err)
+		}
+		return string(out), nil
+	}
+}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+// mergeEnvForSling merges extra env vars into the current process env.
+func mergeEnvForSling(extra map[string]string) []string {
+	base := os.Environ()
+	merged := make([]string, 0, len(base)+len(extra))
+	merged = append(merged, base...)
+	for k, v := range extra {
+		merged = append(merged, k+"="+v)
+	}
+	return merged
+}
 
-	err = cmd.Run()
-	return stdout.String(), stderr.String(), err
+// apiLookupSessionName resolves a session name from the bead store.
+func apiLookupSessionName(store beads.Store, cityName, qualifiedName, sessionTemplate string) string {
+	return agent.SessionNameFor(cityName, qualifiedName, sessionTemplate)
 }
 
 func parseWorkflowIDFromSlingOutput(output string) string {
