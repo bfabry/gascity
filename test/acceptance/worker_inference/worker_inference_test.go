@@ -39,23 +39,32 @@ var (
 )
 
 const (
-	inferenceProbeTemplate   = "probe"
-	inferenceProbeManualID   = "probe-live"
-	inferenceProbePromptPath = "prompts/worker-inference-probe.md"
-	inferenceSlingTarget     = inferenceProbeTemplate
-	namedSessionModeMetadata = "configured_named_mode"
-	liveBootstrapTimeout     = 90 * time.Second
-	liveControlTimeout       = 45 * time.Second
-	liveShutdownTimeout      = 60 * time.Second
-	liveStopBarrierTimeout   = 30 * time.Second
+	inferenceProbeTemplate    = "probe"
+	inferenceProbeManualID    = "probe-live"
+	inferenceProbePromptPath  = "prompts/worker-inference-probe.md"
+	inferenceSlingTarget      = inferenceProbeTemplate
+	namedSessionModeMetadata  = "configured_named_mode"
+	liveBootstrapTimeout      = 90 * time.Second
+	liveControlTimeout        = 45 * time.Second
+	liveSpawnTimeout          = 5 * time.Minute
+	liveSessionStartupTimeout = "3m"
+	liveShutdownTimeout       = 60 * time.Second
+	liveStopBarrierTimeout    = 30 * time.Second
 )
 
 var inferenceDisabledOrders = []string{
 	"beads-health",
 	"cross-rig-deps",
+	"dolt-health",
+	"dolt-remotes-patrol",
 	"gate-sweep",
+	"mol-dog-backup",
+	"mol-dog-compactor",
+	"mol-dog-doctor",
 	"mol-dog-jsonl",
+	"mol-dog-phantom-db",
 	"mol-dog-reaper",
+	"mol-dog-stale-db",
 	"orphan-sweep",
 	"prune-branches",
 	"spawn-storm-detect",
@@ -643,7 +652,7 @@ func leadingWhitespace(line string) string {
 }
 
 func closeLiveSessionsByTemplate(cityDir, template string) error {
-	sessionsOut, err := runGCWithTimeout(10*time.Second, liveEnv, cityDir, "session", "list", "--json")
+	sessionsOut, err := runGCWithTimeout(liveControlTimeout, liveEnv, cityDir, "session", "list", "--json")
 	if err != nil {
 		return err
 	}
@@ -988,7 +997,7 @@ func runFreshInitSlingWorkWithSetup(t *testing.T, provider, prompt, outputRel st
 		blocked           *liveBlockedInteraction
 	)
 
-	spawned := pollForCondition(2*time.Minute, 5*time.Second, func() bool {
+	spawned := pollForCondition(liveSpawnTimeout, 5*time.Second, func() bool {
 		statusOut, statusErr := runGCWithTimeout(10*time.Second, liveEnv, c.Dir, "status")
 		lastStatus = strings.TrimSpace(statusOut)
 		if statusErr != nil {
@@ -1043,30 +1052,44 @@ func runFreshInitSlingWorkWithSetup(t *testing.T, provider, prompt, outputRel st
 	}
 
 	outputPath := filepath.Join(c.Dir, outputRel)
+	hookNudgeOut, hookNudgeErr := runGCWithTimeout(
+		liveControlTimeout,
+		liveEnv,
+		c.Dir,
+		"session",
+		"nudge",
+		"--delivery",
+		"wait-idle",
+		spawnedSession.SessionName,
+		"Check your hook for work assignments, complete the assigned work, and close the work bead.",
+	)
 	var lastWorkBead beadJSON
-	completed := pollForCondition(6*time.Minute, 10*time.Second, func() bool {
-		bead, beadErr := showBeadJSON(c.Dir, workBeadID)
-		if beadErr == nil {
-			lastWorkBead = bead
-		}
-		data, readErr := os.ReadFile(outputPath)
-		if readErr == nil {
-			output := strings.TrimSpace(string(data))
-			if output != "" && beadErr == nil && bead.Status == "closed" {
+	completed := false
+	if hookNudgeErr == nil {
+		completed = pollForCondition(6*time.Minute, 10*time.Second, func() bool {
+			bead, beadErr := showBeadJSON(c.Dir, workBeadID)
+			if beadErr == nil {
+				lastWorkBead = bead
+			}
+			data, readErr := os.ReadFile(outputPath)
+			if readErr == nil {
+				output := strings.TrimSpace(string(data))
+				if output != "" && beadErr == nil && bead.Status == "closed" {
+					return true
+				}
+			}
+			detected, err := detectLiveBlockedInteraction(c.Dir, spawnedSession.SessionName)
+			if err != nil {
+				lastStatus = strings.TrimSpace(lastStatus + "\nTMUX_ERR: " + err.Error())
+				return false
+			}
+			if detected != nil {
+				blocked = detected
 				return true
 			}
-		}
-		detected, err := detectLiveBlockedInteraction(c.Dir, spawnedSession.SessionName)
-		if err != nil {
-			lastStatus = strings.TrimSpace(lastStatus + "\nTMUX_ERR: " + err.Error())
 			return false
-		}
-		if detected != nil {
-			blocked = detected
-			return true
-		}
-		return false
-	})
+		})
+	}
 
 	sessionListOut, _ = runGCWithTimeout(10*time.Second, liveEnv, c.Dir, "session", "list")
 	supervisorLogsOut, _ = runGCWithTimeout(10*time.Second, liveEnv, c.Dir, "supervisor", "logs")
@@ -1124,6 +1147,16 @@ func runFreshInitSlingWorkWithSetup(t *testing.T, provider, prompt, outputRel st
 		"session_key":     spawnedSession.SessionKey,
 		"session_name":    spawnedSession.SessionName,
 		"session_state":   spawnedSession.State,
+	}
+	if trimmed := strings.TrimSpace(hookNudgeOut); trimmed != "" {
+		taskEvidence["hook_nudge_out"] = trimmed
+	}
+	if hookNudgeErr != nil {
+		taskEvidence["hook_nudge_err"] = strings.TrimSpace(errorString(hookNudgeErr))
+		taskEvidence["status"] = lastStatus
+		taskEvidence["session_list"] = run.SessionList
+		taskEvidence["supervisor_logs"] = run.SupervisorLogs
+		return run, spawnEvidence, taskEvidence, "task", fmt.Errorf("nudging %s to check hook: %w", spawnedSession.SessionName, hookNudgeErr)
 	}
 
 	if blocked != nil {
@@ -1844,6 +1877,13 @@ max_active_sessions = 1
 template = %q
 mode = "always"
 `, inferenceProbeTemplate))
+	}
+	if !strings.Contains(string(data), "\n[session]\n") {
+		additions = append(additions, fmt.Sprintf(`
+
+[session]
+startup_timeout = %q
+`, liveSessionStartupTimeout))
 	}
 	if !strings.Contains(string(data), "\n[orders]\n") {
 		additions = append(additions, fmt.Sprintf(`
@@ -3232,6 +3272,7 @@ func isIgnorableTmuxProbeError(err error) bool {
 	return strings.Contains(text, "no server") ||
 		strings.Contains(text, "failed to connect") ||
 		strings.Contains(text, "error connecting") ||
+		strings.Contains(text, "server exited unexpectedly") ||
 		strings.Contains(text, "can't find pane") ||
 		strings.Contains(text, "can't find session")
 }
