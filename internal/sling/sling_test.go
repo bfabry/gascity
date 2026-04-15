@@ -133,11 +133,16 @@ func TestBeadPrefixSling(t *testing.T) {
 		id   string
 		want string
 	}{
-		{"BL-42", "BL"},
-		{"HW-1", "HW"},
-		{"DEMO--42", "DEMO"},
+		{"BL-42", "bl"},
+		{"HW-1", "hw"},
+		{"FE-123", "fe"},
+		{"DEMO--42", "demo"},
+		{"projectwrenunity-abc", "projectwrenunity"},
+		{"A-B-C", "a"},
+		{"A-", "a"},
 		{"", ""},
 		{"nohyphen", ""},
+		{"-1", ""},
 	}
 	for _, tt := range tests {
 		got := BeadPrefix(tt.id)

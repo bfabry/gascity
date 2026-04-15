@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/sling"
 )
 
 // selectiveErrStore wraps a beads.Store and injects Create errors for selected
@@ -3109,26 +3110,6 @@ func TestDryRunIdempotentBead(t *testing.T) {
 
 // --- Cross-rig guard tests ---
 
-func TestBeadPrefix(t *testing.T) {
-	tests := []struct {
-		beadID string
-		want   string
-	}{
-		{"HW-7", "hw"},
-		{"FE-123", "fe"},
-		{"BL-42", "bl"},
-		{"bad", ""},
-		{"", ""},
-		{"-1", ""},
-	}
-	for _, tt := range tests {
-		got := beadPrefix(tt.beadID)
-		if got != tt.want {
-			t.Errorf("beadPrefix(%q) = %q, want %q", tt.beadID, got, tt.want)
-		}
-	}
-}
-
 func TestRigPrefixForAgentCityWide(t *testing.T) {
 	cfg := &config.City{
 		Rigs: []config.Rig{{Name: "hello-world", Path: "/tmp/hw"}},
@@ -3536,23 +3517,6 @@ func TestDoSlingBatchAllIdempotentNoNudge(t *testing.T) {
 	for _, c := range sp.Calls {
 		if c.Method == "Nudge" {
 			t.Error("all-idempotent batch should not nudge")
-		}
-	}
-}
-
-func TestBeadPrefixMultiDash(t *testing.T) {
-	tests := []struct {
-		beadID string
-		want   string
-	}{
-		{"A-B-C", "a"},
-		{"A-", "a"},
-		{"ABC-DEF-123", "abc"},
-	}
-	for _, tt := range tests {
-		got := beadPrefix(tt.beadID)
-		if got != tt.want {
-			t.Errorf("beadPrefix(%q) = %q, want %q", tt.beadID, got, tt.want)
 		}
 	}
 }
@@ -4016,12 +3980,11 @@ func TestFindRigByPrefix(t *testing.T) {
 func TestOneArgSlingNoPrefix(t *testing.T) {
 	// A bead ID with no dash can't derive a prefix.
 	// We test this through cmdSling but that requires a city on disk.
-	// Instead, test the beadPrefix helper directly — already tested above.
-	// The cmdSling path uses beadPrefix then errors, so this is coverage
-	// via the TestNewSlingCmdArgs validation + beadPrefix tests.
-	got := beadPrefix("nodash")
+	// Instead, test the sling.BeadPrefix helper directly — canonical coverage
+	// lives in internal/sling; this just verifies the no-dash contract.
+	got := sling.BeadPrefix("nodash")
 	if got != "" {
-		t.Errorf("beadPrefix(%q) = %q, want empty", "nodash", got)
+		t.Errorf("sling.BeadPrefix(%q) = %q, want empty", "nodash", got)
 	}
 }
 

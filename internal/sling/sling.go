@@ -333,26 +333,15 @@ func FormatBeadLabel(id, title string) string {
 	return id
 }
 
-// BeadPrefix extracts the rig prefix from a bead ID (everything before
-// the first hyphen followed by a digit, or the explicit prefix separator).
+// BeadPrefix extracts the rig prefix from a bead ID by taking the lowercase
+// letters before the first dash. "HW-7" → "hw", "FE-123" → "fe".
+// Returns "" if the ID has no dash (can't determine prefix).
 func BeadPrefix(beadID string) string {
-	beadID = strings.TrimSpace(beadID)
-	if beadID == "" {
+	i := strings.Index(beadID, "-")
+	if i <= 0 {
 		return ""
 	}
-	// Check for explicit prefix separator "--"
-	if idx := strings.Index(beadID, "--"); idx > 0 {
-		return beadID[:idx]
-	}
-	// Check for prefix-NNN pattern (prefix followed by hyphen and digit)
-	for i := 0; i < len(beadID)-1; i++ {
-		if beadID[i] == '-' && beadID[i+1] >= '0' && beadID[i+1] <= '9' {
-			if i > 0 {
-				return beadID[:i]
-			}
-		}
-	}
-	return ""
+	return strings.ToLower(beadID[:i])
 }
 
 // RigPrefixForAgent returns the rig prefix that an agent's rig uses for bead IDs.

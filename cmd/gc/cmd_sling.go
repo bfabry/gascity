@@ -219,7 +219,7 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 			fmt.Fprintf(stderr, "gc sling: inline text requires explicit target\n  usage: gc sling <target> %q\n", beadOrFormula) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		bp := beadPrefix(beadOrFormula)
+		bp := sling.BeadPrefix(beadOrFormula)
 		if bp == "" {
 			fmt.Fprintf(stderr, "gc sling: cannot derive rig from bead %q (no prefix)\n", beadOrFormula) //nolint:errcheck // best-effort stderr
 			return 1
@@ -259,7 +259,7 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 	// 2. Target agent's rig directory (mol operations create in the agent's store)
 	// 3. City path (fallback for city-scoped agents)
 	storeDir := cityPath
-	if bp := beadPrefix(beadOrFormula); bp != "" {
+	if bp := sling.BeadPrefix(beadOrFormula); bp != "" {
 		if rig, found := findRigByPrefix(cfg, bp); found {
 			rigPath := rig.Path
 			if !filepath.IsAbs(rigPath) {
@@ -758,7 +758,7 @@ func formatBeadLabel(id, title string) string {
 // printCrossRigSection prints the Cross-rig dry-run section if applicable.
 func printCrossRigSection(w func(string), beadID string, a config.Agent, cfg *config.City) {
 	if msg := checkCrossRig(beadID, a, cfg); msg != "" {
-		bp := beadPrefix(beadID)
+		bp := sling.BeadPrefix(beadID)
 		rp := rigPrefixForAgent(a, cfg)
 		w("Cross-rig:")
 		w(fmt.Sprintf("  Bead %s (prefix %q) targets %s (rig prefix %q).", beadID, bp, a.QualifiedName(), rp))
@@ -1567,17 +1567,6 @@ func looksLikeBeadID(s string) bool {
 	return false
 }
 
-// beadPrefix extracts the rig prefix from a bead ID by taking the lowercase
-// letters before the first dash. "HW-7" → "hw", "FE-123" → "fe".
-// Returns "" if the ID has no dash (can't determine prefix).
-func beadPrefix(beadID string) string {
-	i := strings.Index(beadID, "-")
-	if i <= 0 {
-		return ""
-	}
-	return strings.ToLower(beadID[:i])
-}
-
 // rigPrefixForAgent returns the effective bead prefix for the rig that an
 // agent belongs to. City-wide agents (Dir="") return "" (exempt from cross-rig
 // checks). Returns "" if no matching rig is found (best-effort skip).
@@ -1597,7 +1586,7 @@ func rigPrefixForAgent(a config.Agent, cfg *config.City) string {
 // doesn't match the target agent's rig prefix. Returns "" when the check
 // passes or can't be performed (missing prefix, city-wide agent, no rig).
 func checkCrossRig(beadID string, a config.Agent, cfg *config.City) string {
-	bp := beadPrefix(beadID)
+	bp := sling.BeadPrefix(beadID)
 	if bp == "" {
 		return ""
 	}
