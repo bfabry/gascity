@@ -591,7 +591,7 @@ func applyAttemptControlStepRoute(step *formula.RecipeStep, executionTarget stri
 	if step.Metadata == nil {
 		step.Metadata = make(map[string]string)
 	}
-	if binding, ok := resolveAttemptRouteBinding(executionTarget, cfg); ok {
+	if binding, ok := resolveAttemptRouteBinding(executionTarget, cfg, nil); ok {
 		step.Metadata["gc.execution_routed_to"] = binding.qualifiedName
 	} else if executionTarget != "" {
 		step.Metadata["gc.execution_routed_to"] = executionTarget
@@ -601,7 +601,7 @@ func applyAttemptControlStepRoute(step *formula.RecipeStep, executionTarget stri
 	step.Labels = removeAttemptPoolLabels(step.Labels)
 
 	controlTarget := config.ControlDispatcherAgentName
-	if binding, ok := resolveAttemptRouteBinding(controlTarget, cfg); ok {
+	if binding, ok := resolveAttemptRouteBinding(controlTarget, cfg, nil); ok {
 		step.Metadata["gc.routed_to"] = binding.qualifiedName
 		if binding.metadataOnly {
 			step.Assignee = ""
