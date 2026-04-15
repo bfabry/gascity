@@ -292,8 +292,14 @@ func ensureDeferredManagedMetadata(path, doltDatabase string) {
 // init the directory, then install event hooks. The ordering matters
 // because init (bd init) may recreate .beads/ and wipe existing hooks.
 func initAndHookDir(cityPath, dir, prefix string) error {
+	if err := ensureBeadsDir(fsys.OSFS{}, filepath.Join(dir, ".beads")); err != nil {
+		return fmt.Errorf("creating .beads dir at %s: %w", dir, err)
+	}
 	if err := initBeadsForDir(cityPath, dir, prefix, ""); err != nil {
 		return err
+	}
+	if err := ensureBeadsDir(fsys.OSFS{}, filepath.Join(dir, ".beads")); err != nil {
+		return fmt.Errorf("tightening .beads dir at %s: %w", dir, err)
 	}
 	// Non-fatal: hooks are convenience (event forwarding), not critical.
 	if err := installBeadHooks(dir); err != nil {

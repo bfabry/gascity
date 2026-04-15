@@ -60,7 +60,7 @@ type Client struct {
 	httpClient  *http.Client
 }
 
-const sessionMessageTimeout = 95 * time.Second
+const sessionMessageTimeout = 4 * time.Minute
 
 // SessionSubmitResponse mirrors POST /v0/session/{id}/submit.
 type SessionSubmitResponse struct {

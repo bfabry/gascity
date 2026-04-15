@@ -192,6 +192,15 @@ func TestInstallGemini(t *testing.T) {
 	if !strings.Contains(string(data), "/usr/local/bin/gc prime --hook") {
 		t.Error("gemini settings should use resolved gc binary path")
 	}
+	if !strings.Contains(string(data), "--hook-format gemini") {
+		t.Error("gemini settings should request Gemini hook output format")
+	}
+	if !strings.Contains(string(data), `"enableInteractiveShell": false`) {
+		t.Error("gemini settings should disable interactive shell")
+	}
+	if !geminiBeforeAgentHasWorkHook(string(data)) {
+		t.Error("gemini settings should inject assigned work before agent turns")
+	}
 	if strings.Contains(string(data), "export PATH=") {
 		t.Error("gemini settings should not use PATH export pattern")
 	}
@@ -494,8 +503,53 @@ func TestInstallGeminiUpgradesStaleGeneratedFile(t *testing.T) {
 	if !strings.Contains(got, "/opt/gc/bin/gc prime --hook") {
 		t.Errorf("upgraded gemini settings missing resolved gc path:\n%s", got)
 	}
+	if !strings.Contains(got, "--hook-format gemini") {
+		t.Errorf("upgraded gemini settings missing Gemini hook output format:\n%s", got)
+	}
 	if strings.Contains(got, "export PATH=") {
 		t.Errorf("upgraded gemini settings still use PATH export:\n%s", got)
+	}
+}
+
+func TestInstallGeminiUpgradesGeneratedFileMissingShellFallback(t *testing.T) {
+	oldResolve := resolveGCBinary
+	resolveGCBinary = func() string { return "/opt/gc/bin/gc" }
+	t.Cleanup(func() { resolveGCBinary = oldResolve })
+
+	fs := fsys.NewFake()
+	fs.Files["/work/.gemini/settings.json"] = []byte(`{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/gc/bin/gc prime --hook --hook-format gemini"
+      }]
+    }],
+    "BeforeAgent": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/gc/bin/gc nudge drain --inject --hook-format gemini"
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/gc/bin/gc hook --inject --hook-format gemini"
+      }]
+    }]
+  }
+}`)
+
+	if err := Install(fs, "/city", "/work", []string{"gemini"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	got := string(fs.Files["/work/.gemini/settings.json"])
+	if !strings.Contains(got, `"enableInteractiveShell": false`) {
+		t.Errorf("upgraded gemini settings should disable interactive shell:\n%s", got)
+	}
+	if !geminiBeforeAgentHasWorkHook(got) {
+		t.Errorf("upgraded gemini settings should inject assigned work before agent turns:\n%s", got)
 	}
 }
 

@@ -1,4 +1,9 @@
 {
+  "tools": {
+    "shell": {
+      "enableInteractiveShell": false
+    }
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -6,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GC_BIN}} prime --hook"
+            "command": "{{GC_BIN}} prime --hook --hook-format gemini"
           }
         ]
       }
@@ -17,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GC_BIN}} prime --hook"
+            "command": "{{GC_BIN}} prime --hook --hook-format gemini"
           }
         ]
       }
@@ -28,11 +33,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GC_BIN}} nudge drain --inject"
+            "command": "{{GC_BIN}} nudge drain --inject --hook-format gemini"
           },
           {
             "type": "command",
-            "command": "{{GC_BIN}} mail check --inject"
+            "command": "{{GC_BIN}} mail check --inject --hook-format gemini"
+          },
+          {
+            "type": "command",
+            "command": "{{GC_BIN}} hook --inject --hook-format gemini"
           }
         ]
       }
@@ -43,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GC_BIN}} hook --inject"
+            "command": "{{GC_BIN}} hook --inject --hook-format gemini"
           }
         ]
       }

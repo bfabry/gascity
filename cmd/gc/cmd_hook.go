@@ -17,6 +17,7 @@ import (
 
 func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 	var inject bool
+	var hookFormat string
 	cmd := &cobra.Command{
 		Use:   "hook [agent]",
 		Short: "Check for available work (use --inject for Stop hook output)",
@@ -25,16 +26,17 @@ func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 Without --inject: prints raw output, exits 0 if work exists, 1 if empty.
 With --inject: wraps output in <system-reminder> for hook injection, always exits 0.
 
-The agent is determined from $GC_AGENT or a positional argument.`,
+		The agent is determined from $GC_AGENT or a positional argument.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdHook(args, inject, stdout, stderr) != 0 {
+			if cmdHookWithFormat(args, inject, hookFormat, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&inject, "inject", false, "output <system-reminder> block for hook injection")
+	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	return cmd
 }
 
@@ -42,6 +44,10 @@ The agent is determined from $GC_AGENT or a positional argument.`,
 // $GC_AGENT or a positional argument, loads the city config, and runs
 // the agent's work query.
 func cmdHook(args []string, inject bool, stdout, stderr io.Writer) int {
+	return cmdHookWithFormat(args, inject, "", stdout, stderr)
+}
+
+func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
 	agentName := os.Getenv("GC_ALIAS")
 	if agentName == "" {
 		agentName = os.Getenv("GC_AGENT")
@@ -121,7 +127,7 @@ func cmdHook(args []string, inject bool, stdout, stderr io.Writer) int {
 	runner := func(command, dir string) (string, error) {
 		return shellWorkQueryWithEnv(command, dir, queryEnv)
 	}
-	return doHook(workQuery, workDir, inject, runner, stdout, stderr)
+	return doHookWithFormat(workQuery, workDir, inject, hookFormat, runner, stdout, stderr)
 }
 
 // hookQueryEnv returns the bd runtime overrides for a hook subprocess.
@@ -171,6 +177,10 @@ func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
 // results based on mode. Without inject: prints raw output, returns 0 if
 // work, 1 if empty. With inject: wraps in <system-reminder>, always returns 0.
 func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, stderr io.Writer) int {
+	return doHookWithFormat(workQuery, dir, inject, "", runner, stdout, stderr)
+}
+
+func doHookWithFormat(workQuery, dir string, inject bool, hookFormat string, runner WorkQueryRunner, stdout, stderr io.Writer) int {
 	output, err := runner(workQuery, dir)
 	if err != nil {
 		if inject {
@@ -186,7 +196,8 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 
 	if inject {
 		if hasWork {
-			fmt.Fprintf(stdout, "<system-reminder>\nYou have pending work. Pick up the next item:\n\n<work-items>\n%s\n</work-items>\n\nClaim it and start working. Run 'gc hook' to see the full queue.\n</system-reminder>\n", normalized) //nolint:errcheck // best-effort stdout
+			content := formatHookInjectReminder(normalized)
+			_ = writeProviderHookContext(stdout, hookFormat, content)
 		}
 		return 0 // --inject always exits 0
 	}
@@ -200,6 +211,23 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	}
 	fmt.Fprint(stdout, normalized) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+func formatHookInjectReminder(normalizedWork string) string {
+	return fmt.Sprintf(`<system-reminder>
+You have pending work. Pick up the next item:
+
+<work-items>
+%s
+</work-items>
+
+Use the bead id from the work item:
+- If the item is not assigned to you yet, run `+"`bd update <id> --claim`"+`.
+- Do the requested work.
+- When done, run `+"`bd close <id>`"+`.
+Run `+"`gc hook`"+` to see the full queue.
+</system-reminder>
+`, normalizedWork)
 }
 
 func workQueryHasReadyWork(output string) bool {

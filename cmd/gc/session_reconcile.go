@@ -609,6 +609,9 @@ func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTrac
 	if dt != nil && dt.get(session.ID) != nil {
 		return false
 	}
+	if isDeliberateSleepReason(session.Metadata["sleep_reason"]) {
+		return false
+	}
 	lastWoke := session.Metadata["last_woke_at"]
 	if lastWoke == "" {
 		return false
@@ -637,6 +640,16 @@ func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTrac
 	_ = store.SetMetadata(session.ID, "last_woke_at", "")
 	session.Metadata["last_woke_at"] = ""
 	return true
+}
+
+func isDeliberateSleepReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "idle", "idle-timeout", "no-wake-reason", "config-drift", "drained",
+		sleepReasonCityStop, "user-hold", "wait-hold":
+		return true
+	default:
+		return false
+	}
 }
 
 // recordChurn increments the churn counter and clears session_key on
@@ -790,10 +803,7 @@ func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clo
 		if target == "asleep" && (session.Metadata["session_key"] != "" || session.Metadata["started_config_hash"] != "") {
 			prevState := session.Metadata["state"]
 			sleepReason := session.Metadata["sleep_reason"]
-			isDraining := sleepReason == "idle" || sleepReason == "idle-timeout" ||
-				sleepReason == "no-wake-reason" || sleepReason == "config-drift" ||
-				sleepReason == "drained" ||
-				sleepReason == "user-hold" || sleepReason == "wait-hold"
+			isDraining := isDeliberateSleepReason(sleepReason)
 			if !isDraining && (prevState == "active" || prevState == "awake" || prevState == "creating") {
 				batch["session_key"] = ""
 				batch["started_config_hash"] = ""

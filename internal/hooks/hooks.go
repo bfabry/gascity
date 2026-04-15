@@ -237,13 +237,45 @@ func writeEmbeddedManaged(fs fsys.FS, dst string, data []byte, needsUpgrade func
 
 func geminiFileNeedsUpgrade(existing []byte) bool {
 	content := string(existing)
-	if !strings.Contains(content, `export PATH=`) {
+	hasManagedHook := geminiContainsManagedHook(content)
+	if strings.Contains(content, `export PATH=`) {
+		return hasManagedHook
+	}
+	if !hasManagedHook {
 		return false
 	}
+	if !strings.Contains(content, `--hook-format gemini`) {
+		return true
+	}
+	if !geminiDisablesInteractiveShell(content) {
+		return true
+	}
+	return !geminiBeforeAgentHasWorkHook(content)
+}
+
+func geminiContainsManagedHook(content string) bool {
 	return strings.Contains(content, `gc prime --hook`) ||
 		strings.Contains(content, `gc nudge drain --inject`) ||
 		strings.Contains(content, `gc mail check --inject`) ||
 		strings.Contains(content, `gc hook --inject`)
+}
+
+func geminiDisablesInteractiveShell(content string) bool {
+	return strings.Contains(content, `"enableInteractiveShell": false`) ||
+		strings.Contains(content, `"enableInteractiveShell":false`)
+}
+
+func geminiBeforeAgentHasWorkHook(content string) bool {
+	start := strings.Index(content, `"BeforeAgent"`)
+	if start < 0 {
+		return false
+	}
+	beforeAgent := content[start:]
+	if end := strings.Index(beforeAgent, `"SessionEnd"`); end >= 0 {
+		beforeAgent = beforeAgent[:end]
+	}
+	return strings.Contains(beforeAgent, `gc hook --inject`) &&
+		strings.Contains(beforeAgent, `--hook-format gemini`)
 }
 
 func opencodeFileNeedsUpgrade(existing []byte) bool {
